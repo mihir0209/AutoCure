@@ -1,7 +1,23 @@
-# Self-Healing Software System - Python Dependencies
+# Self-Healing Software System v2.0 - Python Dependencies
 
-# HTTP client for AI API calls
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# WebSocket support
+websockets>=12.0
+
+# HTTP client for AI API calls and error replication
+aiohttp>=3.9.0
 httpx>=0.27.0
+
+# Database
+asyncpg>=0.29.0  # PostgreSQL async driver
+redis>=5.0.0      # Redis with async support
+
+# Password hashing
+bcrypt>=4.1.0
+python-jose[cryptography]>=3.3.0  # JWT tokens
 
 # Async file operations
 aiofiles>=24.1.0
@@ -12,20 +28,20 @@ python-dotenv>=1.0.0
 # Data validation and serialization
 pydantic>=2.5.0
 
-# Rich console output (optional, for better logging)
+# Rich console output for logging
 rich>=13.7.0
 
-# Type hints support (for Python < 3.10)
+# Type hints support
 typing-extensions>=4.9.0
+
+# AST parsing (optional - install language-specific grammars separately)
+# tree-sitter>=0.20.0
 
 # JSON schema validation
 jsonschema>=4.21.0
 
 # Diff generation for code changes
 diff-match-patch>=20230430
-
-# Watchdog for file monitoring (alternative to polling)
-watchdog>=4.0.0
 
 # Test framework
 pytest>=8.0.0

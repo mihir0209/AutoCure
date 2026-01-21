@@ -1,53 +1,356 @@
-# Self-Healing Software System - Architecture Documentation
+# Self-Healing Software System v2.0 - Architecture
 
 ## System Overview
 
-The Self-Healing Software System is an AI-driven automated error detection, analysis, and resolution platform. It monitors application logs in real-time, detects errors, traces them to source code, generates fixes using large language models, validates fixes through automated testing, and creates version-controlled branches for review.
+The Self-Healing Software System v2.0 is an AI-powered **error detection and fix proposal** platform. It receives real-time logs via WebSocket from user production apps, detects errors, traces them through AST analysis, and **proposes fixes** (without applying them). The system also reviews PRs for code quality.
 
-## Architecture Diagram
+**Key Principle**: The system **proposes fixes only** - it does NOT automatically apply changes to user code.
+
+## System Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph UserSpace["👤 User Space"]
+        UserApp["User Production App<br/>(Python/Node.js/etc)"]
+        ClientSnippet["WebSocket Client Snippet<br/>(~50 lines)"]
+        UserApp --> ClientSnippet
+    end
+
+    subgraph SelfHealerSystem["🏥 Self-Healer System (Single VM)"]
+        subgraph Gateway["WebSocket Gateway"]
+            WSEndpoint["wss://service.com/ws/logs/{user_id}"]
+            JWTAuth["JWT Authentication"]
+            Encryption["TLS 1.3 + Encrypted Payloads"]
+        end
+
+        subgraph CoreServices["Core Backend Services (FastAPI + asyncio)"]
+            LogGateway["Log Gateway Service<br/>• Receives log streams<br/>• Buffers in Redis<br/>• Filters autocure-try"]
+            
+            ErrorDetection["Error Detection Engine<br/>• Regex pattern matching<br/>• AI-powered classification<br/>• Stack trace parsing"]
+            
+            RepoSync["Repo Sync Service<br/>• Git clone on signup<br/>• Periodic git pull (5-15min)<br/>• Commit hash caching"]
+            
+            ASTParser["AST Codebase Parser<br/>• Tree-sitter (multi-lang)<br/>• Symbol table extraction<br/>• Cross-reference mapping"]
+            
+            RootCause["Root Cause Analyzer<br/>• Error replication<br/>• AST traversal<br/>• Context building<br/>• AI reasoning"]
+            
+            CodeReview["Code Review Engine<br/>• PR diff fetching<br/>• 3-dot diff analysis<br/>• Style/security checks"]
+            
+            EmailService["Email Service<br/>• Rich HTML reports<br/>• AST visualization<br/>• Fix proposals"]
+        end
+
+        subgraph DataLayer["Data Layer"]
+            PostgreSQL[("PostgreSQL<br/>• users<br/>• repositories<br/>• error_logs<br/>• analysis_history<br/>• code_reviews")]
+            
+            Redis[("Redis<br/>• Sessions<br/>• Log buffers<br/>• AST cache (24h TTL)<br/>• Rate limiting<br/>• Pub/Sub")]
+            
+            FileSystem[("File System<br/>/workspaces/{user_id}/{repo}<br/>• Free: 100MB/repo, 5 repos<br/>• Pro: 1GB/repo, unlimited")]
+        end
+    end
+
+    subgraph External["☁️ External Services"]
+        GitHub["GitHub API<br/>• Repo cloning (PAT)<br/>• PR diff fetching<br/>• Webhooks (optional)"]
+        
+        AIProviders["AI Providers<br/>• Groq (free, fast)<br/>• Cerebras (free, fast)<br/>via OpenAI SDK"]
+        
+        SMTP["Google SMTP<br/>• App passwords<br/>• Admin sender<br/>• User recipients"]
+    end
+
+    %% Connections
+    ClientSnippet -->|"JSON logs over WSS"| WSEndpoint
+    WSEndpoint --> JWTAuth
+    JWTAuth --> Encryption
+    Encryption --> LogGateway
+    
+    LogGateway --> Redis
+    LogGateway --> ErrorDetection
+    
+    ErrorDetection -->|"Error detected"| RepoSync
+    ErrorDetection -->|"Classify severity"| AIProviders
+    
+    RepoSync --> GitHub
+    RepoSync --> FileSystem
+    RepoSync -->|"Files changed"| ASTParser
+    
+    ASTParser --> Redis
+    ASTParser --> RootCause
+    
+    RootCause -->|"Build context"| AIProviders
+    RootCause --> EmailService
+    RootCause --> PostgreSQL
+    
+    CodeReview --> GitHub
+    CodeReview --> AIProviders
+    CodeReview --> EmailService
+    
+    EmailService --> SMTP
+    EmailService --> PostgreSQL
+    
+    LogGateway --> PostgreSQL
+    ErrorDetection --> PostgreSQL
+```
+
+## Data Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant App as User App
+    participant WS as WebSocket Gateway
+    participant Redis as Redis
+    participant ED as Error Detection
+    participant Git as Git/GitHub
+    participant AST as AST Parser
+    participant AI as AI (Groq/Cerebras)
+    participant DB as PostgreSQL
+    participant Email as Email Service
+
+    App->>WS: Connect (JWT auth)
+    WS->>Redis: Register session
+    
+    loop Real-time Logging
+        App->>WS: Log entry (JSON)
+        WS->>Redis: Buffer log
+        WS->>ED: Process log
+        
+        alt Error Detected
+            ED->>DB: Store error_log
+            ED->>Git: git pull (if needed)
+            Git->>AST: Parse changed files
+            AST->>Redis: Cache AST (24h TTL)
+            AST->>AI: Build context + analyze
+            AI->>DB: Store analysis
+            AI->>Email: Send report
+            Email->>App: Notification to admin
+        end
+    end
+```
+
+## Database Schema (ERD)
+
+```mermaid
+erDiagram
+    USERS ||--o{ REPOSITORIES : owns
+    USERS ||--o{ WEBSOCKET_SESSIONS : has
+    USERS ||--o{ AUDIT_LOGS : generates
+    USERS ||--o{ RATE_LIMITS : subject_to
+    
+    REPOSITORIES ||--o{ ERROR_LOGS : contains
+    REPOSITORIES ||--o{ ANALYSIS_HISTORY : has
+    REPOSITORIES ||--o{ CODE_REVIEWS : receives
+    
+    ERROR_LOGS ||--o| ANALYSIS_HISTORY : analyzed_by
+
+    USERS {
+        uuid id PK
+        string email UK
+        string password_hash
+        string name
+        string tier "free|pro"
+        int max_repos
+        int max_storage_per_repo_mb
+        string websocket_token
+        boolean notifications_enabled
+        boolean is_active
+        timestamp created_at
+    }
+
+    REPOSITORIES {
+        uuid id PK
+        uuid user_id FK
+        string repo_url
+        string repo_name
+        string repo_owner
+        string base_branch
+        bytea github_token_encrypted
+        string workspace_path
+        decimal current_storage_mb
+        string last_commit_hash
+        timestamp last_sync_at
+        string sync_status
+        string admin_email
+    }
+
+    ERROR_LOGS {
+        uuid id PK
+        uuid repo_id FK
+        string error_type
+        text error_message
+        text stack_trace
+        string file_path
+        int line_number
+        string api_endpoint
+        jsonb request_payload
+        string severity
+        string status
+        timestamp occurred_at
+    }
+
+    ANALYSIS_HISTORY {
+        uuid id PK
+        uuid error_log_id FK
+        uuid repo_id FK
+        text root_cause
+        decimal confidence
+        text fix_proposal
+        text fix_diff
+        jsonb affected_files
+        string risk_level
+        string ai_provider
+        boolean email_sent
+    }
+
+    CODE_REVIEWS {
+        uuid id PK
+        uuid repo_id FK
+        int pr_number
+        string pr_title
+        int overall_score
+        text summary
+        jsonb comments
+        boolean has_security_issues
+    }
+```
+
+## Component Responsibilities
+
+### 1. WebSocket Client Snippet (~50 lines)
+**Runs in user's production app**
+
+- **Role**: Captures and forwards logs (does NOT trace errors)
+- **Features**:
+  - Captures stdout/stderr
+  - Intercepts application logs
+  - Captures error stack traces
+  - Auto-reconnection with heartbeat (30s)
+  - Adds metadata (timestamp, level)
+- **Output**: JSON log entries over secure WebSocket
+
+### 2. Error Detection Engine
+**Our system traces the error**
+
+- **Role**: Identifies errors from log streams
+- **Features**:
+  - Regex patterns for common errors
+  - AI-powered classification (Groq/Cerebras)
+  - Stack trace extraction and parsing
+  - API endpoint correlation
+  - Severity assessment
+- **Filters out**: Logs with `autocure-try: true` flag
+
+### 3. AST Codebase Parser
+- **Role**: Builds searchable code structure
+- **Features**:
+  - Tree-sitter for multi-language support
+  - Symbol table extraction
+  - Cross-reference mapping
+  - Cached in Redis (24h TTL)
+
+### 4. Root Cause Analyzer
+- **Role**: AI-powered error investigation
+- **Pipeline**:
+  1. Parse stack trace → identify file/line/function
+  2. AST traversal → walk parents/children/dependencies
+  3. Context building → compile {logs, ast, code, deps}
+  4. AI reasoning → root cause + fix proposal
+- **Output**: Proposal only (NOT applied)
+
+### 5. Email Service
+- **Role**: Delivers rich HTML reports
+- **Sender**: Admin email (Google App Password)
+- **Recipients**: Per-repo admin from `repositories.admin_email`
+
+## Storage Tiers
+
+| Feature | Free Tier | Pro Tier (Future) |
+|---------|-----------|-------------------|
+| Max Repositories | 5 | Unlimited |
+| Storage per Repo | 100 MB | 1 GB |
+| Rate Limit (logs/sec) | 100 | 500 |
+| Rate Limit (PRs/hour) | 10 | 50 |
+
+## Security Architecture
+
+```mermaid
+flowchart LR
+    subgraph Transport["Transport Security"]
+        TLS["TLS 1.3"]
+        WSS["WSS (WebSocket Secure)"]
+    end
+    
+    subgraph Auth["Authentication"]
+        JWT["JWT Tokens"]
+        HMAC["HMAC-SHA256 Signing"]
+    end
+    
+    subgraph DataSec["Data Security"]
+        Fernet["Fernet Encryption<br/>(GitHub tokens)"]
+        PgCrypto["pgcrypto<br/>(DB encryption)"]
+        Bcrypt["bcrypt<br/>(passwords)"]
+    end
+    
+    subgraph Isolation["Tenant Isolation"]
+        Workspace["Separate /workspaces/{user}"]
+        RedisNS["Redis Namespaces"]
+        DBRows["Row-level security"]
+    end
+```
+
+## External Services
+
+| Service | Purpose | Auth Method |
+|---------|---------|-------------|
+| **GitHub API** | Repo clone, PR diffs | User's PAT (read-only) |
+| **Groq** | AI inference (free, fast) | API Key via OpenAI SDK |
+| **Cerebras** | AI inference (free, fast) | API Key via OpenAI SDK |
+| **Google SMTP** | Email delivery | App Password |
+
+### About GitHub PAT Access
+
+- User generates PAT with `repo:read` scope from their GitHub account
+- PAT allows reading private repos **that the user owns/has access to**
+- Token is encrypted at rest using pgcrypto
+- Future: Can implement GitHub OAuth App for seamless authorization
+
+## Deployment (Single VM)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        SELF-HEALING SOFTWARE SYSTEM                         │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           MAIN ORCHESTRATOR                                  │
-│                            (main.py)                                        │
-│  • Manages all subprocesses                                                 │
-│  • Coordinates healing workflow                                             │
-│  • Handles graceful shutdown                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-          │                    │                    │                    │
-          ▼                    ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  SUBPROCESS 1   │  │  SUBPROCESS 2   │  │  SUBPROCESS 3   │  │  SUBPROCESS 4   │
-│  Log Watcher    │  │ Target Service  │  │ Error Processor │  │  Git Handler    │
-│                 │  │                 │  │                 │  │                 │
-│ • Monitor logs  │  │ • Node.js app   │  │ • Parse traces  │  │ • Create branch │
-│ • Detect errors │  │ • Generate logs │  │ • Find origin   │  │ • Commit fixes  │
-│ • Parse stack   │  │ • Error source  │  │ • Get context   │  │ • Push remote   │
-└────────┬────────┘  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-         │                    │                    │                    │
-         └────────────────────┴─────────┬──────────┴────────────────────┘
-                                        │
-                                        ▼
-                    ┌─────────────────────────────────────────┐
-                    │            AI HEALING AGENT             │
-                    │                                         │
-                    │  ┌─────────────────────────────────┐   │
-                    │  │         AI CLIENT               │   │
-                    │  │  • Groq API (llama-3.3-70b)    │   │
-                    │  │  • Cerebras API (llama3.1-8b)  │   │
-                    │  │  • OpenAI-compatible endpoints │   │
-                    │  └─────────────────────────────────┘   │
-                    │                  │                      │
-                    │                  ▼                      │
-                    │  ┌─────────────────────────────────┐   │
-                    │  │     FIX GENERATION LOOP        │   │
-                    │  │                                 │   │
-                    │  │  1. Analyze error context      │   │
+┌─────────────────────────────────────────────────────────────┐
+│                     Single VM (4+ vCPU, 8+ GB RAM)          │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐  ┌─────────────────┐                   │
+│  │   Nginx         │  │   FastAPI       │                   │
+│  │   (Reverse      │──│   (Uvicorn      │                   │
+│  │    Proxy, SSL)  │  │    Workers)     │                   │
+│  └─────────────────┘  └─────────────────┘                   │
+│                              │                               │
+│           ┌──────────────────┼──────────────────┐           │
+│           │                  │                  │           │
+│  ┌────────▼────────┐ ┌───────▼───────┐ ┌───────▼───────┐   │
+│  │   PostgreSQL    │ │    Redis      │ │  File System  │   │
+│  │   (Port 5432)   │ │   (Port 6379) │ │  /workspaces  │   │
+│  └─────────────────┘ └───────────────┘ └───────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Future Enhancements (Not for MVP)
+
+1. **Frontend Dashboard** (React/Next.js)
+   - User registration/login
+   - Repository management
+   - Error reports viewer
+
+2. **GitHub OAuth App**
+   - Seamless repo authorization
+   - No PAT copy-paste
+
+3. **Cloud Storage** (S3/GCS)
+   - Long-term report archives
+   - AST visualization storage
+
+4. **Horizontal Scaling**
+   - Multiple FastAPI pods
+   - Redis cluster
+   - Load balancer   │
                     │  │  2. Generate fix proposal      │   │
                     │  │  3. Generate test cases        │   │
                     │  │  4. Run tests in sandbox       │   │

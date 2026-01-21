@@ -1,28 +1,30 @@
 """
-Configuration module for the Self-Healing Software System.
-Handles environment variables and system-wide settings.
+Configuration module for the Self-Healing Software System v2.0
+WebSocket-based log streaming, AST analysis, and code review system.
 """
 
 import os
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, List
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 
-@dataclass
-class AIConfig:
+class AIConfig(BaseModel):
     """AI Provider Configuration"""
-    provider: str  # 'groq' or 'cerebras'
-    groq_api_key: Optional[str]
-    cerebras_api_key: Optional[str]
+    provider: str = "groq"  # 'groq' or 'cerebras'
+    groq_api_key: Optional[str] = None
+    cerebras_api_key: Optional[str] = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
     cerebras_base_url: str = "https://api.cerebras.ai/v1"
     groq_model: str = "llama-3.3-70b-versatile"
-    cerebras_model: str = "llama3.1-8b"
+    cerebras_model: str = "llama-3.3-70b"
+    max_retries: int = 5
+    initial_retry_delay: float = 2.0
+    max_tokens: int = 8192
     
     @property
     def active_api_key(self) -> str:
@@ -46,37 +48,88 @@ class AIConfig:
         return self.cerebras_model
 
 
-@dataclass
-class EmailConfig:
+class DatabaseConfig(BaseModel):
+    """PostgreSQL Database Configuration"""
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "postgres"
+    password: str = ""
+    database: str = "selfhealer"
+    min_connections: int = 5
+    max_connections: int = 20
+    encryption_key: str = "change-this-encryption-key-in-production"
+    ssl: bool = False
+
+
+class RedisConfig(BaseModel):
+    """Redis Configuration"""
+    host: str = "localhost"
+    port: int = 6379
+    password: Optional[str] = None
+    db: int = 0
+    max_connections: int = 50
+
+
+class EmailConfig(BaseModel):
     """Email Configuration for notifications"""
-    smtp_server: str
-    smtp_port: int
-    sender_email: str
-    sender_password: str  # App password
-    admin_email: str
+    smtp_server: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    sender_email: str = ""
+    sender_password: str = ""  # App password
+    admin_email: str = ""
     enable_notifications: bool = True
 
 
-@dataclass
-class GitConfig:
-    """Git Configuration for version control operations"""
-    repo_path: Path
-    branch_prefix: str = "ai-fix"
-    auto_commit: bool = True
-    remote_name: str = "origin"
+class GitHubConfig(BaseModel):
+    """GitHub/GitLab Configuration for repository access"""
+    default_token: Optional[str] = None
+    repos_base_path: Path = Field(default_factory=lambda: Path("repos"))
+    pull_interval_minutes: int = 5  # How often to git pull
+    pr_webhook_secret: Optional[str] = None
 
 
-@dataclass
-class SystemConfig:
+class ServerConfig(BaseModel):
+    """Server Configuration"""
+    host: str = "0.0.0.0"
+    port: int = 8000
+    websocket_path: str = "/ws/logs"
+    api_prefix: str = "/api/v1"
+    cors_origins: List[str] = Field(default_factory=lambda: ["*"])
+    jwt_secret: str = "change-this-jwt-secret-in-production"
+    jwt_expiry_hours: int = 24
+
+
+class StorageConfig(BaseModel):
+    """Storage Configuration for user tiers"""
+    free_max_repos: int = 5
+    free_max_storage_per_repo_mb: int = 100
+    pro_max_repos: int = 999999  # Unlimited
+    pro_max_storage_per_repo_mb: int = 1024  # 1 GB
+
+
+class RateLimitConfig(BaseModel):
+    """Rate Limiting Configuration"""
+    logs_per_second: int = 100
+    prs_per_hour: int = 10
+    api_calls_per_minute: int = 60
+
+
+class SystemConfig(BaseModel):
     """Main System Configuration"""
-    ai: AIConfig
-    email: EmailConfig
-    git: GitConfig
-    log_file: Path
-    target_service_path: Path
-    max_fix_attempts: int = 5
-    log_watch_interval: float = 1.0  # seconds
-    test_timeout: int = 60  # seconds
+    ai: AIConfig = Field(default_factory=AIConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
+    email: EmailConfig = Field(default_factory=EmailConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    rate_limits: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    base_path: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
+    logs_path: Path = Field(default_factory=lambda: Path("logs"))
+    temp_path: Path = Field(default_factory=lambda: Path("temp"))
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 
 def load_config() -> SystemConfig:
@@ -89,36 +142,96 @@ def load_config() -> SystemConfig:
         groq_api_key=os.getenv("GROQ_API_KEY"),
         cerebras_api_key=os.getenv("CEREBRAS_API_KEY"),
         groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        cerebras_model=os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
+        cerebras_model=os.getenv("CEREBRAS_MODEL", "llama-3.3-70b"),
+        max_retries=int(os.getenv("AI_MAX_RETRIES", "5")),
+        initial_retry_delay=float(os.getenv("AI_INITIAL_RETRY_DELAY", "2.0")),
+        max_tokens=int(os.getenv("AI_MAX_TOKENS", "8192")),
+    )
+    
+    database_config = DatabaseConfig(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=int(os.getenv("DB_PORT", "5432")),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", ""),
+        database=os.getenv("DB_NAME", "selfhealer"),
+        min_connections=int(os.getenv("DB_MIN_CONNECTIONS", "5")),
+        max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "20")),
+        encryption_key=os.getenv("DB_ENCRYPTION_KEY", "change-this-encryption-key-in-production"),
+        ssl=os.getenv("DB_SSL", "false").lower() == "true",
+    )
+    
+    redis_config = RedisConfig(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        password=os.getenv("REDIS_PASSWORD"),
+        db=int(os.getenv("REDIS_DB", "0")),
+        max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "50")),
     )
     
     email_config = EmailConfig(
         smtp_server=os.getenv("SMTP_SERVER", "smtp.gmail.com"),
         smtp_port=int(os.getenv("SMTP_PORT", "587")),
         sender_email=os.getenv("SENDER_EMAIL", ""),
-        sender_password=os.getenv("SENDER_PASSWORD", ""),  # App password
+        sender_password=os.getenv("SENDER_PASSWORD", ""),
         admin_email=os.getenv("ADMIN_EMAIL", ""),
-        enable_notifications=os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true",
+        enable_notifications=os.getenv("ENABLE_EMAIL_NOTIFICATIONS", "true").lower() == "true",
     )
     
-    git_config = GitConfig(
-        repo_path=Path(os.getenv("GIT_REPO_PATH", str(base_path))),
-        branch_prefix=os.getenv("GIT_BRANCH_PREFIX", "ai-fix"),
-        auto_commit=os.getenv("GIT_AUTO_COMMIT", "true").lower() == "true",
-        remote_name=os.getenv("GIT_REMOTE_NAME", "origin"),
+    github_config = GitHubConfig(
+        default_token=os.getenv("GITHUB_TOKEN"),
+        repos_base_path=base_path / "repos",
+        pull_interval_minutes=int(os.getenv("GIT_PULL_INTERVAL", "5")),
+        pr_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET"),
+    )
+    
+    server_config = ServerConfig(
+        host=os.getenv("SERVER_HOST", "0.0.0.0"),
+        port=int(os.getenv("SERVER_PORT", "8000")),
+        websocket_path=os.getenv("WEBSOCKET_PATH", "/ws/logs"),
+        api_prefix=os.getenv("API_PREFIX", "/api/v1"),
+        jwt_secret=os.getenv("JWT_SECRET", "change-this-jwt-secret-in-production"),
+        jwt_expiry_hours=int(os.getenv("JWT_EXPIRY_HOURS", "24")),
+    )
+    
+    storage_config = StorageConfig(
+        free_max_repos=int(os.getenv("FREE_MAX_REPOS", "5")),
+        free_max_storage_per_repo_mb=int(os.getenv("FREE_MAX_STORAGE_MB", "100")),
+        pro_max_repos=int(os.getenv("PRO_MAX_REPOS", "999999")),
+        pro_max_storage_per_repo_mb=int(os.getenv("PRO_MAX_STORAGE_MB", "1024")),
+    )
+    
+    rate_limit_config = RateLimitConfig(
+        logs_per_second=int(os.getenv("RATE_LIMIT_LOGS_PER_SEC", "100")),
+        prs_per_hour=int(os.getenv("RATE_LIMIT_PRS_PER_HOUR", "10")),
+        api_calls_per_minute=int(os.getenv("RATE_LIMIT_API_PER_MIN", "60")),
     )
     
     return SystemConfig(
         ai=ai_config,
+        database=database_config,
+        redis=redis_config,
         email=email_config,
-        git=git_config,
-        log_file=Path(os.getenv("LOG_FILE", str(base_path / "logs" / "service.log"))),
-        target_service_path=Path(os.getenv("TARGET_SERVICE_PATH", str(base_path / "demo_service"))),
-        max_fix_attempts=int(os.getenv("MAX_FIX_ATTEMPTS", "5")),
-        log_watch_interval=float(os.getenv("LOG_WATCH_INTERVAL", "1.0")),
-        test_timeout=int(os.getenv("TEST_TIMEOUT", "60")),
+        github=github_config,
+        server=server_config,
+        storage=storage_config,
+        rate_limits=rate_limit_config,
+        base_path=base_path,
+        logs_path=base_path / "logs",
+        temp_path=base_path / "temp",
     )
 
 
 # Global config instance
-config = load_config()
+_config: Optional[SystemConfig] = None
+
+
+def get_config() -> SystemConfig:
+    """Get or create the global config instance"""
+    global _config
+    if _config is None:
+        _config = load_config()
+    return _config
+
+
+# Convenience export
+config = get_config()
