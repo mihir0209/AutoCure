@@ -356,18 +356,53 @@ function markErrorPath(tree, errorPath) {
 // ==========================================
 
 /**
+ * Helper function to find child by type
+ */
+function findChildByType(node, type) {
+  if (!node) return null;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child && child.type === type) return child;
+  }
+  return null;
+}
+
+/**
+ * Helper function to find all children by type
+ */
+function findChildrenByType(node, type) {
+  const result = [];
+  if (!node) return result;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child && child.type === type) result.push(child);
+  }
+  return result;
+}
+
+/**
  * Extract imports/requires from AST based on language
  */
 function extractImports(tree, sourceCode, language) {
   const imports = [];
+  const seenImports = new Set(); // Prevent duplicates
+  
+  function addImport(imp) {
+    const key = `${imp.source}:${imp.line}`;
+    if (!seenImports.has(key)) {
+      seenImports.add(key);
+      imports.push(imp);
+    }
+  }
   
   function walk(node) {
     if (!node) return;
     
     const type = node.type;
     
-    // JavaScript/TypeScript imports
-    if (type === 'import_statement' || type === 'import_declaration') {
+    // ============ JavaScript/TypeScript ============
+    // ES6 imports: import x from 'module'
+    if (type === 'import_statement') {
       const source = node.childForFieldName('source');
       if (source) {
         const sourcePath = source.text.replace(/['"]/g, '');
@@ -382,7 +417,7 @@ function extractImports(tree, sourceCode, language) {
           }
         }
         
-        imports.push({
+        addImport({
           source: sourcePath,
           specifiers: specifiers.length ? specifiers : [{ imported: '*', local: '*' }],
           line: node.startPosition.row + 1,
@@ -391,7 +426,7 @@ function extractImports(tree, sourceCode, language) {
       }
     }
     
-    // CommonJS require
+    // CommonJS require: const x = require('module')
     if (type === 'call_expression') {
       const callee = node.childForFieldName('function');
       if (callee && callee.text === 'require') {
@@ -400,7 +435,7 @@ function extractImports(tree, sourceCode, language) {
           const arg = args.namedChild(0);
           if (arg && (arg.type === 'string' || arg.type === 'string_literal')) {
             const sourcePath = arg.text.replace(/['"]/g, '');
-            imports.push({
+            addImport({
               source: sourcePath,
               specifiers: [{ imported: '*', local: '*' }],
               line: node.startPosition.row + 1,
@@ -411,85 +446,216 @@ function extractImports(tree, sourceCode, language) {
       }
     }
     
-    // Python imports
-    if (type === 'import_statement' || type === 'import_from_statement') {
-      const moduleNode = node.childForFieldName('module_name') || node.childForFieldName('module');
-      if (moduleNode) {
-        const modulePath = moduleNode.text;
-        imports.push({
+    // ============ Python ============
+    // import os / import os, sys
+    if (language === 'Python' && type === 'import_statement') {
+      const dottedNames = findChildrenByType(node, 'dotted_name');
+      for (const dottedName of dottedNames) {
+        const modulePath = dottedName.text;
+        addImport({
           source: modulePath,
-          specifiers: [{ imported: '*', local: '*' }],
+          specifiers: [{ imported: modulePath.split('.').pop(), local: modulePath.split('.').pop() }],
           line: node.startPosition.row + 1,
-          isRelative: modulePath.startsWith('.')
+          isRelative: false // Python non-relative imports
         });
       }
     }
     
-    // Java imports
-    if (type === 'import_declaration') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
-        if (child.type === 'scoped_identifier' || child.type === 'identifier') {
-          imports.push({
-            source: child.text,
-            specifiers: [{ imported: child.text.split('.').pop(), local: child.text.split('.').pop() }],
-            line: node.startPosition.row + 1,
-            isRelative: false
+    // from module import x / from . import x / from ..module import x
+    if (language === 'Python' && type === 'import_from_statement') {
+      let modulePath = '';
+      let isRelative = false;
+      const specifiers = [];
+      
+      // Check for relative import (from . import / from .. import / from .module import)
+      const relativeImport = findChildByType(node, 'relative_import');
+      if (relativeImport) {
+        isRelative = true;
+        const importPrefix = findChildByType(relativeImport, 'import_prefix');
+        const dottedName = findChildByType(relativeImport, 'dotted_name');
+        modulePath = (importPrefix ? importPrefix.text : '') + (dottedName ? dottedName.text : '');
+      } else {
+        // Absolute import: from module import x
+        const dottedNames = findChildrenByType(node, 'dotted_name');
+        if (dottedNames.length > 0) {
+          modulePath = dottedNames[0].text;
+        }
+      }
+      
+      // Get imported names (after 'import' keyword)
+      const dottedNames = findChildrenByType(node, 'dotted_name');
+      // For "from X import Y, Z", the first dotted_name might be X (if not relative), rest are Y, Z
+      const startIdx = (relativeImport || dottedNames.length === 0) ? 0 : 1;
+      for (let i = startIdx; i < dottedNames.length; i++) {
+        specifiers.push({
+          imported: dottedNames[i].text,
+          local: dottedNames[i].text
+        });
+      }
+      
+      // Also check for aliased imports
+      const aliasedImports = findChildrenByType(node, 'aliased_import');
+      for (const ai of aliasedImports) {
+        const name = findChildByType(ai, 'dotted_name') || findChildByType(ai, 'identifier');
+        const alias = findChildByType(ai, 'identifier');
+        if (name) {
+          specifiers.push({
+            imported: name.text,
+            local: alias ? alias.text : name.text
           });
+        }
+      }
+      
+      if (modulePath || isRelative) {
+        addImport({
+          source: modulePath || '.',
+          specifiers: specifiers.length ? specifiers : [{ imported: '*', local: '*' }],
+          line: node.startPosition.row + 1,
+          isRelative: isRelative
+        });
+      }
+    }
+    
+    // ============ Java ============
+    // import java.util.List;
+    if (language === 'Java' && type === 'import_declaration') {
+      const scopedId = findChildByType(node, 'scoped_identifier');
+      if (scopedId) {
+        const fullPath = scopedId.text;
+        addImport({
+          source: fullPath,
+          specifiers: [{ imported: fullPath.split('.').pop(), local: fullPath.split('.').pop() }],
+          line: node.startPosition.row + 1,
+          isRelative: false
+        });
+      }
+    }
+    
+    // ============ Go ============
+    // import "fmt" / import ( "fmt" )
+    if (language === 'Go' && (type === 'import_declaration' || type === 'import_spec')) {
+      const pathNode = node.childForFieldName('path');
+      if (pathNode) {
+        const importPath = pathNode.text.replace(/"/g, '');
+        addImport({
+          source: importPath,
+          specifiers: [{ imported: importPath.split('/').pop(), local: importPath.split('/').pop() }],
+          line: node.startPosition.row + 1,
+          isRelative: importPath.startsWith('./')
+        });
+      }
+      // Also check for interpreted_string_literal directly as child
+      const stringLit = findChildByType(node, 'interpreted_string_literal');
+      if (stringLit) {
+        const importPath = stringLit.text.replace(/"/g, '');
+        addImport({
+          source: importPath,
+          specifiers: [{ imported: importPath.split('/').pop(), local: importPath.split('/').pop() }],
+          line: node.startPosition.row + 1,
+          isRelative: importPath.startsWith('./')
+        });
+      }
+    }
+    
+    // ============ C/C++ ============
+    // #include <header.h> / #include "header.h"
+    if ((language === 'C' || language === 'C++' || language === 'C Header' || language === 'C++ Header') && type === 'preproc_include') {
+      // Try different child types
+      const pathNode = node.childForFieldName('path');
+      const stringLit = findChildByType(node, 'string_literal') || findChildByType(node, 'system_lib_string');
+      const actualPath = pathNode || stringLit;
+      
+      if (actualPath) {
+        const includePath = actualPath.text.replace(/[<>"]/g, '');
+        addImport({
+          source: includePath,
+          specifiers: [{ imported: '*', local: '*' }],
+          line: node.startPosition.row + 1,
+          isRelative: actualPath.text.startsWith('"')
+        });
+      }
+    }
+    
+    // ============ Rust ============
+    // use std::io; / use crate::module;
+    if (language === 'Rust' && type === 'use_declaration') {
+      const argument = node.childForFieldName('argument');
+      const scopedId = findChildByType(node, 'scoped_identifier') || findChildByType(node, 'use_wildcard') || findChildByType(node, 'scoped_use_list');
+      const pathNode = argument || scopedId;
+      
+      if (pathNode) {
+        const usePath = pathNode.text;
+        addImport({
+          source: usePath,
+          specifiers: [{ imported: usePath.split('::').pop(), local: usePath.split('::').pop() }],
+          line: node.startPosition.row + 1,
+          isRelative: usePath.startsWith('crate::') || usePath.startsWith('self::') || usePath.startsWith('super::')
+        });
+      }
+    }
+    
+    // ============ C# ============
+    // using System;
+    if (language === 'C#' && type === 'using_directive') {
+      const nameNode = node.childForFieldName('name') || findChildByType(node, 'qualified_name') || findChildByType(node, 'identifier');
+      if (nameNode) {
+        addImport({
+          source: nameNode.text,
+          specifiers: [{ imported: nameNode.text.split('.').pop(), local: nameNode.text.split('.').pop() }],
+          line: node.startPosition.row + 1,
+          isRelative: false
+        });
+      }
+    }
+    
+    // ============ Ruby ============
+    // require 'module' / require_relative 'module'
+    if (language === 'Ruby' && type === 'call') {
+      const methodNode = node.childForFieldName('method');
+      if (methodNode && (methodNode.text === 'require' || methodNode.text === 'require_relative')) {
+        const args = node.childForFieldName('arguments');
+        if (args && args.namedChildCount > 0) {
+          const arg = args.namedChild(0);
+          if (arg) {
+            const requirePath = arg.text.replace(/['"]/g, '');
+            addImport({
+              source: requirePath,
+              specifiers: [{ imported: '*', local: '*' }],
+              line: node.startPosition.row + 1,
+              isRelative: methodNode.text === 'require_relative' || requirePath.startsWith('./')
+            });
+          }
         }
       }
     }
     
-    // Go imports
-    if (type === 'import_declaration' || type === 'import_spec') {
-      const pathNode = node.childForFieldName('path');
-      if (pathNode) {
-        imports.push({
-          source: pathNode.text.replace(/"/g, ''),
-          specifiers: [{ imported: '*', local: '*' }],
-          line: node.startPosition.row + 1,
-          isRelative: pathNode.text.startsWith('"./')
-        });
+    // ============ PHP ============
+    // require 'file.php'; / include 'file.php'; / use Namespace\Class;
+    if (language === 'PHP') {
+      if (type === 'include_expression' || type === 'require_expression' || type === 'include_once_expression' || type === 'require_once_expression') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child && (child.type === 'string' || child.type === 'encapsed_string')) {
+            const reqPath = child.text.replace(/['"]/g, '');
+            addImport({
+              source: reqPath,
+              specifiers: [{ imported: '*', local: '*' }],
+              line: node.startPosition.row + 1,
+              isRelative: !reqPath.startsWith('/')
+            });
+          }
+        }
       }
-    }
-    
-    // C/C++ includes
-    if (type === 'preproc_include') {
-      const pathNode = node.childForFieldName('path');
-      if (pathNode) {
-        const includePath = pathNode.text.replace(/[<>"]/g, '');
-        imports.push({
-          source: includePath,
-          specifiers: [{ imported: '*', local: '*' }],
-          line: node.startPosition.row + 1,
-          isRelative: pathNode.text.startsWith('"')
-        });
-      }
-    }
-    
-    // Rust use statements
-    if (type === 'use_declaration') {
-      const argument = node.childForFieldName('argument');
-      if (argument) {
-        imports.push({
-          source: argument.text,
-          specifiers: [{ imported: '*', local: '*' }],
-          line: node.startPosition.row + 1,
-          isRelative: argument.text.startsWith('crate::') || argument.text.startsWith('self::') || argument.text.startsWith('super::')
-        });
-      }
-    }
-    
-    // C# using statements
-    if (type === 'using_directive') {
-      const nameNode = node.childForFieldName('name');
-      if (nameNode) {
-        imports.push({
-          source: nameNode.text,
-          specifiers: [{ imported: '*', local: '*' }],
-          line: node.startPosition.row + 1,
-          isRelative: false
-        });
+      if (type === 'namespace_use_declaration') {
+        const nameNode = findChildByType(node, 'namespace_name') || findChildByType(node, 'qualified_name');
+        if (nameNode) {
+          addImport({
+            source: nameNode.text,
+            specifiers: [{ imported: nameNode.text.split('\\').pop(), local: nameNode.text.split('\\').pop() }],
+            line: node.startPosition.row + 1,
+            isRelative: false
+          });
+        }
       }
     }
     
@@ -629,19 +795,74 @@ function extractDeclarations(tree, sourceCode, language) {
  * Resolve import path to actual file
  */
 function resolveImportPath(currentFile, importPath, availableFiles, language) {
-  // Skip non-relative imports for most languages
-  if (!importPath.startsWith('.') && !importPath.startsWith('/')) {
-    // Special handling for certain languages
-    if (language === 'Python') {
-      // Python relative imports
-      if (!importPath.startsWith('.')) return null;
+  const currentDir = path.dirname(currentFile).replace(/\\/g, '/');
+  let resolved = null;
+  
+  // Python module resolution
+  if (language === 'Python') {
+    // Relative imports (., .., .module, ..module)
+    if (importPath.startsWith('.')) {
+      let relativePath = importPath;
+      let targetDir = currentDir;
+      
+      // Count leading dots to determine parent directory traversal
+      let dotCount = 0;
+      while (relativePath.charAt(dotCount) === '.') {
+        dotCount++;
+      }
+      
+      // Go up directories (first dot = current dir, additional dots = parent dirs)
+      for (let i = 1; i < dotCount; i++) {
+        targetDir = path.dirname(targetDir).replace(/\\/g, '/');
+      }
+      
+      // Remaining part after dots is the module path
+      const moduleName = relativePath.slice(dotCount).replace(/\./g, '/');
+      
+      if (moduleName) {
+        resolved = targetDir ? `${targetDir}/${moduleName}` : moduleName;
+      } else {
+        // Pure relative import like "from . import x" - resolve to __init__.py
+        resolved = targetDir;
+      }
     } else {
-      return null;
+      // Absolute Python imports - try to resolve as path from project root
+      // Convert dots to slashes: utils.helper -> utils/helper
+      resolved = importPath.replace(/\./g, '/');
     }
+    
+    // Clean up resolved path
+    if (resolved) {
+      if (resolved.startsWith('./')) resolved = resolved.slice(2);
+      if (resolved.startsWith('/')) resolved = resolved.slice(1);
+      
+      // Try exact match
+      if (availableFiles.includes(resolved)) return resolved;
+      
+      // Try .py extension
+      if (availableFiles.includes(resolved + '.py')) return resolved + '.py';
+      
+      // Try __init__.py for package imports
+      if (availableFiles.includes(`${resolved}/__init__.py`)) return `${resolved}/__init__.py`;
+      
+      // Try as a direct Python file match by filename
+      const moduleName = resolved.split('/').pop();
+      for (const f of availableFiles) {
+        if (f.endsWith(`/${moduleName}.py`) || f === `${moduleName}.py`) {
+          return f;
+        }
+      }
+    }
+    
+    return null;
   }
   
-  const currentDir = path.dirname(currentFile);
-  let resolved = path.posix.join(currentDir, importPath).replace(/\\/g, '/');
+  // Skip non-relative imports for other languages
+  if (!importPath.startsWith('.') && !importPath.startsWith('/')) {
+    return null;
+  }
+  
+  resolved = path.posix.join(currentDir, importPath).replace(/\\/g, '/');
   
   // Remove leading ./ or /
   if (resolved.startsWith('./')) resolved = resolved.slice(2);
@@ -660,9 +881,6 @@ function resolveImportPath(currentFile, importPath, availableFiles, language) {
   for (const ext of extensions) {
     if (availableFiles.includes(`${resolved}/index${ext}`)) return `${resolved}/index${ext}`;
   }
-  
-  // Python: try __init__.py
-  if (availableFiles.includes(`${resolved}/__init__.py`)) return `${resolved}/__init__.py`;
   
   return null;
 }

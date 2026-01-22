@@ -1,8 +1,40 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useMemo } from "react";
 import TreeVisualization from "./components/TreeVisualization";
 import CodePanel from "./components/CodePanel";
 
 const API_BASE = "http://localhost:3000";
+
+/**
+ * Build a map of line numbers to tree nodes for code→tree navigation
+ */
+function buildNodesByLine(tree, prefix = 'root') {
+  const map = {};
+  
+  function walk(node, nodeId) {
+    if (!node) return;
+    
+    // Add this node to lines it spans
+    if (node.loc?.start?.line) {
+      const startLine = node.loc.start.line;
+      const endLine = node.loc.end?.line || startLine;
+      
+      for (let line = startLine; line <= endLine; line++) {
+        if (!map[line]) map[line] = [];
+        map[line].push({ ...node, nodeId });
+      }
+    }
+    
+    // Recurse into children
+    if (node.children) {
+      node.children.forEach((child, i) => {
+        walk(child, `${nodeId}-${i}`);
+      });
+    }
+  }
+  
+  walk(tree, prefix);
+  return map;
+}
 
 function App() {
   // Project state - stores ALL data from backend
@@ -13,6 +45,7 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [highlightLine, setHighlightLine] = useState(null);
   const [showCodePanel, setShowCodePanel] = useState(false);
+  const [focusedNodeId, setFocusedNodeId] = useState(null); // For code→tree navigation
   
   // Single file / Code mode
   const [mode, setMode] = useState("empty"); // 'empty', 'project', 'single', 'code'
@@ -165,6 +198,7 @@ const result = greet("World");`);
     if (node.loc?.start?.line) {
       setHighlightLine(node.loc.start.line);
       setShowCodePanel(true);
+      setFocusedNodeId(null); // Clear code→tree focus
     }
   }, []);
 
@@ -174,8 +208,17 @@ const result = greet("World");`);
       setSelectedFile(node.targetFile);
       setHighlightLine(node.targetLine || 1);
       setShowCodePanel(true);
+      setFocusedNodeId(null);
     }
   }, [projectData]);
+
+  // Handle clicking a code line - navigate to tree node (code→tree navigation)
+  const handleLineClick = useCallback((node) => {
+    if (node?.nodeId) {
+      setFocusedNodeId(node.nodeId);
+      setHighlightLine(node.loc?.start?.line || null);
+    }
+  }, []);
 
   // Get current visualization data
   const getCurrentTree = () => {
@@ -194,6 +237,14 @@ const result = greet("World");`);
 
   const currentTree = getCurrentTree();
   const currentContent = getCurrentContent();
+  
+  // Build nodesByLine map for code→tree navigation (memoized)
+  const nodesByLine = useMemo(() => {
+    if (currentTree) {
+      return buildNodesByLine(currentTree);
+    }
+    return {};
+  }, [currentTree]);
 
   // ========================================
   // RENDER
@@ -451,6 +502,7 @@ const result = greet("World");`);
                     tree={currentTree}
                     onNodeClick={handleNodeClick}
                     onReferenceClick={handleReferenceClick}
+                    focusedNodeId={focusedNodeId}
                   />
                 ) : (
                   <div className="h-full flex items-center justify-center text-slate-500">
@@ -470,6 +522,8 @@ const result = greet("World");`);
                     content={currentContent}
                     highlightLine={highlightLine}
                     filename={selectedFile}
+                    onLineClick={handleLineClick}
+                    nodesByLine={nodesByLine}
                   />
                 </div>
               )}

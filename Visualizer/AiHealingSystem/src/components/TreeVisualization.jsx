@@ -3,13 +3,19 @@ import React, { useState, useCallback, memo, useRef, useEffect } from "react";
 /**
  * TreeVisualization - Renders AST as an interactive tree graph
  * Uses SVG for proper tree visualization with lines
+ * @param {object} tree - Tree data structure
+ * @param {function} onNodeClick - Callback when node is clicked
+ * @param {function} onReferenceClick - Callback when reference node is clicked
+ * @param {string} focusedNodeId - Node ID to focus/highlight (for code→tree navigation)
  */
-const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
+const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick, focusedNodeId }) => {
   const [expandedNodes, setExpandedNodes] = useState(new Set(['root']));
   const [transform, setTransform] = useState({ x: 50, y: 20, scale: 1 });
+  const [showMinimap, setShowMinimap] = useState(true);
   const containerRef = useRef(null);
   const isDragging = useRef(false);
   const lastPos = useRef({ x: 0, y: 0 });
+  const minimapDragging = useRef(false);
 
   // Initialize with first level expanded
   useEffect(() => {
@@ -23,6 +29,38 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
       setTransform({ x: 50, y: 20, scale: 1 });
     }
   }, [tree]);
+
+  // Auto-navigate to focused node (code→tree navigation)
+  useEffect(() => {
+    if (focusedNodeId && tree) {
+      // Expand path to focused node
+      const pathIds = focusedNodeId.split('-');
+      const newExpanded = new Set(expandedNodes);
+      let currentPath = pathIds[0];
+      newExpanded.add(currentPath);
+      for (let i = 1; i < pathIds.length; i++) {
+        currentPath += `-${pathIds[i]}`;
+        newExpanded.add(currentPath);
+      }
+      setExpandedNodes(newExpanded);
+
+      // Calculate the position of the focused node and center on it
+      setTimeout(() => {
+        const { nodes } = layoutTree(tree, newExpanded);
+        const focusedNode = nodes.find(n => n.id === focusedNodeId);
+        if (focusedNode && containerRef.current) {
+          const rect = containerRef.current.getBoundingClientRect();
+          const centerX = rect.width / 2;
+          const centerY = rect.height / 2;
+          setTransform(prev => ({
+            ...prev,
+            x: centerX - focusedNode.x * prev.scale,
+            y: centerY - focusedNode.y * prev.scale
+          }));
+        }
+      }, 50);
+    }
+  }, [focusedNodeId, tree]);
 
   // Prevent page scroll when cursor is inside the canvas
   useEffect(() => {
@@ -105,6 +143,35 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
     isDragging.current = false;
   };
 
+  // Minimap click to navigate
+  const handleMinimapClick = useCallback((e) => {
+    if (!containerRef.current) return;
+    const minimapRect = e.currentTarget.getBoundingClientRect();
+    const container = containerRef.current.getBoundingClientRect();
+    
+    // Calculate layout dimensions
+    const { width: treeWidth, height: treeHeight } = layoutTree(tree, expandedNodes);
+    const minimapWidth = 180;
+    const minimapHeight = 120;
+    const padding = 10;
+    
+    // Scale factor for minimap
+    const scaleX = (minimapWidth - 2 * padding) / Math.max(treeWidth, 1);
+    const scaleY = (minimapHeight - 2 * padding) / Math.max(treeHeight, 1);
+    const minimapScale = Math.min(scaleX, scaleY);
+    
+    // Get click position relative to minimap
+    const clickX = (e.clientX - minimapRect.left - padding) / minimapScale;
+    const clickY = (e.clientY - minimapRect.top - padding) / minimapScale;
+    
+    // Center viewport on clicked position
+    setTransform(prev => ({
+      ...prev,
+      x: container.width / 2 - clickX * prev.scale,
+      y: container.height / 2 - clickY * prev.scale
+    }));
+  }, [tree, expandedNodes]);
+
   if (!tree) {
     return (
       <div className="h-full flex items-center justify-center text-slate-500">
@@ -120,7 +187,7 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
   const { nodes, edges, width, height } = layoutTree(tree, expandedNodes);
 
   return (
-    <div className="h-full flex flex-col bg-slate-900">
+    <div className="h-full flex flex-col bg-slate-900 relative">
       {/* Controls */}
       <div className="flex items-center gap-2 p-2 bg-slate-800 border-b border-slate-700 shrink-0">
         <button
@@ -157,6 +224,12 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
         <span className="text-slate-500 text-xs ml-2">
           {Math.round(transform.scale * 100)}%
         </span>
+        <button
+          onClick={() => setShowMinimap(prev => !prev)}
+          className={`px-3 py-1 rounded text-xs ${showMinimap ? 'bg-cyan-700 hover:bg-cyan-600' : 'bg-slate-700 hover:bg-slate-600'}`}
+        >
+          {showMinimap ? '🗺️ Minimap' : '🗺️'}
+        </button>
         <span className="text-slate-500 text-xs ml-auto">
           Drag to pan • Scroll to zoom • Click nodes to view code
         </span>
@@ -195,6 +268,7 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
                 key={node.id}
                 node={node}
                 isExpanded={expandedNodes.has(node.id)}
+                isFocused={node.id === focusedNodeId}
                 onToggle={() => toggleNode(node.id)}
                 onClick={() => onNodeClick?.(node.data)}
                 onReferenceClick={() => onReferenceClick?.(node.data)}
@@ -203,6 +277,107 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
           </g>
         </svg>
       </div>
+
+      {/* Minimap overlay */}
+      {showMinimap && (
+        <Minimap
+          nodes={nodes}
+          edges={edges}
+          width={width}
+          height={height}
+          transform={transform}
+          containerRef={containerRef}
+          onClick={handleMinimapClick}
+          focusedNodeId={focusedNodeId}
+        />
+      )}
+    </div>
+  );
+});
+
+/**
+ * Minimap component for quick navigation
+ */
+const Minimap = memo(({ nodes, edges, width, height, transform, containerRef, onClick, focusedNodeId }) => {
+  const minimapWidth = 180;
+  const minimapHeight = 120;
+  const padding = 10;
+
+  // Scale factor
+  const scaleX = (minimapWidth - 2 * padding) / Math.max(width, 1);
+  const scaleY = (minimapHeight - 2 * padding) / Math.max(height, 1);
+  const minimapScale = Math.min(scaleX, scaleY);
+
+  // Calculate viewport rectangle
+  let viewportRect = null;
+  if (containerRef.current) {
+    const container = containerRef.current.getBoundingClientRect();
+    const viewportX = (-transform.x / transform.scale);
+    const viewportY = (-transform.y / transform.scale);
+    const viewportW = container.width / transform.scale;
+    const viewportH = container.height / transform.scale;
+    
+    viewportRect = {
+      x: padding + viewportX * minimapScale,
+      y: padding + viewportY * minimapScale,
+      w: viewportW * minimapScale,
+      h: viewportH * minimapScale
+    };
+  }
+
+  return (
+    <div 
+      className="absolute bottom-4 right-4 bg-slate-800/90 border border-slate-600 rounded-lg shadow-lg cursor-pointer"
+      style={{ width: minimapWidth, height: minimapHeight }}
+      onClick={onClick}
+      title="Click to navigate"
+    >
+      {/* Header */}
+      <div className="absolute top-1 left-2 text-xs text-slate-400 pointer-events-none">🗺️</div>
+      
+      <svg width={minimapWidth} height={minimapHeight}>
+        <g transform={`translate(${padding}, ${padding}) scale(${minimapScale})`}>
+          {/* Edges */}
+          {edges.map((edge, i) => (
+            <line
+              key={`mm-edge-${i}`}
+              x1={edge.x1}
+              y1={edge.y1 + 25}
+              x2={edge.x2}
+              y2={edge.y2}
+              stroke="#475569"
+              strokeWidth={1 / minimapScale}
+            />
+          ))}
+          
+          {/* Nodes as dots */}
+          {nodes.map((node) => (
+            <rect
+              key={`mm-${node.id}`}
+              x={node.x - 5}
+              y={node.y}
+              width={10}
+              height={5}
+              rx={2}
+              fill={node.id === focusedNodeId ? '#06b6d4' : node.data.isError ? '#ef4444' : node.data.isReference ? '#0891b2' : '#64748b'}
+            />
+          ))}
+        </g>
+        
+        {/* Viewport rectangle */}
+        {viewportRect && (
+          <rect
+            x={Math.max(0, viewportRect.x)}
+            y={Math.max(0, viewportRect.y)}
+            width={Math.min(viewportRect.w, minimapWidth - Math.max(0, viewportRect.x))}
+            height={Math.min(viewportRect.h, minimapHeight - Math.max(0, viewportRect.y))}
+            fill="rgba(96, 165, 250, 0.2)"
+            stroke="#60a5fa"
+            strokeWidth="1.5"
+            strokeDasharray="4,2"
+          />
+        )}
+      </svg>
     </div>
   );
 });
@@ -210,7 +385,7 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
 /**
  * Individual tree node component
  */
-const TreeNode = memo(({ node, isExpanded, onToggle, onClick, onReferenceClick }) => {
+const TreeNode = memo(({ node, isExpanded, isFocused, onToggle, onClick, onReferenceClick }) => {
   const { x, y, data, hasChildren } = node;
   
   // Determine colors
@@ -218,7 +393,10 @@ const TreeNode = memo(({ node, isExpanded, onToggle, onClick, onReferenceClick }
   let strokeColor = "#475569"; // slate-600
   let textColor = "#f1f5f9"; // slate-100
   
-  if (data.isError) {
+  if (isFocused) {
+    fillColor = "#0e7490"; // cyan-700
+    strokeColor = "#22d3ee"; // cyan-400
+  } else if (data.isError) {
     fillColor = "#b91c1c"; // red-700
     strokeColor = "#ef4444"; // red-500
   } else if (data.isReference) {

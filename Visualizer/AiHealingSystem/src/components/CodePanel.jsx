@@ -1,9 +1,14 @@
-import React, { useEffect, useRef, memo } from "react";
+import React, { useEffect, useRef, memo, useCallback } from "react";
 
 /**
  * CodePanel - Displays file content with syntax highlighting and line highlighting
+ * @param {string} content - File content to display
+ * @param {number} highlightLine - Currently highlighted line (from tree node)
+ * @param {string} filename - Name of the file
+ * @param {function} onLineClick - Callback when a line is clicked (for code→tree navigation)
+ * @param {object} nodesByLine - Map of line numbers to tree nodes for code→tree navigation
  */
-const CodePanel = memo(({ content, highlightLine, filename }) => {
+const CodePanel = memo(({ content, highlightLine, filename, onLineClick, nodesByLine }) => {
   const containerRef = useRef(null);
   const highlightRef = useRef(null);
 
@@ -16,6 +21,19 @@ const CodePanel = memo(({ content, highlightLine, filename }) => {
       });
     }
   }, [highlightLine]);
+
+  // Handle line click - find nodes at this line and trigger navigation
+  const handleLineClick = useCallback((lineNum) => {
+    if (onLineClick && nodesByLine) {
+      // Find node at this line
+      const nodesAtLine = nodesByLine[lineNum];
+      if (nodesAtLine && nodesAtLine.length > 0) {
+        // Prefer the most specific (deepest) node at this line
+        const targetNode = nodesAtLine[nodesAtLine.length - 1];
+        onLineClick(targetNode);
+      }
+    }
+  }, [onLineClick, nodesByLine]);
 
   if (!content) {
     return (
@@ -36,6 +54,9 @@ const CodePanel = memo(({ content, highlightLine, filename }) => {
           <span className="text-xs bg-blue-600 px-2 py-0.5 rounded">Line {highlightLine}</span>
         )}
         <span className="text-xs text-slate-500 ml-auto">{lines.length} lines</span>
+        {onLineClick && (
+          <span className="text-xs text-slate-500">Click line to navigate to tree</span>
+        )}
       </div>
 
       {/* Code content */}
@@ -45,17 +66,24 @@ const CodePanel = memo(({ content, highlightLine, filename }) => {
             {lines.map((line, index) => {
               const lineNum = index + 1;
               const isHighlighted = lineNum === highlightLine;
+              const hasNode = nodesByLine && nodesByLine[lineNum] && nodesByLine[lineNum].length > 0;
               
               return (
                 <tr
                   key={lineNum}
                   ref={isHighlighted ? highlightRef : null}
-                  className={`${isHighlighted ? 'bg-yellow-500/20' : 'hover:bg-slate-800/50'}`}
+                  onClick={() => handleLineClick(lineNum)}
+                  className={`
+                    ${isHighlighted ? 'bg-yellow-500/20' : 'hover:bg-slate-800/50'}
+                    ${hasNode && onLineClick ? 'cursor-pointer' : ''}
+                  `}
+                  title={hasNode ? `Click to navigate to: ${nodesByLine[lineNum].map(n => n.type).join(' > ')}` : ''}
                 >
                   {/* Line number */}
                   <td className={`px-3 py-0.5 text-right select-none border-r border-slate-700 w-12 shrink-0 ${
-                    isHighlighted ? 'text-yellow-400 bg-yellow-500/10' : 'text-slate-600'
+                    isHighlighted ? 'text-yellow-400 bg-yellow-500/10' : hasNode ? 'text-blue-400' : 'text-slate-600'
                   }`}>
+                    {hasNode && <span className="text-xs mr-1">●</span>}
                     {lineNum}
                   </td>
                   {/* Code */}
