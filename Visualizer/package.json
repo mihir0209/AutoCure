@@ -16,6 +16,8 @@
     "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
     "express": "^5.2.1",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "tree-sitter-wasms": "^0.1.7",
+    "web-tree-sitter": "^0.22.6"
   }
 }

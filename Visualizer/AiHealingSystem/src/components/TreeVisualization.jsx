@@ -19,8 +19,35 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
         tree.children.forEach((_, i) => initial.add(`root-${i}`));
       }
       setExpandedNodes(initial);
+      // Reset transform when tree changes
+      setTransform({ x: 50, y: 20, scale: 1 });
     }
   }, [tree]);
+
+  // Prevent page scroll when cursor is inside the canvas
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const preventScroll = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      
+      // Handle zoom
+      const delta = e.deltaY > 0 ? 0.9 : 1.1;
+      setTransform(prev => ({
+        ...prev,
+        scale: Math.max(0.2, Math.min(3, prev.scale * delta))
+      }));
+    };
+
+    // Use passive: false to allow preventDefault
+    container.addEventListener('wheel', preventScroll, { passive: false });
+    
+    return () => {
+      container.removeEventListener('wheel', preventScroll);
+    };
+  }, []);
 
   const toggleNode = useCallback((nodeId) => {
     setExpandedNodes(prev => {
@@ -59,10 +86,10 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
 
   // Pan handlers
   const handleMouseDown = (e) => {
-    if (e.target === containerRef.current || e.target.tagName === 'svg') {
-      isDragging.current = true;
-      lastPos.current = { x: e.clientX, y: e.clientY };
-    }
+    // Allow dragging from anywhere in the canvas
+    isDragging.current = true;
+    lastPos.current = { x: e.clientX, y: e.clientY };
+    e.preventDefault();
   };
 
   const handleMouseMove = (e) => {
@@ -76,15 +103,6 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
 
   const handleMouseUp = () => {
     isDragging.current = false;
-  };
-
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    setTransform(prev => ({
-      ...prev,
-      scale: Math.max(0.2, Math.min(3, prev.scale * delta))
-    }));
   };
 
   if (!tree) {
@@ -144,20 +162,20 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick }) => {
         </span>
       </div>
 
-      {/* SVG Canvas */}
+      {/* SVG Canvas - fixed viewport, no page scroll */}
       <div
         ref={containerRef}
-        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing"
+        className="flex-1 overflow-hidden cursor-grab active:cursor-grabbing select-none"
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
+        style={{ touchAction: 'none' }}
       >
         <svg
           width="100%"
           height="100%"
-          style={{ minWidth: '100%', minHeight: '100%' }}
+          style={{ minWidth: '100%', minHeight: '100%', display: 'block' }}
         >
           <g transform={`translate(${transform.x}, ${transform.y}) scale(${transform.scale})`}>
             {/* Draw edges first (behind nodes) */}

@@ -24,6 +24,7 @@ function App() {
 
 const result = greet("World");`);
   const [errorLine, setErrorLine] = useState(null);
+  const [codeLanguage, setCodeLanguage] = useState(".js"); // File extension for language detection
   
   // Loading/Error state
   const [loading, setLoading] = useState(false);
@@ -131,7 +132,7 @@ const result = greet("World");`);
         body: JSON.stringify({
           code: codeInput,
           errorLine: errorLine || undefined,
-          filename: "snippet.js"
+          filename: `snippet${codeLanguage}`
         })
       });
       
@@ -209,6 +210,11 @@ const result = greet("World");`);
         {projectName && (
           <span className="text-slate-400 text-sm">
             {projectName} • {Object.keys(projectData?.files || {}).length} files
+            {projectData?.summary?.languages?.length > 0 && (
+              <span className="ml-2 text-xs">
+                ({projectData.summary.languages.join(', ')})
+              </span>
+            )}
           </span>
         )}
         
@@ -231,7 +237,7 @@ const result = greet("World");`);
           <input
             ref={fileInputRef}
             type="file"
-            accept=".js,.jsx,.ts,.tsx,.mjs,.cjs"
+            accept=".js,.jsx,.ts,.tsx,.mjs,.cjs,.py,.pyw,.java,.kt,.kts,.c,.cpp,.cc,.cxx,.h,.hpp,.hxx,.hh,.cs,.go,.rs,.html,.htm,.css,.vue,.json,.yaml,.yml,.toml,.rb,.erb,.php,.lua,.swift,.scala,.sc,.dart,.ex,.exs,.elm,.zig,.sh,.bash,.zsh,.m,.mm,.ml,.mli,.sol"
             onChange={handleFileUpload}
             className="hidden"
           />
@@ -269,11 +275,65 @@ const result = greet("World");`);
           {mode === "code" ? (
             /* Code input panel */
             <div className="flex-1 flex flex-col p-3 gap-3 overflow-hidden">
+              {/* Language selector */}
+              <div className="flex gap-2 items-center">
+                <span className="text-xs text-slate-400">Language:</span>
+                <select
+                  value={codeLanguage}
+                  onChange={(e) => setCodeLanguage(e.target.value)}
+                  className="bg-slate-900 text-white px-2 py-1 rounded border border-slate-600 text-xs flex-1"
+                >
+                  <optgroup label="Web">
+                    <option value=".js">JavaScript</option>
+                    <option value=".ts">TypeScript</option>
+                    <option value=".jsx">JSX</option>
+                    <option value=".tsx">TSX</option>
+                    <option value=".html">HTML</option>
+                    <option value=".css">CSS</option>
+                    <option value=".vue">Vue</option>
+                  </optgroup>
+                  <optgroup label="Backend">
+                    <option value=".py">Python</option>
+                    <option value=".java">Java</option>
+                    <option value=".kt">Kotlin</option>
+                    <option value=".cs">C#</option>
+                    <option value=".go">Go</option>
+                    <option value=".rs">Rust</option>
+                    <option value=".rb">Ruby</option>
+                    <option value=".php">PHP</option>
+                    <option value=".scala">Scala</option>
+                    <option value=".swift">Swift</option>
+                    <option value=".dart">Dart</option>
+                    <option value=".ex">Elixir</option>
+                  </optgroup>
+                  <optgroup label="Systems">
+                    <option value=".c">C</option>
+                    <option value=".cpp">C++</option>
+                    <option value=".h">C Header</option>
+                    <option value=".zig">Zig</option>
+                    <option value=".m">Objective-C</option>
+                  </optgroup>
+                  <optgroup label="Functional">
+                    <option value=".elm">Elm</option>
+                    <option value=".ml">OCaml</option>
+                  </optgroup>
+                  <optgroup label="Data/Config">
+                    <option value=".json">JSON</option>
+                    <option value=".yaml">YAML</option>
+                    <option value=".toml">TOML</option>
+                  </optgroup>
+                  <optgroup label="Other">
+                    <option value=".lua">Lua</option>
+                    <option value=".sh">Bash</option>
+                    <option value=".sol">Solidity</option>
+                  </optgroup>
+                </select>
+              </div>
               <textarea
                 className="flex-1 bg-slate-900 font-mono text-green-300 p-3 rounded-lg border border-slate-600 text-sm resize-none"
                 value={codeInput}
                 onChange={(e) => setCodeInput(e.target.value)}
-                placeholder="Enter JavaScript/TypeScript code..."
+                placeholder="Enter code..."
                 spellCheck={false}
               />
               <div className="flex gap-2 items-center">
@@ -429,6 +489,40 @@ function FileItem({ file, isSelected, onClick }) {
   const hasError = !!file.error;
   const refCount = (file.outgoingRefs?.length || 0) + (file.incomingRefs?.length || 0);
   
+  // Language icon based on extension
+  const getIcon = (filename) => {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    const icons = {
+      // Web
+      js: '🟨', mjs: '🟨', cjs: '🟨',
+      jsx: '⚛️', tsx: '⚛️',
+      ts: '🔷', 
+      html: '🌐', htm: '🌐', 
+      css: '🎨',
+      vue: '💚',
+      // Python
+      py: '🐍', pyw: '🐍',
+      // JVM
+      java: '☕', kt: '🟪', kts: '🟪', scala: '🔴', sc: '🔴',
+      // C family
+      c: '🔵', cpp: '🔵', cc: '🔵', cxx: '🔵',
+      h: '📋', hpp: '📋', hxx: '📋', hh: '📋',
+      // Other compiled
+      cs: '💜', go: '🐹', rs: '🦀', swift: '🍊', dart: '🎯', zig: '⚡',
+      // Scripting
+      rb: '💎', erb: '💎', php: '🐘', lua: '🌙',
+      // Functional
+      ex: '💧', exs: '💧', elm: '🌳', ml: '🐫', mli: '🐫',
+      // Shell
+      sh: '🐚', bash: '🐚', zsh: '🐚',
+      // Data/Config
+      json: '📋', yaml: '📋', yml: '📋', toml: '📋',
+      // Other
+      m: '🍎', mm: '🍎', sol: '💠'
+    };
+    return icons[ext] || '📄';
+  };
+  
   return (
     <button
       onClick={onClick}
@@ -441,10 +535,15 @@ function FileItem({ file, isSelected, onClick }) {
       }`}
     >
       <span className="flex-1 font-mono truncate">
-        {hasError ? '⚠️' : '📄'} {file.name}
+        {hasError ? '⚠️' : getIcon(file.name)} {file.name}
       </span>
+      {file.language && (
+        <span className="px-1 py-0.5 bg-slate-600/50 rounded text-[10px] text-slate-400">
+          {file.language}
+        </span>
+      )}
       {refCount > 0 && (
-        <span className="px-1.5 py-0.5 bg-slate-700 rounded text-xs text-slate-400">
+        <span className="px-1.5 py-0.5 bg-cyan-900/50 rounded text-xs text-cyan-400">
           {refCount}
         </span>
       )}
