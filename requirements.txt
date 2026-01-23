@@ -53,3 +53,8 @@ isort>=5.13.0
 
 # Static type checking (development)
 mypy>=1.8.0
+
+# === AST TREE-SITTER ===
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0

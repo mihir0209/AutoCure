@@ -19,7 +19,7 @@ try {
     console.log('Self-Healer client not available, using file logging');
 }
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 9002;
 const LOG_FILE = process.env.LOG_FILE || path.join(__dirname, '..', 'logs', 'service.log');
 
 // Ensure log directory exists

@@ -1,0 +1,595 @@
+"""
+AST Trace Service for the Self-Healing Software System v2.0
+
+Provides AST-based error tracing with cross-file reference resolution.
+This service enhances error context by:
+- Building complete AST for error files
+- Tracing imports to find cross-file dependencies  
+- Detecting project requirements (package.json, requirements.txt, etc.)
+- Generating rich context for AI analysis
+"""
+
+import os
+import json
+import re
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Set
+from dataclasses import dataclass, field
+
+from utils.models import ASTNode, ASTContext
+from utils.logger import setup_colored_logger
+from services.ast_service import get_ast_service, ASTService
+
+logger = setup_colored_logger("ast_trace_service")
+
+
+# ==========================================
+# Data Models for Tracing
+# ==========================================
+
+@dataclass
+class Reference:
+    """Cross-file reference (import/export)."""
+    from_file: str
+    to_file: str
+    symbol_name: str
+    line_number: int
+    ref_type: str = "import"  # "import", "export", "call"
+    resolved_path: Optional[str] = None
+
+
+@dataclass
+class ProjectRequirements:
+    """Detected project dependencies."""
+    language: str
+    manifest_file: str
+    manifest_content: str = ""
+    dependencies: Dict[str, str] = field(default_factory=dict)  # name -> version
+    dev_dependencies: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ASTTraceContext:
+    """Complete AST trace for error analysis."""
+    error_file: str
+    error_line: int
+    main_ast: Optional[ASTNode] = None
+    references: List[Reference] = field(default_factory=list)
+    referenced_files: Dict[str, ASTNode] = field(default_factory=dict)  # file -> AST
+    error_path: List[ASTNode] = field(default_factory=list)  # Path from root to error
+    source_code: str = ""
+    error_context_code: str = ""  # Code around error line
+    requirements: Optional[ProjectRequirements] = None
+
+
+class ASTTraceService:
+    """
+    Service for building rich AST-based error context.
+    
+    Features:
+    - Complete AST trace with error line annotation
+    - Cross-file reference resolution (imports/exports)
+    - Project requirements detection
+    - Rich context building for AI consumption
+    """
+    
+    # Common requirement manifest files
+    MANIFEST_FILES = {
+        "javascript": ["package.json"],
+        "typescript": ["package.json"],
+        "python": ["requirements.txt", "pyproject.toml", "setup.py", "Pipfile"],
+        "java": ["pom.xml", "build.gradle", "build.gradle.kts"],
+        "go": ["go.mod"],
+        "rust": ["Cargo.toml"],
+        "ruby": ["Gemfile"],
+        "php": ["composer.json"],
+    }
+    
+    def __init__(self):
+        """Initialize the AST trace service."""
+        self.ast_service = get_ast_service()
+    
+    def trace_error(
+        self,
+        error_file: str,
+        error_line: int,
+        repo_path: str,
+        source_code: Optional[str] = None
+    ) -> ASTTraceContext:
+        """
+        Build complete AST trace for an error.
+        
+        Args:
+            error_file: Path to the file containing the error
+            error_line: Line number of the error
+            repo_path: Root path of the repository
+            source_code: Optional source code (if file content is provided)
+            
+        Returns:
+            ASTTraceContext with full trace information
+        """
+        logger.info(f"Tracing error at {error_file}:{error_line}")
+        
+        # Initialize context
+        context = ASTTraceContext(
+            error_file=error_file,
+            error_line=error_line
+        )
+        
+        # Get source code
+        full_path = os.path.join(repo_path, error_file) if repo_path else error_file
+        if source_code:
+            context.source_code = source_code
+        elif os.path.exists(full_path):
+            try:
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    context.source_code = f.read()
+            except Exception as e:
+                logger.error(f"Failed to read file {full_path}: {e}")
+        
+        # Extract context around error line
+        if context.source_code:
+            context.error_context_code = self._extract_context_lines(
+                context.source_code, error_line, context_lines=10
+            )
+        
+        # Parse main file AST
+        if context.source_code:
+            language = self.ast_service.detect_language(error_file)
+            if language:
+                context.main_ast = self.ast_service.parse_code(
+                    context.source_code, language, error_file
+                )
+                
+                # Find path to error line
+                if context.main_ast:
+                    context.error_path = self._find_error_path(
+                        context.main_ast, error_line
+                    )
+        
+        # Extract references and trace to other files
+        if context.source_code:
+            context.references = self._extract_references(
+                context.source_code, error_file
+            )
+            
+            # Resolve references to actual files
+            context.references = self._resolve_references(
+                context.references, repo_path
+            )
+            
+            # Parse referenced files (limited depth)
+            for ref in context.references[:5]:  # Limit to 5 references
+                if ref.resolved_path and ref.resolved_path not in context.referenced_files:
+                    referenced_ast = self.ast_service.parse_file(ref.resolved_path)
+                    if referenced_ast:
+                        context.referenced_files[ref.resolved_path] = referenced_ast
+        
+        # Detect project requirements
+        if repo_path:
+            context.requirements = self.detect_requirements(repo_path)
+        
+        logger.info(f"Trace complete: {len(context.references)} refs, "
+                   f"{len(context.referenced_files)} resolved files")
+        
+        return context
+    
+    def _extract_context_lines(
+        self, source_code: str, error_line: int, context_lines: int = 10
+    ) -> str:
+        """Extract code lines around the error."""
+        lines = source_code.split('\n')
+        start = max(0, error_line - context_lines - 1)
+        end = min(len(lines), error_line + context_lines)
+        
+        result = []
+        for i, line in enumerate(lines[start:end], start + 1):
+            marker = ">>> " if i == error_line else "    "
+            result.append(f"{marker}{i:4d} | {line}")
+        
+        return '\n'.join(result)
+    
+    def _find_error_path(self, root: ASTNode, error_line: int) -> List[ASTNode]:
+        """Find the path from root to the error line."""
+        path = []
+        
+        def traverse(node: ASTNode) -> bool:
+            if node.start_line <= error_line <= node.end_line:
+                path.append(node)
+                for child in node.children:
+                    if traverse(child):
+                        return True
+                return True
+            return False
+        
+        traverse(root)
+        return path
+    
+    def _extract_references(
+        self, source_code: str, file_path: str
+    ) -> List[Reference]:
+        """Extract import/export references from source code."""
+        references = []
+        lines = source_code.split('\n')
+        
+        # Detect language
+        language = self.ast_service.detect_language(file_path)
+        
+        for i, line in enumerate(lines, 1):
+            if language in ["javascript", "typescript"]:
+                refs = self._extract_js_imports(line, i, file_path)
+            elif language == "python":
+                refs = self._extract_python_imports(line, i, file_path)
+            elif language == "java":
+                refs = self._extract_java_imports(line, i, file_path)
+            elif language == "go":
+                refs = self._extract_go_imports(line, i, file_path)
+            else:
+                refs = []
+            
+            references.extend(refs)
+        
+        return references
+    
+    def _extract_js_imports(
+        self, line: str, line_num: int, from_file: str
+    ) -> List[Reference]:
+        """Extract JavaScript/TypeScript import references."""
+        refs = []
+        
+        # ES6 imports: import X from 'path'
+        es6_match = re.search(
+            r"import\s+(?:{[^}]+}|[\w,\s*]+)\s+from\s+['\"]([^'\"]+)['\"]",
+            line
+        )
+        if es6_match:
+            import_path = es6_match.group(1)
+            if import_path.startswith('.'):  # Relative import
+                refs.append(Reference(
+                    from_file=from_file,
+                    to_file=import_path,
+                    symbol_name=self._extract_import_symbols(line),
+                    line_number=line_num,
+                    ref_type="import"
+                ))
+        
+        # CommonJS: require('path')
+        cjs_match = re.search(r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", line)
+        if cjs_match:
+            import_path = cjs_match.group(1)
+            if import_path.startswith('.'):
+                refs.append(Reference(
+                    from_file=from_file,
+                    to_file=import_path,
+                    symbol_name="",
+                    line_number=line_num,
+                    ref_type="require"
+                ))
+        
+        return refs
+    
+    def _extract_python_imports(
+        self, line: str, line_num: int, from_file: str
+    ) -> List[Reference]:
+        """Extract Python import references."""
+        refs = []
+        
+        # from X import Y
+        from_match = re.search(r"from\s+([\w.]+)\s+import", line)
+        if from_match:
+            module = from_match.group(1)
+            if not module.startswith('__'):
+                refs.append(Reference(
+                    from_file=from_file,
+                    to_file=module.replace('.', '/'),
+                    symbol_name=self._extract_python_import_symbols(line),
+                    line_number=line_num,
+                    ref_type="import"
+                ))
+        
+        # import X
+        import_match = re.search(r"^import\s+([\w.]+)", line)
+        if import_match:
+            module = import_match.group(1)
+            refs.append(Reference(
+                from_file=from_file,
+                to_file=module.replace('.', '/'),
+                symbol_name=module,
+                line_number=line_num,
+                ref_type="import"
+            ))
+        
+        return refs
+    
+    def _extract_java_imports(
+        self, line: str, line_num: int, from_file: str
+    ) -> List[Reference]:
+        """Extract Java import references."""
+        refs = []
+        
+        import_match = re.search(r"import\s+([\w.]+);", line)
+        if import_match:
+            package = import_match.group(1)
+            refs.append(Reference(
+                from_file=from_file,
+                to_file=package.replace('.', '/'),
+                symbol_name=package.split('.')[-1],
+                line_number=line_num,
+                ref_type="import"
+            ))
+        
+        return refs
+    
+    def _extract_go_imports(
+        self, line: str, line_num: int, from_file: str
+    ) -> List[Reference]:
+        """Extract Go import references."""
+        refs = []
+        
+        import_match = re.search(r'"([^"]+)"', line)
+        if import_match:
+            import_path = import_match.group(1)
+            refs.append(Reference(
+                from_file=from_file,
+                to_file=import_path,
+                symbol_name="",
+                line_number=line_num,
+                ref_type="import"
+            ))
+        
+        return refs
+    
+    def _extract_import_symbols(self, line: str) -> str:
+        """Extract imported symbol names from JS import statement."""
+        # Match { X, Y, Z }
+        braces_match = re.search(r'{([^}]+)}', line)
+        if braces_match:
+            symbols = braces_match.group(1)
+            return symbols.strip()
+        
+        # Match default import
+        default_match = re.search(r'import\s+(\w+)\s+from', line)
+        if default_match:
+            return default_match.group(1)
+        
+        return ""
+    
+    def _extract_python_import_symbols(self, line: str) -> str:
+        """Extract imported symbol names from Python import statement."""
+        match = re.search(r'import\s+(.+)$', line)
+        if match:
+            return match.group(1).strip()
+        return ""
+    
+    def _resolve_references(
+        self, references: List[Reference], repo_path: str
+    ) -> List[Reference]:
+        """Resolve reference paths to actual file paths."""
+        if not repo_path:
+            return references
+        
+        resolved = []
+        for ref in references:
+            possible_paths = self._get_possible_paths(ref.to_file, repo_path)
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    ref.resolved_path = path
+                    break
+            
+            resolved.append(ref)
+        
+        return resolved
+    
+    def _get_possible_paths(self, import_path: str, repo_path: str) -> List[str]:
+        """Generate possible file paths for an import."""
+        # Clean the import path
+        clean_path = import_path.lstrip('./')
+        
+        # Common extensions to try
+        extensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go']
+        
+        paths = []
+        
+        # Direct file
+        base = os.path.join(repo_path, clean_path)
+        paths.append(base)
+        
+        # With extensions
+        for ext in extensions:
+            paths.append(base + ext)
+            paths.append(os.path.join(base, f"index{ext}"))
+        
+        return paths
+    
+    def detect_requirements(self, repo_path: str) -> Optional[ProjectRequirements]:
+        """
+        Detect project requirements from manifest files.
+        
+        Scans for package.json, requirements.txt, pom.xml, etc.
+        """
+        logger.info(f"Detecting requirements in {repo_path}")
+        
+        for language, manifests in self.MANIFEST_FILES.items():
+            for manifest in manifests:
+                manifest_path = os.path.join(repo_path, manifest)
+                if os.path.exists(manifest_path):
+                    try:
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        requirements = ProjectRequirements(
+                            language=language,
+                            manifest_file=manifest,
+                            manifest_content=content
+                        )
+                        
+                        # Parse based on manifest type
+                        if manifest == "package.json":
+                            requirements = self._parse_package_json(requirements, content)
+                        elif manifest == "requirements.txt":
+                            requirements = self._parse_requirements_txt(requirements, content)
+                        elif manifest == "pyproject.toml":
+                            requirements = self._parse_pyproject_toml(requirements, content)
+                        elif manifest == "pom.xml":
+                            requirements = self._parse_pom_xml(requirements, content)
+                        elif manifest == "go.mod":
+                            requirements = self._parse_go_mod(requirements, content)
+                        elif manifest == "Cargo.toml":
+                            requirements = self._parse_cargo_toml(requirements, content)
+                        
+                        logger.info(f"Found {len(requirements.dependencies)} dependencies in {manifest}")
+                        return requirements
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to parse {manifest_path}: {e}")
+        
+        return None
+    
+    def _parse_package_json(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse package.json for dependencies."""
+        try:
+            data = json.loads(content)
+            reqs.dependencies = data.get("dependencies", {})
+            reqs.dev_dependencies = data.get("devDependencies", {})
+        except json.JSONDecodeError:
+            pass
+        return reqs
+    
+    def _parse_requirements_txt(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse requirements.txt for dependencies."""
+        for line in content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                # Parse package==version or package>=version
+                match = re.match(r'^([a-zA-Z0-9_-]+)([<>=!]+)?([\d.]+)?', line)
+                if match:
+                    package = match.group(1)
+                    version = match.group(3) or "any"
+                    reqs.dependencies[package] = version
+        return reqs
+    
+    def _parse_pyproject_toml(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse pyproject.toml for dependencies."""
+        # Simple regex-based parsing for dependencies section
+        deps_match = re.search(r'\[project\].*?dependencies\s*=\s*\[(.*?)\]', 
+                               content, re.DOTALL)
+        if deps_match:
+            deps_str = deps_match.group(1)
+            for dep in re.findall(r'"([^"]+)"', deps_str):
+                match = re.match(r'^([a-zA-Z0-9_-]+)', dep)
+                if match:
+                    reqs.dependencies[match.group(1)] = "any"
+        return reqs
+    
+    def _parse_pom_xml(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse pom.xml for dependencies."""
+        # Simple regex parsing for dependencies
+        dep_pattern = r'<dependency>.*?<groupId>(.*?)</groupId>.*?<artifactId>(.*?)</artifactId>.*?<version>(.*?)</version>.*?</dependency>'
+        for match in re.finditer(dep_pattern, content, re.DOTALL):
+            group_id = match.group(1)
+            artifact_id = match.group(2)
+            version = match.group(3)
+            reqs.dependencies[f"{group_id}:{artifact_id}"] = version
+        return reqs
+    
+    def _parse_go_mod(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse go.mod for dependencies."""
+        for line in content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('//') and not line.startswith('module'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    reqs.dependencies[parts[0]] = parts[1]
+        return reqs
+    
+    def _parse_cargo_toml(
+        self, reqs: ProjectRequirements, content: str
+    ) -> ProjectRequirements:
+        """Parse Cargo.toml for dependencies."""
+        in_deps = False
+        for line in content.split('\n'):
+            line = line.strip()
+            if line == '[dependencies]':
+                in_deps = True
+                continue
+            if line.startswith('['):
+                in_deps = False
+            if in_deps and '=' in line:
+                parts = line.split('=', 1)
+                package = parts[0].strip()
+                version = parts[1].strip().strip('"\'')
+                reqs.dependencies[package] = version
+        return reqs
+    
+    def build_ai_context(self, trace: ASTTraceContext) -> str:
+        """
+        Build a rich context string for AI analysis.
+        
+        This creates a structured message that includes:
+        - Error location and context code
+        - AST path to error
+        - Cross-file references
+        - Project dependencies
+        """
+        sections = []
+        
+        # Error location
+        sections.append(f"## Error Location\n")
+        sections.append(f"File: `{trace.error_file}`\n")
+        sections.append(f"Line: {trace.error_line}\n")
+        
+        # Context code with error line marked
+        if trace.error_context_code:
+            sections.append(f"\n## Code Context\n")
+            sections.append(f"```\n{trace.error_context_code}\n```\n")
+        
+        # AST path
+        if trace.error_path:
+            sections.append(f"\n## AST Path to Error\n")
+            for i, node in enumerate(trace.error_path):
+                indent = "  " * i
+                sections.append(f"{indent}└─ {node.node_type}: {node.name} "
+                              f"(lines {node.start_line}-{node.end_line})\n")
+        
+        # Cross-file references
+        if trace.references:
+            sections.append(f"\n## Cross-File References\n")
+            for ref in trace.references[:10]:  # Limit
+                resolved = "✓" if ref.resolved_path else "✗"
+                sections.append(f"- [{resolved}] Line {ref.line_number}: "
+                              f"{ref.ref_type} `{ref.symbol_name}` from `{ref.to_file}`\n")
+        
+        # Dependencies
+        if trace.requirements:
+            sections.append(f"\n## Project Dependencies ({trace.requirements.language})\n")
+            sections.append(f"Manifest: `{trace.requirements.manifest_file}`\n")
+            for pkg, ver in list(trace.requirements.dependencies.items())[:20]:
+                sections.append(f"- {pkg}: {ver}\n")
+        
+        return ''.join(sections)
+
+
+# ==========================================
+# Singleton
+# ==========================================
+
+_trace_service: Optional[ASTTraceService] = None
+
+
+def get_ast_trace_service() -> ASTTraceService:
+    """Get or create the AST trace service singleton."""
+    global _trace_service
+    if _trace_service is None:
+        _trace_service = ASTTraceService()
+    return _trace_service

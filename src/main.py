@@ -35,6 +35,13 @@ from services import (
     get_log_analyzer, get_ast_service, get_ai_analyzer, get_email_service,
     get_github_service, get_error_replicator,
 )
+# Import AST trace and confidence validation services
+try:
+    from services.ast_trace_service import get_ast_trace_service
+    from services.confidence_validator import get_confidence_validator
+except ImportError:
+    get_ast_trace_service = None
+    get_confidence_validator = None
 
 logger = setup_colored_logger("server")
 
@@ -119,9 +126,11 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
     """
     Full error analysis pipeline:
     1. Parse error and extract details
-    2. Get AI root cause analysis
-    3. Generate fix proposal
-    4. Send email notification
+    2. Build AST trace for error context
+    3. Get AI root cause analysis
+    4. Run multi-iteration confidence validation
+    5. Generate fix proposal (if high confidence)
+    6. Send email notification with AST trace
     """
     config = get_config()
     
@@ -153,55 +162,124 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         
         logger.info(f"Detected error: {detected_error.error_type} - {detected_error.message[:50]}")
         
-        # 2. Get root cause analysis from AI
+        # 2. Build AST trace for error context (if possible)
+        ast_trace = None
+        repo_info = user_repos.get(user_id)
+        
+        if get_ast_trace_service and detected_error.source_file and detected_error.source_file != "unknown":
+            try:
+                ast_trace_service = get_ast_trace_service()
+                repo_path = str(repo_info.local_path) if repo_info and repo_info.local_path else ""
+                
+                ast_trace = ast_trace_service.trace_error(
+                    error_file=detected_error.source_file,
+                    error_line=detected_error.line_number or 1,
+                    repo_path=repo_path,
+                    source_code=None  # Will read from file
+                )
+                logger.info(f"AST trace built: {len(ast_trace.error_path)} nodes in path, "
+                           f"{len(ast_trace.references)} references")
+            except Exception as e:
+                logger.warning(f"AST trace failed (continuing without it): {e}")
+                ast_trace = None
+        
+        # 3. Get root cause analysis from AI
+        ast_context = None
+        ast_trace_service = None
+        
+        if get_ast_trace_service:
+            ast_trace_service = get_ast_trace_service()
+        
+        if ast_trace and ast_trace.main_ast and ast_trace_service:
+            # Build AI context from AST trace
+            try:
+                ast_context = ast_trace_service.build_ai_context(ast_trace)
+            except Exception as e:
+                logger.warning(f"Failed to build AI context from AST trace: {e}")
+        
         analysis = await ai_analyzer.analyze_error(
             error=detected_error,
-            ast_context=None,  # Would come from AST service if repo is synced
-            source_code=None,
+            ast_context=ast_context,
+            source_code=ast_trace.error_context_code if ast_trace else None,
         )
         
-        logger.info(f"AI Analysis complete - Confidence: {analysis.confidence:.0%}")
+        logger.info(f"AI Analysis complete - Initial Confidence: {analysis.confidence:.0%}")
         
-        # 3. Generate fix proposal
-        fix_proposals = await ai_analyzer.generate_fix_proposals(
-            error=detected_error,
-            analysis=analysis,
-            source_code="",  # No source code available without repo sync
-        )
+        # 4. Run multi-iteration confidence validation
+        validation_result = None
+        if get_confidence_validator and detected_error.api_endpoint:
+            try:
+                confidence_validator = get_confidence_validator()
+                validation_result = await confidence_validator.validate_error(
+                    error=detected_error,
+                    initial_analysis=analysis,
+                    base_url=None  # Use default from config
+                )
+                logger.info(f"Validation complete - Final Confidence: {validation_result.confidence_score:.0f}%")
+                
+                if not validation_result.confidence_met:
+                    logger.warning(f"Confidence {validation_result.confidence_score:.0f}% below threshold - "
+                                  "will show possible causes instead of fix proposals")
+            except Exception as e:
+                logger.warning(f"Confidence validation failed (using initial analysis): {e}")
+                validation_result = None
         
-        fix_proposal = fix_proposals[0] if fix_proposals else None
+        # 5. Generate fix proposal (only if high confidence or no validation)
+        fix_proposals = []
+        should_suggest_fixes = True
         
-        if fix_proposal:
-            logger.info(f"Fix proposal generated: {fix_proposal.explanation[:50]}")
+        if validation_result:
+            should_suggest_fixes = validation_result.confidence_met
+        
+        if should_suggest_fixes:
+            fix_proposals = await ai_analyzer.generate_fix_proposals(
+                error=detected_error,
+                analysis=analysis,
+                source_code=ast_trace.error_context_code if ast_trace else "",
+            )
+            
+            if fix_proposals:
+                logger.info(f"Generated {len(fix_proposals)} fix proposal(s)")
+            else:
+                logger.info("No specific fix proposals generated")
         else:
-            logger.info("No specific fix proposals generated")
+            logger.info("Skipping fix proposal generation due to low confidence")
         
-        # 4. Determine recipient email
+        # 6. Determine recipient email
         registration = user_registrations.get(user_id)
         to_email = config.email.admin_email
         if registration and hasattr(registration, 'notification_email') and registration.notification_email:
             to_email = registration.notification_email
         
-        # 5. Send email notification
+        # 7. Send email notification with AST trace and validation results
         if config.email.enable_notifications and to_email:
             await email_service.send_analysis_email(
                 to_email=to_email,
                 analysis=analysis,
-                proposals=fix_proposals,  # List of fix proposals
+                proposals=fix_proposals,
+                ast_trace=ast_trace,  # Include AST trace
+                validation_result=validation_result,  # Include validation results
             )
             logger.info(f"Email sent to {to_email}")
         else:
             logger.warning("Email notifications disabled or no recipient configured")
         
-        # 6. Notify via WebSocket
+        # 8. Notify via WebSocket
+        confidence_score = validation_result.confidence_score if validation_result else (analysis.confidence * 100)
+        confidence_met = validation_result.confidence_met if validation_result else (confidence_score >= 75)
+        
         await manager.send_message(user_id, WebSocketMessage(
             type="analysis_complete",
             user_id=user_id,
             payload={
                 "error_type": detected_error.error_type,
                 "root_cause": analysis.root_cause,
-                "confidence": analysis.confidence,
-                "fix_summary": fix_proposal.explanation[:100] if fix_proposal else "No fix proposal generated",
+                "confidence": confidence_score,
+                "confidence_met": confidence_met,
+                "ast_trace_available": ast_trace is not None,
+                "validation_iterations": len(validation_result.iterations) if validation_result else 0,
+                "fix_proposals_count": len(fix_proposals),
+                "fix_summary": fix_proposals[0].explanation[:100] if fix_proposals else "No fix proposal generated",
                 "email_sent": bool(to_email and config.email.enable_notifications),
             },
         ))

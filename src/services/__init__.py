@@ -16,6 +16,8 @@ from .github_service import GitHubService
 from .error_replicator import ErrorReplicator
 from .ai_analyzer import AIAnalyzer
 from .email_service import EmailService
+from .ast_trace_service import ASTTraceService, get_ast_trace_service
+from .confidence_validator import ConfidenceValidator, get_confidence_validator
 
 
 # Singleton instances (lazy initialization)
@@ -81,10 +83,14 @@ __all__ = [
     "ErrorReplicator",
     "AIAnalyzer",
     "EmailService",
+    "ASTTraceService",
+    "ConfidenceValidator",
     "get_log_analyzer",
     "get_ast_service",
     "get_github_service",
     "get_error_replicator",
     "get_ai_analyzer",
     "get_email_service",
+    "get_ast_trace_service",
+    "get_confidence_validator",
 ]
