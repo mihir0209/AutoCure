@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Reports{% endblock %}
+{% block page_title %}<i class="ph ph-file-text"></i> Reports{% endblock %}
+
+{% block content %}
+<div class="stats-grid mb-6" id="reportStats">
+  <div class="stat-card">
+    <div class="stat-icon yellow"><i class="ph ph-file-text"></i></div>
+    <div><div class="stat-value" id="rptTotal">--</div><div class="stat-label">Total Reports</div></div>
+  </div>
+</div>
+
+<div class="filter-bar mb-4">
+  <input class="form-input" id="rptFilterUser" placeholder="Filter user..." style="width:180px">
+  <input class="form-input" id="rptFilterError" placeholder="Filter error type..." style="width:180px">
+  <button class="btn btn-sm" onclick="rptPage=0;loadReports()"><i class="ph ph-funnel"></i> Apply</button>
+  <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="loadStats();loadReports()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
+</div>
+
+<div class="card">
+  <div class="card-body" style="padding:0;">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Severity</th>
+            <th>Error Type</th>
+            <th>Source</th>
+            <th>Confidence</th>
+            <th>Fixes</th>
+            <th>Created</th>
+            <th style="text-align:right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rptTableBody">
+          <tr><td colspan="7"><div class="empty-state"><i class="ph ph-file-text"></i><p>No reports yet. Reports are generated when errors are analysed.</p></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div class="pagination" id="rptPagination"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+var rptPage = 0, RPT_LIMIT = 20;
+
+var SEV_BADGE = {
+  critical: 'badge-danger', high: 'badge-danger',
+  medium: 'badge-warning', low: 'badge-info',
+  approve: 'badge-success', request_changes: 'badge-danger', comment: 'badge-warning',
+};
+
+async function loadStats() {
+  try {
+    var s = await api('/api/v1/reports/stats');
+    document.getElementById('rptTotal').textContent = s.total || 0;
+    document.getElementById('rptConfidence').textContent = (s.avg_confidence || 0).toFixed(0) + '%';
+    document.getElementById('rptErrors').textContent = s.unique_error_types || 0;
+    document.getElementById('rptFixes').textContent = s.total_proposals || 0;
+  } catch(e) { /* ignore */ }
+}
+
+async function loadReports() {
+  try {
+    var params = new URLSearchParams({ limit: RPT_LIMIT, offset: rptPage * RPT_LIMIT });
+    var user = document.getElementById('rptFilterUser').value.trim();
+    var errType = document.getElementById('rptFilterError').value.trim();
+    if (user) params.set('user_id', user);
+    if (errType) params.set('error_type', errType);
+
+    var data = await api('/api/v1/reports?' + params);
+    var reports = data.reports || [];
+    var total = data.total || 0;
+    var totalPages = Math.max(1, Math.ceil(total / RPT_LIMIT));
+    var tbody = document.getElementById('rptTableBody');
+
+    if (reports.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state"><i class="ph ph-file-text"></i><p>No reports found.</p></div></td></tr>';
+    } else {
+      tbody.innerHTML = reports.map(function(r) {
+        var confCls = r.confidence >= 0.75 ? 'badge-success' : (r.confidence >= 0.5 ? 'badge-warning' : 'badge-danger');
+        return '<tr>' +
+          '<td><span class="badge ' + (SEV_BADGE[r.severity]||'badge-info') + '">' + escapeHtml(r.severity) + '</span></td>' +
+          '<td class="mono text-sm">' + escapeHtml(r.error_type) + '</td>' +
+          '<td class="text-sm text-muted truncate" style="max-width:200px">' + (r.source_file ? escapeHtml(r.source_file)+':'+r.line_number : '&mdash;') + '</td>' +
+          '<td><span class="badge ' + confCls + '">' + (r.confidence*100).toFixed(0) + '%</span></td>' +
+          '<td>' + r.proposals_count + '</td>' +
+          '<td class="text-sm text-muted">' + timeAgo(r.created_at) + '</td>' +
+          '<td style="text-align:right">' +
+            '<a href="'+r.view_url+'" target="_blank" class="btn btn-sm btn-primary"><i class="ph ph-eye"></i> View</a> ' +
+            '<button class="btn btn-sm btn-danger" onclick="deleteReport(\''+r.report_id+'\')"><i class="ph ph-trash"></i></button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    var pag = document.getElementById('rptPagination');
+    if (totalPages > 1) {
+      pag.innerHTML =
+        '<button class="btn btn-sm" '+(rptPage===0?'disabled':'')+' onclick="rptPage--;loadReports()"><i class="ph ph-caret-left"></i> Prev</button>' +
+        '<span class="text-sm text-muted">Page '+(rptPage+1)+' / '+totalPages+'</span>' +
+        '<button class="btn btn-sm" '+(rptPage>=totalPages-1?'disabled':'')+' onclick="rptPage++;loadReports()">Next <i class="ph ph-caret-right"></i></button>';
+    } else {
+      pag.innerHTML = '';
+    }
+  } catch(e) {
+    showToast('Failed to load reports', 'error');
+  }
+}
+
+async function deleteReport(id) {
+  if (!confirm('Delete this report?')) return;
+  try {
+    await fetch('/api/v1/reports/'+id, { method: 'DELETE' });
+    showToast('Report deleted', 'success');
+    loadReports(); loadStats();
+  } catch(e) {
+    showToast('Delete failed', 'error');
+  }
+}
+
+loadStats();
+loadReports();
+</script>
+{% endblock %}

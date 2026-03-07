@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, memo, useCallback } from "react";
+import { FileCodeIcon } from "@phosphor-icons/react";
 
 /**
  * CodePanel - Displays file content with syntax highlighting and line highlighting
@@ -49,7 +50,7 @@ const CodePanel = memo(({ content, highlightLine, filename, onLineClick, nodesBy
     <div className="h-full flex flex-col bg-slate-900">
       {/* Header */}
       <div className="px-4 py-2 bg-slate-800 border-b border-slate-700 flex items-center gap-2 shrink-0">
-        <span className="text-sm text-slate-300 font-mono">📝 {filename}</span>
+        <span className="text-sm text-slate-300 font-mono flex items-center gap-1"><FileCodeIcon size={14} /> {filename}</span>
         {highlightLine && (
           <span className="text-xs bg-blue-600 px-2 py-0.5 rounded">Line {highlightLine}</span>
         )}

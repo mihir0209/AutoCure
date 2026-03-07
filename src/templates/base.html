@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Dashboard{% endblock %} | AutoCure</title>
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+  <link rel="stylesheet" href="/static/css/style.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <i class="ph ph-first-aid-kit"></i>
+        <span>AutoCure</span>
+      </div>
+      <nav class="sidebar-nav">
+        <a href="/" class="sidebar-link {% if page == 'dashboard' %}active{% endif %}">
+          <i class="ph ph-chart-line-up"></i><span>Dashboard</span>
+        </a>
+        <a href="/connections" class="sidebar-link {% if page == 'connections' %}active{% endif %}">
+          <i class="ph ph-plugs-connected"></i><span>Connections</span>
+        </a>
+        <a href="/logs" class="sidebar-link {% if page == 'logs' %}active{% endif %}">
+          <i class="ph ph-terminal-window"></i><span>Logs</span>
+        </a>
+        <a href="/reports" class="sidebar-link {% if page == 'reports' %}active{% endif %}">
+          <i class="ph ph-file-text"></i><span>Reports</span>
+        </a>
+        <a href="/integration" class="sidebar-link {% if page == 'integration' %}active{% endif %}">
+          <i class="ph ph-code-block"></i><span>Integration</span>
+        </a>
+        <a href="/visualizer" class="sidebar-link {% if page == 'visualizer' %}active{% endif %}">
+          <i class="ph ph-tree-structure"></i><span>AST Visualizer</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-user">
+          <i class="ph ph-user-circle"></i>
+          <span>{{ user.username }}</span>
+        </div>
+        <a href="/logout" class="sidebar-link">
+          <i class="ph ph-sign-out"></i><span>Logout</span>
+        </a>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <h1 class="topbar-title">{% block page_title %}Dashboard{% endblock %}</h1>
+        <div class="topbar-actions">
+          <span class="ws-status" id="wsStatus">
+            <i class="ph ph-circle"></i>
+            <span>Connecting...</span>
+          </span>
+        </div>
+      </header>
+      <div class="content">
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+  <script src="/static/js/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

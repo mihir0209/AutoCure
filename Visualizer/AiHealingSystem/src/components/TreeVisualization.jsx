@@ -1,4 +1,5 @@
 import React, { useState, useCallback, memo, useRef, useEffect } from "react";
+import { TreeStructureIcon } from "@phosphor-icons/react";
 
 /**
  * TreeVisualization - Renders AST as an interactive tree graph
@@ -176,7 +177,7 @@ const TreeVisualization = memo(({ tree, onNodeClick, onReferenceClick, focusedNo
     return (
       <div className="h-full flex items-center justify-center text-slate-500">
         <div className="text-center">
-          <div className="text-6xl mb-4">🌳</div>
+          <TreeStructureIcon size={64} weight="duotone" className="mb-4 opacity-50" />
           <p>No tree data</p>
         </div>
       </div>

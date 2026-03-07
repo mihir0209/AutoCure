@@ -116,3 +116,6 @@ output/
 ai-fix-*
 *.bak
 *.backup
+
+reports/
+repos/

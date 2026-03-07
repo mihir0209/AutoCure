@@ -4,10 +4,20 @@ Provides consistent logging across all components.
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+# Force unbuffered output globally
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+
+# Always log to a file as well, so we never lose webhook logs
+_LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_APP_LOG_FILE = _LOG_DIR / "app.log"
 
 
 def setup_logger(
@@ -42,12 +52,18 @@ def setup_logger(
     
     # Console handler
     if console_output:
-        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler = FlushingStreamHandler()
         console_handler.setLevel(level)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
     
-    # File handler
+    # File handler (always add app-wide log)
+    file_handler = logging.FileHandler(_APP_LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Additional file handler
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
@@ -61,6 +77,17 @@ def setup_logger(
 def get_logger(name: str) -> logging.Logger:
     """Get an existing logger by name."""
     return logging.getLogger(name)
+
+
+class FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that writes to stderr and flushes after every record.
+    stderr is unbuffered on most platforms, avoiding lost logs on Windows."""
+    def __init__(self):
+        super().__init__(sys.stderr)
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
 
 class ColoredFormatter(logging.Formatter):
@@ -83,16 +110,25 @@ class ColoredFormatter(logging.Formatter):
 
 
 def setup_colored_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Set up a logger with colored console output."""
+    """Set up a logger with colored console output + file logging."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.handlers.clear()
     
-    handler = logging.StreamHandler(sys.stdout)
+    handler = FlushingStreamHandler()
     handler.setFormatter(ColoredFormatter(
         fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     ))
     logger.addHandler(handler)
+    
+    # Always log to file as well
+    file_handler = logging.FileHandler(_APP_LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(file_handler)
     
     return logger

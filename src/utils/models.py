@@ -55,18 +55,30 @@ class ReplicationResult(str, Enum):
 class UserRegistration(BaseModel):
     """User registration data"""
     user_id: str
-    email: str
-    repo_url: str
-    repo_token: str  # Read-only access token
+    email: str = ""
+    repo_url: str = ""
+    repo_token: str = ""  # Read-only access token
+    access_token: str = ""  # Alias for repo_token
     base_branch: str = "main"
+    notification_email: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
+
+    def model_post_init(self, __context):
+        # Sync access_token and repo_token
+        if self.repo_token and not self.access_token:
+            self.access_token = self.repo_token
+        elif self.access_token and not self.repo_token:
+            self.repo_token = self.access_token
 
 
 class RepositoryInfo(BaseModel):
     """Repository information"""
-    repo_url: str
-    base_branch: str
-    local_path: str
+    repo_url: str = ""
+    base_branch: str = "main"
+    local_path: str = ""
+    user_id: str = ""
+    current_branch: str = ""
+    latest_commit: str = ""
     last_pulled: Optional[datetime] = None
     file_count: int = 0
     languages: List[str] = Field(default_factory=list)
@@ -164,33 +176,50 @@ class ASTVisualization(BaseModel):
 
 class APIReplicationRequest(BaseModel):
     """Request for replicating API call"""
-    endpoint: str
-    method: str
+    model_config = {"extra": "ignore"}
+
+    url: str = ""
+    endpoint: str = ""
+    method: str = "GET"
+    payload: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    headers: Dict[str, str] = Field(default_factory=dict)
     original_payload: Dict[str, Any] = Field(default_factory=dict)
-    variation_type: str = "exact"  # "exact", "null_field", "empty_string", "type_mismatch"
     modified_payload: Dict[str, Any] = Field(default_factory=dict)
+    variation_type: str = "original"
     autocure_try: bool = True
 
 
 class APIReplicationResult(BaseModel):
     """Result of an API replication attempt"""
+    model_config = {"extra": "ignore"}
+
     request: APIReplicationRequest
-    result: ReplicationResult
-    response_status: Optional[int] = None
+    success: bool = False
+    status_code: int = 0
+    response_body: str = ""
+    error_reproduced: bool = False
     error_message: Optional[str] = None
     response_time_ms: float = 0.0
+    result: Optional[ReplicationResult] = None
+    response_status: Optional[int] = None
     timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class ErrorReplicationSummary(BaseModel):
     """Summary of all replication attempts for an error"""
-    error_id: str
+    model_config = {"extra": "ignore"}
+
+    error_id: str = ""
+    error: Optional[Any] = None  # The DetectedError being replicated
+    results: List[APIReplicationResult] = Field(default_factory=list)
+    is_reproducible: bool = False
+    reproduction_rate: float = 0.0
+    error_patterns: List[str] = Field(default_factory=list)
     total_attempts: int = 0
     same_error_count: int = 0
     different_error_count: int = 0
     no_error_count: int = 0
     timeout_count: int = 0
-    results: List[APIReplicationResult] = Field(default_factory=list)
     conclusion: str = ""
 
 
@@ -220,6 +249,16 @@ class RootCauseAnalysis(BaseModel):
     references: List[str] = Field(default_factory=list)
 
 
+class EdgeTestCase(BaseModel):
+    """An edge test case that demonstrates the original bug."""
+    test_name: str = ""
+    description: str = ""
+    test_code: str = ""
+    expected_behavior: str = ""
+    original_would_fail: bool = True  # Original code fails this test
+    fix_would_pass: bool = True       # Proposed fix passes this test
+
+
 class FixProposal(BaseModel):
     """A proposed fix (not applied, just suggested)"""
     model_config = {"extra": "ignore"}
@@ -233,6 +272,7 @@ class FixProposal(BaseModel):
     risk_level: str = "medium"  # "low", "medium", "high"
     confidence: float = 0.0
     side_effects: List[str] = Field(default_factory=list)
+    test_cases: List[EdgeTestCase] = Field(default_factory=list)  # Edge tests for this fix
 
 
 # ==========================================
@@ -258,21 +298,25 @@ class PRInfo(BaseModel):
 class CodeReviewComment(BaseModel):
     """A code review comment"""
     file_path: str
-    line_number: int
+    line_number: int = 0
     comment_type: str = "suggestion"  # "suggestion", "issue", "question", "praise"
     severity: str = "info"  # "info", "warning", "error"
     message: str
     suggested_fix: Optional[str] = None
+    code_snippet: str = ""  # Relevant original code snippet for context
 
 
 class CodeReviewResult(BaseModel):
     """Complete code review result"""
     pr_info: PRInfo
     overall_score: float = 0.0  # 0-100
+    overall_assessment: str = "comment"  # "approve", "request_changes", "comment"
     summary: str = ""
     comments: List[CodeReviewComment] = Field(default_factory=list)
+    highlights: List[str] = Field(default_factory=list)
     issues_count: Dict[str, int] = Field(default_factory=dict)
     approved: bool = False
+    ast_insights: str = ""  # AST-based analysis findings
     reviewed_at: datetime = Field(default_factory=datetime.now)
 
 

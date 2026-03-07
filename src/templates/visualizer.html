@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}AST Visualizer{% endblock %}
+{% block page_title %}<i class="ph ph-tree-structure"></i> AST Visualizer{% endblock %}
+
+{% block content %}
+<div class="card mb-6">
+  <div class="card-header">
+    <h2><i class="ph ph-tree-structure"></i> Interactive AST Visualizer</h2>
+    <a href="{{ visualizer_url }}" target="_blank" class="btn btn-sm btn-primary">
+      <i class="ph ph-arrow-square-out"></i> Open Full Visualizer
+    </a>
+  </div>
+  <div class="card-body">
+    <p style="color:var(--text-secondary);font-size:14px;margin-bottom:16px;">
+      Paste code below to visualize its Abstract Syntax Tree, or parse a file from a registered service's repository.
+    </p>
+
+    <!-- Code input -->
+    <div class="grid-2" style="margin-bottom:16px;">
+      <div>
+        <label class="form-label"><i class="ph ph-code"></i> Code</label>
+        <textarea id="vizCode" class="form-input" rows="12"
+          style="font-family:'SFMono-Regular',Consolas,monospace;font-size:13px;resize:vertical;"
+          placeholder="Paste your code here...">def hello():
+    print("Hello, World!")
+
+class Greeter:
+    def greet(self, name):
+        return f"Hi, {name}!"
+</textarea>
+      </div>
+      <div>
+        <label class="form-label"><i class="ph ph-tree-structure"></i> AST Tree</label>
+        <div id="vizTree" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px;min-height:260px;max-height:500px;overflow:auto;font-size:13px;font-family:'SFMono-Regular',Consolas,monospace;">
+          <div class="empty-state"><i class="ph ph-tree-structure"></i><p>Click "Parse" to visualize the AST.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="filter-bar" style="gap:8px;">
+      <select id="vizLang" class="form-select" style="max-width:160px;">
+        <option value="python" selected>Python</option>
+        <option value="javascript">JavaScript</option>
+        <option value="typescript">TypeScript</option>
+        <option value="java">Java</option>
+        <option value="go">Go</option>
+        <option value="rust">Rust</option>
+        <option value="c">C</option>
+        <option value="cpp">C++</option>
+      </select>
+      <button class="btn btn-primary" onclick="parseCode()"><i class="ph ph-play"></i> Parse</button>
+      <button class="btn btn-sm" onclick="clearViz()"><i class="ph ph-trash"></i> Clear</button>
+    </div>
+  </div>
+</div>
+
+<!-- Parse file from repo -->
+<div class="card mb-6">
+  <div class="card-header"><h2><i class="ph ph-file-code"></i> Parse File from Repository</h2></div>
+  <div class="card-body">
+    <div class="filter-bar" style="gap:8px;margin-bottom:16px;">
+      <input type="text" id="vizUserId" class="form-input" placeholder="user-id" style="max-width:180px;">
+      <input type="text" id="vizFilePath" class="form-input" placeholder="src/main.py" style="flex:1;">
+      <button class="btn btn-primary" onclick="parseFile()"><i class="ph ph-file-search"></i> Parse File</button>
+    </div>
+    <div id="vizFileTree" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px;min-height:100px;max-height:500px;overflow:auto;font-size:13px;font-family:'SFMono-Regular',Consolas,monospace;">
+      <div class="empty-state"><i class="ph ph-file-code"></i><p>Enter a user ID and file path to parse a file from their repository.</p></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Colour palette (matching backend ASTAccordionBuilder) ──
+var NODE_COLORS = {
+  module:'#9C27B0', program:'#9C27B0',
+  'class':'#2196F3', class_definition:'#2196F3',
+  'function':'#4CAF50', function_definition:'#4CAF50',
+  method:'#8BC34A', async_function:'#00BCD4',
+  'import':'#FF9800', import_statement:'#FF9800', import_from_statement:'#FF9800',
+  variable:'#795548', assignment:'#607D8B',
+  call:'#E91E63', call_expression:'#E91E63',
+  'if':'#673AB7', if_statement:'#673AB7',
+  'for':'#3F51B5', for_statement:'#3F51B5',
+  'while':'#009688', while_statement:'#009688',
+  'try':'#FFC107', try_statement:'#FFC107',
+  except:'#FF5722', except_clause:'#FF5722',
+  'return':'#CDDC39', return_statement:'#CDDC39',
+  block:'#78909C', expression_statement:'#90A4AE',
+};
+
+function nodeColor(t) { return NODE_COLORS[(t||'').toLowerCase()] || '#9E9E9E'; }
+
+function renderASTNode(node, depth) {
+  if (!node) return '';
+  depth = depth || 0;
+  if (depth > 12) return '<span style="color:var(--text-muted);">...</span>';
+
+  var t = escapeHtml(node.node_type || node.type || '?');
+  var name = escapeHtml(node.name || t);
+  var color = nodeColor(t);
+  var line = node.start_line || node.startPosition && node.startPosition.row + 1 || '';
+  var endLine = node.end_line || '';
+  var lines = line ? ('L' + line + (endLine && endLine !== line ? '-' + endLine : '')) : '';
+  var snippet = '';
+  if (node.code_snippet || node.text) {
+    var s = (node.code_snippet || node.text || '').split('\n')[0].substring(0, 80);
+    snippet = '<div style="color:var(--text-muted);font-size:11px;margin:2px 0 0 24px;' +
+      'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:500px;' +
+      'padding:2px 6px;background:rgba(255,255,255,.04);border-radius:3px;">' +
+      '<code>' + escapeHtml(s) + '</code></div>';
+  }
+
+  var badge = '<span style="display:inline-block;padding:1px 7px;border-radius:4px;' +
+    'font-size:11px;font-weight:600;color:#fff;background:' + color + ';">' + t + '</span>';
+  var lineBadge = lines ? ' <span style="color:var(--text-muted);font-size:10px;padding:1px 5px;' +
+    'border-radius:3px;background:rgba(255,255,255,.06);">' + lines + '</span>' : '';
+
+  var kids = node.children || [];
+  if (kids.length > 0 && depth < 12) {
+    var childrenHtml = kids.slice(0, 40).map(function(c){ return renderASTNode(c, depth + 1); }).join('\n');
+    if (kids.length > 40) childrenHtml += '<div style="padding:4px 0 4px 18px;color:var(--text-muted);font-size:11px;">... ' + (kids.length - 40) + ' more</div>';
+    var open = depth < 2 ? ' open' : '';
+    return '<details' + open + ' style="margin:1px 0 1px 12px;padding:3px 0 3px 10px;' +
+      'border-left:2px solid ' + color + '55;border-radius:0 4px 4px 0;">' +
+      '<summary style="cursor:pointer;list-style:none;padding:3px 4px;">' +
+      '<span style="display:inline-block;width:14px;font-size:10px;color:var(--text-muted);margin-right:3px;">&#9654;</span>' +
+      badge + ' <strong>' + name + '</strong>' + lineBadge + '</summary>' +
+      snippet + '<div style="margin-left:8px;">' + childrenHtml + '</div></details>';
+  }
+
+  return '<div style="margin:1px 0 1px 12px;padding:4px 4px 4px 10px;' +
+    'border-left:2px solid ' + color + '55;border-radius:0 4px 4px 0;">' +
+    '<span style="display:inline-block;width:14px;margin-right:3px;font-size:10px;color:var(--text-muted);">&#9679;</span>' +
+    badge + ' <strong>' + name + '</strong>' + lineBadge + snippet + '</div>';
+}
+
+async function parseCode() {
+  var code = document.getElementById('vizCode').value;
+  var lang = document.getElementById('vizLang').value;
+  var tree = document.getElementById('vizTree');
+  if (!code.trim()) { showToast('Enter some code first', 'warning'); return; }
+  tree.innerHTML = '<div class="empty-state"><i class="ph ph-spinner" style="animation:spin 1s linear infinite;"></i><p>Parsing...</p></div>';
+  try {
+    var data = await api('/api/v1/parse/code', { method: 'POST', body: JSON.stringify({ code: code, language: lang }) });
+    tree.innerHTML = '<div style="font-family:\'SFMono-Regular\',Consolas,monospace;font-size:13px;">' +
+      renderASTNode(data.ast) + '</div>';
+  } catch(e) {
+    tree.innerHTML = '<div class="alert alert-danger"><i class="ph ph-warning-circle"></i> Parse failed. Check that tree-sitter is available for this language.</div>';
+    showToast('Parse failed', 'error');
+  }
+}
+
+async function parseFile() {
+  var userId = document.getElementById('vizUserId').value;
+  var filePath = document.getElementById('vizFilePath').value;
+  var tree = document.getElementById('vizFileTree');
+  if (!userId || !filePath) { showToast('Enter user ID and file path', 'warning'); return; }
+  tree.innerHTML = '<div class="empty-state"><i class="ph ph-spinner" style="animation:spin 1s linear infinite;"></i><p>Parsing...</p></div>';
+  try {
+    var data = await api('/api/v1/parse/file', { method: 'POST', body: JSON.stringify({ user_id: userId, file_path: filePath }) });
+    tree.innerHTML = '<p style="color:var(--text-muted);font-size:12px;margin-bottom:8px;">Language: <strong>' + escapeHtml(data.language) + '</strong></p>' +
+      '<div style="font-family:\'SFMono-Regular\',Consolas,monospace;font-size:13px;">' +
+      renderASTNode(data.ast) + '</div>';
+  } catch(e) {
+    tree.innerHTML = '<div class="alert alert-danger"><i class="ph ph-warning-circle"></i> Parse failed. Make sure the repo has been cloned and the file exists.</div>';
+    showToast('Parse failed', 'error');
+  }
+}
+
+function clearViz() {
+  document.getElementById('vizCode').value = '';
+  document.getElementById('vizTree').innerHTML = '<div class="empty-state"><i class="ph ph-tree-structure"></i><p>Click "Parse" to visualize the AST.</p></div>';
+}
+</script>
+{% endblock %}

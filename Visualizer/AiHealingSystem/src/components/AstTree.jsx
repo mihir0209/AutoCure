@@ -1,4 +1,5 @@
 import React, { useState, useCallback, memo } from "react";
+import { TreeStructureIcon } from "@phosphor-icons/react";
 
 // Lightweight custom tree component - NO react-d3-tree
 const ASTTree = memo(({ ast, highlightPath = [], references = [], onReferenceClick }) => {
@@ -38,7 +39,7 @@ const ASTTree = memo(({ ast, highlightPath = [], references = [], onReferenceCli
     return (
       <div className="h-full flex items-center justify-center text-slate-400">
         <div className="text-center">
-          <div className="text-4xl mb-2">🌳</div>
+          <TreeStructureIcon size={48} weight="duotone" className="mb-2 opacity-50" />
           <p>Select a file to view its AST</p>
         </div>
       </div>

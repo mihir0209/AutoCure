@@ -15,13 +15,18 @@ load_dotenv()
 
 class AIConfig(BaseModel):
     """AI Provider Configuration"""
-    provider: str = "groq"  # 'groq' or 'cerebras'
+    provider: str = "groq"  # 'groq', 'cerebras', or 'azure'
     groq_api_key: Optional[str] = None
     cerebras_api_key: Optional[str] = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
     cerebras_base_url: str = "https://api.cerebras.ai/v1"
     groq_model: str = "llama-3.3-70b-versatile"
     cerebras_model: str = "llama-3.3-70b"
+    # Azure OpenAI
+    azure_openai_endpoint: Optional[str] = None
+    azure_openai_api_key: Optional[str] = None
+    azure_openai_deployment: str = "gpt-4o-mini"
+    azure_api_version: str = "2024-12-01-preview"
     max_retries: int = 5
     initial_retry_delay: float = 2.0
     max_tokens: int = 8192
@@ -29,6 +34,8 @@ class AIConfig(BaseModel):
     @property
     def active_api_key(self) -> str:
         """Get the API key for the active provider"""
+        if self.provider == "azure":
+            return self.azure_openai_api_key or ""
         if self.provider == "groq":
             return self.groq_api_key or ""
         return self.cerebras_api_key or ""
@@ -36,6 +43,9 @@ class AIConfig(BaseModel):
     @property
     def active_base_url(self) -> str:
         """Get the base URL for the active provider"""
+        if self.provider == "azure":
+            ep = (self.azure_openai_endpoint or "").rstrip("/")
+            return f"{ep}/openai/deployments/{self.azure_openai_deployment}"
         if self.provider == "groq":
             return self.groq_base_url
         return self.cerebras_base_url
@@ -43,6 +53,8 @@ class AIConfig(BaseModel):
     @property
     def active_model(self) -> str:
         """Get the model for the active provider"""
+        if self.provider == "azure":
+            return self.azure_openai_deployment
         if self.provider == "groq":
             return self.groq_model
         return self.cerebras_model
@@ -142,7 +154,11 @@ def load_config() -> SystemConfig:
         groq_api_key=os.getenv("GROQ_API_KEY"),
         cerebras_api_key=os.getenv("CEREBRAS_API_KEY"),
         groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        cerebras_model=os.getenv("CEREBRAS_MODEL", "llama-3.3-70b"),
+        cerebras_model=os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
+        azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_openai_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
+        azure_api_version=os.getenv("API_VERSION", "2024-12-01-preview"),
         max_retries=int(os.getenv("AI_MAX_RETRIES", "5")),
         initial_retry_delay=float(os.getenv("AI_INITIAL_RETRY_DELAY", "2.0")),
         max_tokens=int(os.getenv("AI_MAX_TOKENS", "8192")),

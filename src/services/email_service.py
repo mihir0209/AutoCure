@@ -2,231 +2,975 @@
 Email Service for the Self-Healing Software System v2.0
 
 Sends rich HTML emails with:
-- Error analysis results with AST trace (not stack trace)
+- AST parser trace visualization (accordion-based, NOT stack traces)
+- Interactive collapsible AST tree with <details>/<summary>
 - Fix proposals with confidence validation
-- Interactive AST tree visualization (HTML)
-- Code review results
-- High/Low confidence templates
+- Code context with error line highlighting
+- Cross-file reference map
+- Saves full HTML reports to disk for online viewing
 """
 
+from __future__ import annotations
+
 import asyncio
+import os
 import smtplib
+import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from datetime import datetime
-import html
+from pathlib import Path
+import html as html_mod
+
+import json as json_mod
 
 from config import get_config
 from utils.models import (
     AnalysisEmail, CodeReviewEmail, RootCauseAnalysis, FixProposal,
-    CodeReviewResult, ASTVisualization, DetectedError, ASTNode
+    CodeReviewResult, ASTVisualization, DetectedError, ASTNode,
 )
 from utils.logger import setup_colored_logger
+from database.report_store import get_report_store, REPORTS_DIR
 
-# Import AST trace and validation types
-try:
+if TYPE_CHECKING:
     from services.ast_trace_service import ASTTraceContext, Reference, ProjectRequirements
     from services.confidence_validator import ValidationResult, ValidationIteration
-except ImportError:
-    # Graceful fallback if services not available
-    ASTTraceContext = None
-    ValidationResult = None
-    Reference = None
-    ProjectRequirements = None
-    ValidationIteration = None
 
+# Import AST trace and validation types at runtime too (for isinstance etc.)
+try:
+    from services.ast_trace_service import ASTTraceContext, Reference, ProjectRequirements  # noqa: F811
+    from services.confidence_validator import ValidationResult, ValidationIteration  # noqa: F811
+except ImportError:
+    pass
 
 logger = setup_colored_logger("email_service")
 
+# Report store is managed by database.report_store
 
-# ==========================================
-# AST Tree HTML Builder
-# ==========================================
 
-class ASTTreeHTMLBuilder:
-    """
-    Builds HTML representations of AST trees for email visualization.
-    
-    Features:
-    - Interactive collapsible tree view
-    - Error path highlighting
-    - Node type coloring
-    """
-    
-    # Node type colors
-    NODE_COLORS = {
-        "module": "#9C27B0",
-        "class": "#2196F3",
-        "function": "#4CAF50",
-        "method": "#8BC34A",
-        "async_function": "#00BCD4",
-        "import": "#FF9800",
-        "variable": "#795548",
-        "assignment": "#607D8B",
-        "call": "#E91E63",
-        "if": "#673AB7",
-        "for": "#3F51B5",
-        "while": "#009688",
-        "try": "#FFC107",
-        "except": "#FF5722",
-        "return": "#CDDC39",
-        "default": "#9E9E9E"
+# ════════════════════════════════════════════════════════════════
+#  Colour palette (shared across all templates)
+# ════════════════════════════════════════════════════════════════
+
+_NODE_COLORS: Dict[str, str] = {
+    "module": "#9C27B0", "program": "#9C27B0",
+    "class": "#2196F3", "class_definition": "#2196F3",
+    "function": "#4CAF50", "function_definition": "#4CAF50",
+    "method": "#8BC34A", "async_function": "#00BCD4",
+    "import": "#FF9800", "import_statement": "#FF9800",
+    "import_from_statement": "#FF9800",
+    "variable": "#795548", "assignment": "#607D8B",
+    "call": "#E91E63", "call_expression": "#E91E63",
+    "if": "#673AB7", "if_statement": "#673AB7",
+    "for": "#3F51B5", "for_statement": "#3F51B5",
+    "while": "#009688", "while_statement": "#009688",
+    "try": "#FFC107", "try_statement": "#FFC107",
+    "except": "#FF5722", "except_clause": "#FF5722",
+    "return": "#CDDC39", "return_statement": "#CDDC39",
+    "block": "#78909C", "expression_statement": "#90A4AE",
+}
+_DEFAULT_NODE_COLOR = "#9E9E9E"
+
+_SEVERITY_COLORS: Dict[str, str] = {
+    "critical": "#dc3545", "high": "#fd7e14",
+    "medium": "#ffc107", "low": "#28a745",
+}
+
+
+def _esc(text: Any) -> str:
+    """Shorthand HTML-escape."""
+    return html_mod.escape(str(text)) if text else ""
+
+
+def _node_color(node_type: str) -> str:
+    return _NODE_COLORS.get((node_type or "").lower(), _DEFAULT_NODE_COLOR)
+
+
+def _get_error(analysis: Optional[RootCauseAnalysis]):
+    """Safely extract DetectedError from analysis."""
+    if analysis and hasattr(analysis, 'error') and analysis.error:
+        return analysis.error
+    return None
+
+
+def _ast_node_to_dict(node: ASTNode, max_depth: int = 12, depth: int = 0) -> Optional[dict]:
+    """Recursively convert ASTNode to JSON-serializable dict for the interactive visualizer."""
+    if node is None or depth > max_depth:
+        return None
+    d = {
+        "type": node.node_type or "unknown",
+        "name": node.name or "",
+        "loc": {"start": {"line": node.start_line, "col": node.start_col},
+                "end": {"line": node.end_line, "col": node.end_col}},
     }
-    
+    if node.code_snippet:
+        d["snippet"] = node.code_snippet.split("\n")[0][:120]
+    if node.children:
+        kids = [_ast_node_to_dict(c, max_depth, depth + 1) for c in node.children]
+        d["children"] = [k for k in kids if k is not None]
+    return d
+
+
+# ════════════════════════════════════════════════════════════════
+#  Interactive AST Tree Visualizer  (inline JS for standalone reports)
+# ════════════════════════════════════════════════════════════════
+
+_INTERACTIVE_TREE_CSS = """
+.ast-viz-wrap{position:relative;background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-top:10px;}
+.ast-viz-toolbar{display:flex;gap:6px;padding:6px 10px;background:#161b22;border-bottom:1px solid #30363d;align-items:center;}
+.ast-viz-toolbar button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 10px;
+  font-size:12px;cursor:pointer;transition:background .15s;}
+.ast-viz-toolbar button:hover{background:#30363d;}
+.ast-viz-container{width:100%;height:500px;overflow:auto;position:relative;cursor:grab;}
+.ast-viz-container:active{cursor:grabbing;}
+.ast-viz-container svg{min-width:100%;}
+.ast-viz-node{cursor:pointer;user-select:none;}
+.ast-viz-node rect{transition:opacity .15s;}
+.ast-viz-node:hover rect{opacity:.85;}
+.ast-viz-label{font-family:'SFMono-Regular',Consolas,monospace;pointer-events:none;}
+"""
+
+_INTERACTIVE_TREE_JS = """
+(function(){
+  var DATA_ID = '__AST_DATA_ID__';
+  var data = window[DATA_ID];
+  if(!data) return;
+  var wrap = document.getElementById(DATA_ID + '_wrap');
+  if(!wrap) return;
+
+  var NODE_W = 160, NODE_H = 40, PAD_X = 20, PAD_Y = 60;
+  var expanded = {'root':true};
+  var colors = {
+    module:'#9C27B0',program:'#9C27B0',class:'#2196F3',class_definition:'#2196F3',
+    function:'#4CAF50',function_definition:'#4CAF50',method:'#8BC34A',async_function:'#00BCD4',
+    import:'#FF9800',import_statement:'#FF9800',import_from_statement:'#FF9800',
+    call:'#E91E63',call_expression:'#E91E63','if':'#673AB7',if_statement:'#673AB7',
+    'for':'#3F51B5',for_statement:'#3F51B5','while':'#009688',while_statement:'#009688',
+    'try':'#FFC107',try_statement:'#FFC107',except:'#FF5722',except_clause:'#FF5722',
+    'return':'#CDDC39',return_statement:'#CDDC39'
+  };
+  var defColor = '#9E9E9E';
+
+  function color(t){return colors[(t||'').toLowerCase()]||defColor;}
+
+  // Layout: compute (x,y) for each visible node
+  function layout(node, id, depth){
+    var n = {id:id, node:node, x:0, y:depth*PAD_Y, depth:depth, children:[]};
+    if(node.children && node.children.length && expanded[id]){
+      for(var i=0;i<node.children.length;i++){
+        var cid = id+'-'+i;
+        var child = layout(node.children[i], cid, depth+1);
+        n.children.push(child);
+      }
+    }
+    return n;
+  }
+
+  function measureWidth(n){
+    if(!n.children.length) {n.width=NODE_W+PAD_X; return n.width;}
+    var w=0;
+    for(var i=0;i<n.children.length;i++){w+=measureWidth(n.children[i]);}
+    n.width = Math.max(w, NODE_W+PAD_X);
+    return n.width;
+  }
+
+  function position(n, left){
+    if(!n.children.length){n.x = left + n.width/2; return;}
+    var cx = left;
+    for(var i=0;i<n.children.length;i++){
+      position(n.children[i], cx);
+      cx += n.children[i].width;
+    }
+    n.x = (n.children[0].x + n.children[n.children.length-1].x)/2;
+  }
+
+  function allNodes(n, arr){arr.push(n); for(var i=0;i<n.children.length;i++) allNodes(n.children[i],arr); return arr;}
+  function allEdges(n,arr){
+    for(var i=0;i<n.children.length;i++){arr.push([n,n.children[i]]); allEdges(n.children[i],arr);}
+    return arr;
+  }
+
+  function maxDepth(n){var d=n.depth; for(var i=0;i<n.children.length;i++){d=Math.max(d,maxDepth(n.children[i]));} return d;}
+
+  function render(){
+    var tree = layout(data, 'root', 0);
+    measureWidth(tree);
+    position(tree, 0);
+    var nodes = allNodes(tree,[]);
+    var edges = allEdges(tree,[]);
+    var md = maxDepth(tree);
+    var maxX = 0; for(var i=0;i<nodes.length;i++){maxX=Math.max(maxX,nodes[i].x);}
+    var svgW = maxX + NODE_W + 40;
+    var svgH = (md+1)*PAD_Y + NODE_H + 40;
+
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="'+svgW+'" height="'+svgH+'">';
+    // Edges
+    for(var i=0;i<edges.length;i++){
+      var p=edges[i][0], c=edges[i][1];
+      var px=p.x, py=p.y+NODE_H, cx=c.x, cy=c.y;
+      var my=(py+cy)/2;
+      svg+='<path d="M'+px+' '+py+' C'+px+' '+my+' '+cx+' '+my+' '+cx+' '+cy+'" fill="none" stroke="#30363d" stroke-width="1.5"/>';
+    }
+    // Nodes
+    for(var i=0;i<nodes.length;i++){
+      var n=nodes[i], nd=n.node;
+      var c=color(nd.type);
+      var hasKids = nd.children && nd.children.length>0;
+      var isExp = expanded[n.id];
+      var lbl = (nd.name || nd.type).substring(0,18);
+      var sub = nd.type + (nd.loc?' L'+nd.loc.start.line:'');
+      var rx=n.x-NODE_W/2, ry=n.y;
+      svg+='<g class="ast-viz-node" data-id="'+n.id+'" transform="translate('+rx+','+ry+')">';
+      svg+='<rect width="'+NODE_W+'" height="'+NODE_H+'" rx="6" fill="'+c+'22" stroke="'+c+'" stroke-width="1.5"/>';
+      svg+='<text class="ast-viz-label" x="8" y="16" fill="#e6edf3" font-size="12" font-weight="600">'+esc(lbl)+'</text>';
+      svg+='<text class="ast-viz-label" x="8" y="30" fill="#8b949e" font-size="10">'+esc(sub)+'</text>';
+      if(hasKids){
+        svg+='<text x="'+(NODE_W-16)+'" y="26" fill="#8b949e" font-size="14" text-anchor="middle">'+(isExp?'\\u25BC':'\\u25B6')+'</text>';
+      }
+      svg+='</g>';
+    }
+    svg+='</svg>';
+    var container = wrap.querySelector('.ast-viz-container');
+    container.innerHTML = svg;
+
+    // Attach click handlers
+    var gs = container.querySelectorAll('.ast-viz-node');
+    for(var j=0;j<gs.length;j++){
+      gs[j].addEventListener('click', function(){
+        var id = this.getAttribute('data-id');
+        if(expanded[id]) delete expanded[id]; else expanded[id]=true;
+        render();
+      });
+    }
+  }
+
+  function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+  // Toolbar
+  wrap.querySelector('.ast-viz-btn-expand').onclick=function(){
+    (function ex(n,id){expanded[id]=true;if(n.children)for(var i=0;i<n.children.length;i++)ex(n.children[i],id+'-'+i);})(data,'root');
+    render();
+  };
+  wrap.querySelector('.ast-viz-btn-collapse').onclick=function(){expanded={'root':true};render();};
+
+  // Initial expand first two levels
+  expanded['root']=true;
+  if(data.children) for(var i=0;i<data.children.length;i++) expanded['root-'+i]=true;
+  render();
+})();
+"""
+
+
+def _build_interactive_ast_section(ast_trace, section_id: str = "ast_interactive") -> str:
+    """
+    Build an interactive SVG-based AST tree visualization.
+    Returns HTML with embedded JS that renders the tree client-side.
+    Only used in standalone reports (not email).
+    """
+    if not ast_trace or not ast_trace.main_ast:
+        return ""
+
+    data_var = f"__ast_{section_id}__"
+    ast_json = json_mod.dumps(
+        _ast_node_to_dict(ast_trace.main_ast, max_depth=12),
+        separators=(',', ':'),
+    )
+
+    js = _INTERACTIVE_TREE_JS.replace('__AST_DATA_ID__', data_var)
+
+    return f"""
+  <div class="card">
+    <h2><i class="ph ph-tree-structure"></i> Interactive AST Visualization</h2>
+    <p style="color:var(--fg2);font-size:13px;margin-bottom:8px;">
+      Click nodes to expand/collapse. Drag to pan.</p>
+    <div class="ast-viz-wrap" id="{data_var}_wrap">
+      <div class="ast-viz-toolbar">
+        <button class="ast-viz-btn-expand">Expand All</button>
+        <button class="ast-viz-btn-collapse">Collapse All</button>
+        <span style="color:#8b949e;font-size:11px;margin-left:auto;">
+          <i class="ph ph-tree-structure" style="font-size:11px;"></i> {_esc(ast_trace.error_file)} &bull; Error at L{ast_trace.error_line}</span>
+      </div>
+      <div class="ast-viz-container"></div>
+    </div>
+  </div>
+  <script>window['{data_var}']={ast_json};</script>
+  <script>{js}</script>
+"""
+
+
+# ════════════════════════════════════════════════════════════════
+#  AST Accordion Tree Builder
+# ════════════════════════════════════════════════════════════════
+
+class ASTAccordionBuilder:
+    """
+    Builds email-safe accordion HTML for AST trees using
+    ``<details>`` / ``<summary>`` elements.
+
+    Works natively in Apple Mail, iOS Mail, Thunderbird, Samsung Mail.
+    In Gmail / Outlook the tree renders fully expanded (still readable).
+    """
+
     @classmethod
-    def build_ast_tree_html(
+    def build_tree(
         cls,
-        root: 'ASTNode',
+        root: ASTNode,
         error_line: int = 0,
-        error_path: List['ASTNode'] = None,
-        max_depth: int = 5
+        error_path_ids: Optional[set] = None,
+        max_depth: int = 8,
+        max_children: int = 30,
     ) -> str:
-        """
-        Build an interactive HTML tree representation of an AST.
-        
-        Args:
-            root: Root AST node
-            error_line: Line number of the error (for highlighting)
-            error_path: Path of nodes to the error location
-            max_depth: Maximum depth to render
-            
-        Returns:
-            HTML string for the tree visualization
-        """
-        if not root:
-            return '<p style="color: #6c757d;">No AST available</p>'
-        
-        error_path_ids = set()
-        if error_path:
-            for node in error_path:
-                error_path_ids.add(id(node))
-        
-        def render_node(node: 'ASTNode', depth: int = 0) -> str:
-            if depth > max_depth:
-                return '<span style="color: #6c757d;">...</span>'
-            
-            is_error_path = id(node) in error_path_ids
-            contains_error = node.start_line <= error_line <= node.end_line if error_line else False
-            
-            # Determine node styling
-            node_type = node.node_type.lower() if node.node_type else "default"
-            color = cls.NODE_COLORS.get(node_type, cls.NODE_COLORS["default"])
-            
-            # Highlight error path
-            bg_color = ""
-            border = ""
-            if is_error_path:
-                bg_color = "background: rgba(255, 0, 0, 0.1);"
-                border = "border-left: 3px solid #dc3545;"
-            elif contains_error:
-                bg_color = "background: rgba(255, 193, 7, 0.1);"
-            
-            # Format node name
-            name = html.escape(node.name or node.node_type or "?")
-            
-            # Build line info
-            line_info = f":{node.start_line}"
-            if node.end_line != node.start_line:
-                line_info += f"-{node.end_line}"
-            
-            # Build children HTML
-            children_html = ""
-            if node.children and depth < max_depth:
-                child_items = []
-                for child in node.children[:20]:  # Limit children
-                    child_items.append(render_node(child, depth + 1))
-                
-                if len(node.children) > 20:
-                    child_items.append(f'<li style="color: #6c757d;">... {len(node.children) - 20} more</li>')
-                
-                children_html = f'''
-                <ul style="margin: 2px 0 2px 15px; padding-left: 10px; border-left: 1px dashed #dee2e6; list-style: none;">
-                    {"".join(f'<li style="margin: 2px 0;">{item}</li>' for item in child_items)}
-                </ul>
-                '''
-            
-            return f'''
-            <div style="padding: 3px 5px; {bg_color} {border}">
-                <span style="color: {color}; font-weight: 600;">●</span>
-                <span style="color: #333;">{name}</span>
-                <span style="color: #6c757d; font-size: 0.85em;">({node.node_type})</span>
-                <span style="color: #007bff; font-size: 0.8em;">{line_info}</span>
-                {children_html}
-            </div>
-            '''
-        
-        return f'''
-        <div style="font-family: 'Monaco', 'Menlo', 'Consolas', monospace; font-size: 0.85em; line-height: 1.4;">
-            {render_node(root)}
-        </div>
-        '''
-    
+        """Return full accordion-tree HTML for *root*."""
+        if root is None:
+            return '<p style="color:#6c757d;font-style:italic;">No AST available</p>'
+        error_path_ids = error_path_ids or set()
+        return (
+            '<div style="font-family:\'SFMono-Regular\',Consolas,\'Liberation Mono\',Menlo,monospace;'
+            'font-size:13px;line-height:1.55;color:#24292e;">'
+            + cls._render(root, 0, error_line, error_path_ids, max_depth, max_children)
+            + '</div>'
+        )
+
     @classmethod
-    def build_error_path_html(cls, error_path: List['ASTNode']) -> str:
-        """
-        Build a visual representation of the path from root to error.
-        
-        Args:
-            error_path: List of AST nodes from root to error location
-            
-        Returns:
-            HTML string showing the error path
-        """
+    def _render(
+        cls, node: ASTNode, depth: int,
+        error_line: int, path_ids: set,
+        max_depth: int, max_children: int,
+    ) -> str:
+        if depth > max_depth:
+            return '<span style="color:#6c757d;font-style:italic;">... (depth limit)</span>'
+
+        on_error_path = id(node) in path_ids
+        contains_error = (
+            error_line
+            and node.start_line <= error_line <= node.end_line
+        )
+
+        color = _node_color(node.node_type)
+        name = _esc(node.name or node.node_type or "?")
+        ntype = _esc(node.node_type)
+        lines = f"L{node.start_line}"
+        if node.end_line and node.end_line != node.start_line:
+            lines += f"&#8209;{node.end_line}"
+
+        # Styling for error path / error containment
+        bg = ""
+        left_border = f"border-left:2px solid {color}55;"
+        if on_error_path:
+            bg = "background:rgba(220,53,69,.10);"
+            left_border = "border-left:3px solid #dc3545;"
+        elif contains_error:
+            bg = "background:rgba(255,193,7,.08);"
+            left_border = f"border-left:2px solid #ffc107;"
+
+        # ── Type badge with icon ──
+        # Map common node types to symbolic icons
+        _icons = {
+            "module": "&#128230;", "program": "&#128230;",
+            "class": "&#128307;", "class_definition": "&#128307;",
+            "function": "&#9670;", "function_definition": "&#9670;",
+            "method": "&#9670;", "async_function": "&#9889;",
+            "import": "&#8599;", "import_statement": "&#8599;",
+            "import_from_statement": "&#8599;",
+            "call": "&#9654;", "call_expression": "&#9654;",
+            "if": "&#10140;", "if_statement": "&#10140;",
+            "for": "&#8635;", "for_statement": "&#8635;",
+            "while": "&#8635;", "while_statement": "&#8635;",
+            "try": "&#9888;", "try_statement": "&#9888;",
+            "except": "&#10060;", "except_clause": "&#10060;",
+            "return": "&#8592;", "return_statement": "&#8592;",
+        }
+        icon = _icons.get((node.node_type or "").lower(), "&#9679;")
+
+        badge = (
+            f'<span style="display:inline-block;padding:1px 7px;border-radius:4px;'
+            f'font-size:11px;font-weight:600;color:#fff;background:{color};'
+            f'letter-spacing:.3px;">'
+            f'{icon} {ntype}</span>'
+        )
+
+        # Line number badge
+        line_badge = (
+            f'<span style="color:#8b949e;font-size:10px;margin-left:6px;'
+            f'padding:1px 5px;border-radius:3px;background:rgba(139,148,158,.12);">{lines}</span>'
+        )
+
+        # Error indicator
+        error_indicator = ""
+        if on_error_path and error_line and node.start_line <= error_line <= node.end_line:
+            error_indicator = (
+                ' <span style="color:#dc3545;font-size:10px;font-weight:700;'
+                'animation:blink 1s infinite;">&#9888; ERROR</span>'
+            )
+
+        # Code snippet (first 100 chars)
+        snippet = ""
+        if node.code_snippet:
+            short = _esc(node.code_snippet.split("\n")[0][:100])
+            snippet = (
+                f'<div style="color:#8b949e;font-size:11px;margin:2px 0 0 24px;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:550px;'
+                f'padding:2px 6px;background:rgba(0,0,0,.04);border-radius:3px;">'
+                f'<code>{short}</code></div>'
+            )
+
+        has_kids = bool(node.children) and depth < max_depth
+
+        # ── With children -> collapsible accordion ──
+        if has_kids:
+            open_attr = "open" if (on_error_path or contains_error or depth < 2) else ""
+            # Tree connector: ▶ (collapsed) / ▼ (expanded) via CSS
+            arrow_style = (
+                'display:inline-block;width:14px;font-size:10px;color:#8b949e;'
+                'transition:transform .15s;margin-right:3px;'
+            )
+            kids = node.children[:max_children]
+            children_html = "\n".join(
+                cls._render(c, depth + 1, error_line, path_ids, max_depth, max_children)
+                for c in kids
+            )
+            if len(node.children) > max_children:
+                children_html += (
+                    f'<div style="padding:4px 0 4px 18px;color:#8b949e;font-size:11px;">'
+                    f'&#8943; {len(node.children) - max_children} more children</div>'
+                )
+            return (
+                f'<details {open_attr} style="margin:1px 0 1px 12px;padding:3px 0 3px 10px;'
+                f'{left_border}{bg}border-radius:0 4px 4px 0;">'
+                f'<summary style="cursor:pointer;list-style:none;padding:3px 4px;'
+                f'border-radius:4px;transition:background .15s;'
+                f'user-select:none;">'
+                f'<span style="{arrow_style}">&#9654;</span>'
+                f'{badge} <strong style="color:#24292e;">{name}</strong>{line_badge}{error_indicator}'
+                f'</summary>'
+                f'{snippet}'
+                f'<div style="margin-left:8px;">{children_html}</div>'
+                f'</details>'
+            )
+
+        # ── Leaf node ──
+        return (
+            f'<div style="margin:1px 0 1px 12px;padding:4px 4px 4px 10px;'
+            f'{left_border}{bg}border-radius:0 4px 4px 0;">'
+            f'<span style="display:inline-block;width:14px;margin-right:3px;'
+            f'font-size:10px;color:#d1d5db;">&#9679;</span>'
+            f'{badge} <strong style="color:#24292e;">{name}</strong>{line_badge}{error_indicator}'
+            f'{snippet}'
+            f'</div>'
+        )
+
+    # Error-path breadcrumb
+    @classmethod
+    def build_error_path(cls, error_path: List[ASTNode]) -> str:
+        """Horizontal breadcrumb showing root -> ... -> error node."""
         if not error_path:
-            return '<p style="color: #6c757d;">No error path available</p>'
-        
-        path_items = []
+            return '<p style="color:#6c757d;">No AST error path available</p>'
+
+        pills = []
         for i, node in enumerate(error_path):
             is_last = i == len(error_path) - 1
-            node_type = node.node_type.lower() if node.node_type else "default"
-            color = cls.NODE_COLORS.get(node_type, cls.NODE_COLORS["default"])
-            
-            name = html.escape(node.name or node.node_type or "?")
+            color = _node_color(node.node_type)
+            name = _esc(node.name or node.node_type or "?")
             line = f"L{node.start_line}"
-            
-            arrow = "" if is_last else " → "
-            style = "font-weight: 700; color: #dc3545;" if is_last else ""
-            
-            path_items.append(
-                f'<span style="background: {color}22; padding: 2px 6px; border-radius: 3px; {style}">'
-                f'{name} <small style="opacity: 0.7;">({line})</small>'
-                f'</span>{arrow}'
-            )
-        
-        return f'''
-        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.9em;">
-            {"".join(path_items)}
-        </div>
-        '''
 
+            if is_last:
+                weight = "font-weight:700;"
+                border = "border:2px solid #dc3545;"
+                bg = "background:rgba(220,53,69,.12);"
+                extra = "box-shadow:0 0 0 2px rgba(220,53,69,.2);"
+            else:
+                weight = ""
+                border = f"border:1px solid {color}88;"
+                bg = f"background:{color}15;"
+                extra = ""
+
+            pills.append(
+                f'<span style="display:inline-flex;align-items:center;gap:4px;'
+                f'padding:4px 10px;border-radius:6px;'
+                f'font-size:12px;{weight}{border}{bg}{extra}white-space:nowrap;">'
+                f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+                f'background:{color};"></span>'
+                f'{name} <small style="opacity:.6;">({line})</small></span>'
+            )
+
+        return (
+            '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;'
+            'font-family:\'SFMono-Regular\',Consolas,monospace;padding:8px 0;">'
+            + ' <span style="color:#8b949e;font-size:14px;">&#10132;</span> '.join(pills)
+            + '</div>'
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+#  Standalone HTML Report Generator
+# ════════════════════════════════════════════════════════════════
+
+class ReportGenerator:
+    """
+    Builds a **full self-contained HTML page** that can be:
+      - embedded in emails
+      - saved to disk and served statically
+      - opened directly in any browser
+
+    All CSS is inlined so the file has zero external dependencies.
+    Uses a dark theme for the standalone report.
+    """
+
+    REPORT_CSS = """
+    :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--fg:#c9d1d9;
+          --fg2:#8b949e;--accent:#58a6ff;--red:#f85149;--green:#3fb950;
+          --yellow:#d29922;--purple:#bc8cff;--cyan:#39d2c0;}
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+         background:var(--bg);color:var(--fg);line-height:1.6;padding:0;margin:0;}
+    .rpt{max-width:960px;margin:0 auto;padding:24px;}
+    .hdr{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
+         border-radius:12px;padding:32px;margin-bottom:24px;border:1px solid var(--border);}
+    .hdr h1{font-size:22px;color:#fff;margin-bottom:4px;}
+    .hdr p{color:#8b949e;font-size:14px;}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+          padding:20px;margin-bottom:16px;}
+    .card h2{font-size:16px;color:var(--accent);margin-bottom:12px;
+             border-bottom:1px solid var(--border);padding-bottom:8px;}
+    .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;
+           font-weight:600;color:#fff;}
+    table.meta{width:100%;border-collapse:collapse;}
+    table.meta td{padding:6px 0;font-size:14px;}
+    table.meta td:first-child{color:var(--fg2);width:130px;}
+    .code-ctx{background:#0d1117;border:1px solid var(--border);border-radius:6px;
+              padding:12px;overflow-x:auto;font-family:'SFMono-Regular',Consolas,monospace;
+              font-size:13px;line-height:1.5;white-space:pre;color:var(--fg);}
+    .code-ctx .err-line{background:rgba(248,81,73,.15);display:block;
+                        border-left:3px solid var(--red);padding-left:8px;}
+    details{margin:2px 0 2px 8px;padding:2px 0 2px 10px;border-left:2px solid var(--border);}
+    details[open]>summary{margin-bottom:2px;}
+    summary{cursor:pointer;list-style:none;padding:3px 4px;border-radius:4px;}
+    summary:hover{background:rgba(88,166,255,.06);}
+    summary::-webkit-details-marker{display:none;}
+    .nbadge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;
+            font-weight:600;color:#fff;}
+    .ref-item{background:rgba(88,166,255,.06);border-left:3px solid var(--accent);
+              padding:8px 12px;margin:6px 0;border-radius:0 4px 4px 0;font-size:13px;}
+    .proposal{background:var(--surface);border-left:4px solid var(--accent);
+              padding:16px;margin:10px 0;border-radius:0 8px 8px 0;}
+    .proposal pre{background:#0d1117;color:#e6edf3;padding:12px;border-radius:6px;
+                  overflow-x:auto;margin-top:8px;font-size:13px;line-height:1.5;}
+    .iter-card{background:rgba(255,255,255,.03);border:1px solid var(--border);
+               border-radius:6px;padding:10px 14px;margin:6px 0;font-size:13px;}
+    .progress{background:var(--border);border-radius:10px;height:18px;overflow:hidden;margin:8px 0;}
+    .progress-fill{height:100%;border-radius:10px;}
+    .cause{background:rgba(210,153,34,.08);border-left:4px solid var(--yellow);
+           padding:10px 16px;margin:8px 0;border-radius:0 6px 6px 0;}
+    .footer{text-align:center;color:var(--fg2);font-size:12px;padding:20px 0;
+            border-top:1px solid var(--border);margin-top:24px;}
+    @media(max-width:640px){.rpt{padding:12px;}.hdr{padding:20px;}.card{padding:14px;}}
+    """ + _INTERACTIVE_TREE_CSS
+
+    @classmethod
+    def generate(
+        cls,
+        analysis: Optional[RootCauseAnalysis] = None,
+        proposals: Optional[List[FixProposal]] = None,
+        ast_trace: Optional['ASTTraceContext'] = None,
+        validation_result: Optional['ValidationResult'] = None,
+        title: str = "Error Analysis Report",
+        subtitle: str = "AutoCure Self-Healing System",
+    ) -> str:
+        """Return a complete ``<!DOCTYPE html>`` page."""
+        proposals = proposals or []
+
+        error = _get_error(analysis)
+        error_type = error.error_type if error else "Unknown"
+        error_msg = _esc((error.message if error else "")[:500])
+        source_file = str(error.source_file) if error else "unknown"
+        line_number = error.line_number if error else 0
+        severity = (analysis.severity if analysis else "medium").lower()
+        severity_color = _SEVERITY_COLORS.get(severity, "#6c757d")
+        confidence = analysis.confidence if analysis else 0.5
+        root_cause = _esc(analysis.root_cause if analysis else "Unknown")
+        category = _esc(analysis.error_category if analysis else "unknown")
+        affected = analysis.affected_components if analysis else []
+        timestamp = (error.timestamp if error else datetime.utcnow())
+
+        # Build sections
+        validation_sec = cls._validation_section(validation_result)
+        ast_sec = cls._ast_trace_section(ast_trace, line_number)
+        interactive_ast_sec = _build_interactive_ast_section(ast_trace, "main_ast")
+        proposals_sec = cls._proposals_section(proposals)
+        deps_sec = cls._deps_section(ast_trace)
+        causes_sec = cls._causes_section(validation_result)
+
+        ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') if hasattr(timestamp, 'strftime') else str(timestamp)
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+<title>{_esc(title)}</title>
+<style>{cls.REPORT_CSS}</style>
+</head>
+<body>
+<div class="rpt">
+
+  <div class="hdr">
+    <h1><i class="ph ph-first-aid-kit" style="vertical-align:middle;"></i> {_esc(title)}</h1>
+    <p>{_esc(subtitle)} &bull; {ts_str}</p>
+  </div>
+
+  <!-- Error Summary -->
+  <div class="card">
+    <h2><i class="ph ph-warning-circle"></i> Error Summary</h2>
+    <table class="meta">
+      <tr><td>Type</td><td><strong>{_esc(error_type)}</strong></td></tr>
+      <tr><td>Severity</td><td><span class="badge" style="background:{severity_color};">{severity.upper()}</span></td></tr>
+      <tr><td>Location</td><td><code>{_esc(source_file)}:{line_number}</code></td></tr>
+      <tr><td>Confidence</td><td>{confidence:.0%}</td></tr>
+    </table>
+    <div style="background:rgba(248,81,73,.08);padding:12px;border-radius:6px;margin-top:14px;border:1px solid rgba(248,81,73,.2);">
+      <strong style="color:var(--red);">Error:</strong> <code>{error_msg}</code>
+    </div>
+  </div>
+
+  {validation_sec}
+
+  {interactive_ast_sec}
+
+  {ast_sec}
+
+  <!-- Root Cause -->
+  <div class="card">
+    <h2><i class="ph ph-magnifying-glass"></i> Root Cause Analysis</h2>
+    <div style="background:rgba(88,166,255,.08);border-left:4px solid var(--accent);padding:14px;border-radius:0 6px 6px 0;">
+      <p>{root_cause}</p>
+    </div>
+    <p style="color:var(--fg2);font-size:13px;margin-top:10px;">Category: {category}</p>
+    {"<p><strong>Affected:</strong> " + ", ".join(_esc(c) for c in affected) + "</p>" if affected else ""}
+  </div>
+
+  {causes_sec}
+
+  {proposals_sec}
+
+  {deps_sec}
+
+  <div class="footer">
+    Generated by AutoCure Self-Healing System v2.0<br>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    # ──────────────────────────────────────────────────────────
+    #  Section builders (dark theme, standalone report)
+    # ──────────────────────────────────────────────────────────
+
+    @classmethod
+    def _validation_section(cls, vr) -> str:
+        if not vr:
+            return ""
+        score = vr.confidence_score
+        total = len(vr.iterations) + 1
+        matching = vr.matching_iterations + 1
+        bar_color = "#3fb950" if score >= 75 else ("#d29922" if score >= 50 else "#f85149")
+
+        iter_items = ""
+        for it in vr.iterations[:6]:
+            icon = "&#9989;" if it.matches_initial else "&#10060;"
+            iter_items += (
+                f'<div class="iter-card">{icon} <strong>Iteration {it.iteration_number}</strong>'
+                f' &ndash; {_esc(it.payload_variation)}'
+                + (f'<br><small style="color:var(--fg2);">{_esc(it.notes[:120])}</small>' if it.notes else "")
+                + '</div>'
+            )
+
+        return f"""
+  <div class="card">
+    <h2><i class="ph ph-chart-bar"></i> Confidence Validation</h2>
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;font-size:14px;">
+      <span>Confidence Score</span><strong style="color:{bar_color};">{score:.0f}%</strong>
+    </div>
+    <div class="progress"><div class="progress-fill" style="width:{score}%;background:{bar_color};"></div></div>
+    <p style="color:var(--fg2);font-size:12px;">Threshold 75% &bull; {matching}/{total} iterations matched</p>
+    <details style="margin-top:12px;border-left:none;padding-left:0;">
+      <summary style="color:var(--accent);font-weight:600;font-size:14px;">View Iteration Details</summary>
+      <div style="margin-top:8px;">{iter_items or "<p style='color:var(--fg2);'>No iteration data.</p>"}</div>
+    </details>
+  </div>"""
+
+    @classmethod
+    def _ast_trace_section(cls, trace, error_line: int) -> str:
+        """The centrepiece accordion-based AST parser trace."""
+        if not trace:
+            return ""
+
+        parts: List[str] = []
+
+        # 1. Error path breadcrumb
+        if trace.error_path:
+            path_ids = {id(n) for n in trace.error_path}
+            path_html = ASTAccordionBuilder.build_error_path(trace.error_path)
+            parts.append(
+                '<div style="margin-bottom:16px;">'
+                '<h3 style="font-size:14px;color:var(--fg);margin-bottom:8px;">Error Path</h3>'
+                '<p style="color:var(--fg2);font-size:12px;margin-bottom:6px;">'
+                'AST path from module root to the error location:</p>'
+                f'{path_html}</div>'
+            )
+        else:
+            path_ids = set()
+
+        # 2. Code context (error line highlighted)
+        if trace.error_context_code:
+            code_lines = trace.error_context_code.split('\n')
+            formatted = []
+            for line in code_lines:
+                if line.startswith(">>>"):
+                    formatted.append(f'<span class="err-line">{_esc(line)}</span>')
+                else:
+                    formatted.append(_esc(line))
+            ctx_html = "\n".join(formatted)
+            parts.append(
+                '<details open style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:6px;">'
+                '<i class="ph ph-note-pencil" style="font-size:13px;"></i> Code Context</summary>'
+                f'<div class="code-ctx" style="margin-top:6px;">{ctx_html}</div></details>'
+            )
+
+        # 3. Full AST tree (accordion)
+        if trace.main_ast:
+            tree_html = ASTAccordionBuilder.build_tree(
+                trace.main_ast,
+                error_line=error_line,
+                error_path_ids=path_ids,
+                max_depth=8,
+            )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:6px;">'
+                '<i class="ph ph-tree-structure" style="font-size:13px;"></i> Full AST Tree (click to expand)</summary>'
+                '<div style="background:#0d1117;border:1px solid var(--border);border-radius:6px;'
+                f'padding:14px;margin-top:6px;max-height:600px;overflow:auto;">'
+                f'{tree_html}</div></details>'
+            )
+
+        # 4. Cross-file references
+        if trace.references:
+            ref_items = ""
+            for ref in trace.references[:12]:
+                resolved = f" &rarr; <code>{_esc(ref.resolved_path)}</code>" if ref.resolved_path else ""
+                ref_items += (
+                    f'<div class="ref-item">'
+                    f'<strong>{_esc(ref.symbol_name)}</strong> '
+                    f'<span style="color:var(--fg2);">({ref.ref_type})</span><br>'
+                    f'<small>{_esc(ref.from_file)}:{ref.line_number}{resolved}</small>'
+                    f'</div>'
+                )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:6px;">'
+                f'<i class="ph ph-link" style="font-size:13px;"></i> Cross-File References ({len(trace.references)})</summary>'
+                f'<div style="margin-top:6px;">{ref_items}</div></details>'
+            )
+
+        # 5. Referenced file ASTs
+        if trace.referenced_files:
+            ref_tree_parts = []
+            for fpath, ast_root in list(trace.referenced_files.items())[:5]:
+                mini_tree = ASTAccordionBuilder.build_tree(
+                    ast_root, max_depth=3, max_children=15,
+                )
+                ref_tree_parts.append(
+                    '<details style="border-left:none;padding-left:0;margin:8px 0;">'
+                    f'<summary style="font-size:13px;color:var(--accent);">'
+                    f'<i class="ph ph-file" style="font-size:12px;"></i> {_esc(os.path.basename(fpath))}'
+                    f' <small style="color:var(--fg2);">({_esc(fpath)})</small></summary>'
+                    '<div style="background:#0d1117;border:1px solid var(--border);border-radius:6px;'
+                    f'padding:10px;margin-top:4px;max-height:300px;overflow:auto;">'
+                    f'{mini_tree}</div></details>'
+                )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:6px;">'
+                f'<i class="ph ph-books" style="font-size:13px;"></i> Referenced File ASTs ({len(trace.referenced_files)})</summary>'
+                f'<div style="margin-top:6px;">{"".join(ref_tree_parts)}</div></details>'
+            )
+
+        if not parts:
+            return ""
+
+        return (
+            '<div class="card"><h2><i class="ph ph-tree-structure"></i> AST Parser Trace</h2>'
+            + "\n".join(parts)
+            + '</div>'
+        )
+
+    @classmethod
+    def _proposals_section(cls, proposals: List[FixProposal]) -> str:
+        if not proposals:
+            return ""
+        items = ""
+        for i, p in enumerate(proposals, 1):
+            side_fx = ""
+            if p.side_effects:
+                side_fx = (
+                    '<p style="color:var(--yellow);margin-top:8px;">'
+                    '<strong><i class="ph ph-warning" style="vertical-align:middle;"></i> Side Effects:</strong> '
+                    + ", ".join(_esc(e) for e in p.side_effects) + '</p>'
+                )
+            # Edge test cases
+            tests_html = ""
+            if p.test_cases:
+                test_items = ""
+                for j, tc in enumerate(p.test_cases, 1):
+                    status_icon = '<i class="ph ph-check-circle" style="color:#3fb950;"></i>' if tc.fix_would_pass else '<i class="ph ph-x-circle" style="color:#f85149;"></i>'
+                    fail_icon = '<i class="ph ph-x-circle" style="color:#f85149;"></i>' if tc.original_would_fail else '<i class="ph ph-check-circle" style="color:#3fb950;"></i>'
+                    test_items += f"""
+          <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);
+                      border-radius:6px;padding:12px;margin:6px 0;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <strong style="color:var(--fg);font-size:13px;">{_esc(tc.test_name or f'Test {j}')}</strong>
+              <div style="font-size:11px;">
+                <span style="color:#f85149;">{fail_icon} Original</span>
+                <span style="margin:0 6px;color:var(--fg2);">|</span>
+                <span style="color:#3fb950;">{status_icon} Fixed</span>
+              </div>
+            </div>
+            <p style="color:var(--fg2);font-size:12px;margin-bottom:6px;">{_esc(tc.description)}</p>
+            {f'<pre style="font-size:12px;line-height:1.4;">{_esc(tc.test_code)}</pre>' if tc.test_code else ''}
+            {f'<p style="color:var(--green);font-size:12px;margin-top:4px;"><strong>Expected:</strong> {_esc(tc.expected_behavior)}</p>' if tc.expected_behavior else ''}
+          </div>"""
+                tests_html = (
+                    f'<details open style="border-left:none;padding-left:0;margin-top:12px;">'
+                    f'<summary style="font-size:13px;font-weight:600;color:var(--accent);cursor:pointer;">'
+                    f'<i class="ph ph-test-tube" style="font-size:12px;"></i> Edge Test Cases ({len(p.test_cases)})</summary>'
+                    f'{test_items}</details>'
+                )
+            items += f"""
+      <div class="proposal">
+        <h3 style="font-size:14px;color:var(--accent);margin-bottom:8px;">Proposal {i}</h3>
+        <table class="meta">
+          <tr><td>File</td><td><code>{_esc(p.target_file)}</code></td></tr>
+          <tr><td>Confidence</td><td>{p.confidence:.0%}</td></tr>
+          <tr><td>Risk</td><td>{_esc(p.risk_level)}</td></tr>
+        </table>
+        <p style="margin:10px 0;">{_esc(p.explanation)}</p>
+        {f'<pre>{_esc(p.suggested_code)}</pre>' if p.suggested_code else ""}
+        {side_fx}
+        {tests_html}
+      </div>"""
+        return f'<div class="card"><h2><i class="ph ph-lightbulb"></i> Fix Proposals</h2>{items}</div>'
+
+    @classmethod
+    def _deps_section(cls, trace) -> str:
+        if not trace or not getattr(trace, 'requirements', None):
+            return ""
+        reqs = trace.requirements
+        all_deps = {**reqs.dependencies, **reqs.dev_dependencies}
+        if not all_deps:
+            return ""
+        items = ""
+        for name, ver in list(all_deps.items())[:20]:
+            dev = (' <span class="badge" style="background:#6c757d;font-size:10px;">dev</span>'
+                   if name in reqs.dev_dependencies else "")
+            items += f"<li><code>{_esc(name)}</code>: {_esc(ver)}{dev}</li>"
+        if len(all_deps) > 20:
+            items += f'<li style="color:var(--fg2);">... and {len(all_deps) - 20} more</li>'
+        return (
+            f'<div class="card"><h2><i class="ph ph-package"></i> Dependencies</h2>'
+            f'<p style="color:var(--fg2);font-size:13px;margin-bottom:8px;">'
+            f'From <code>{_esc(reqs.manifest_file)}</code> ({_esc(reqs.language)})</p>'
+            f'<ul style="padding-left:20px;font-size:13px;">{items}</ul></div>'
+        )
+
+    @classmethod
+    def _causes_section(cls, vr) -> str:
+        if not vr or not getattr(vr, 'possible_causes', None):
+            return ""
+        items = ""
+        for cause in vr.possible_causes[:6]:
+            items += f'<div class="cause"><strong><i class="ph ph-caret-right" style="color:var(--accent);"></i> Possible Cause</strong><p>{_esc(cause)}</p></div>'
+        divergent = ""
+        if getattr(vr, 'divergent_findings', None):
+            for finding in vr.divergent_findings[:3]:
+                divergent += (
+                    '<div style="background:rgba(248,81,73,.06);border-left:4px solid var(--red);'
+                    f'padding:10px 14px;margin:6px 0;border-radius:0 6px 6px 0;font-size:13px;">'
+                    f'{_esc(finding)}</div>'
+                )
+            divergent = (
+                '<h3 style="font-size:14px;color:var(--fg);margin-top:14px;">Divergent Findings</h3>'
+                + divergent
+            )
+        return f'<div class="card"><h2><i class="ph ph-question"></i> Possible Causes</h2>{items}{divergent}</div>'
+
+
+# ════════════════════════════════════════════════════════════════
+#  Email-specific CSS (light theme for email clients)
+# ════════════════════════════════════════════════════════════════
+
+_EMAIL_CSS = """
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+     line-height:1.6;color:#24292e;background:#f6f8fa;margin:0;padding:0;}
+.container{max-width:900px;margin:0 auto;padding:20px;}
+.hdr{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;
+     padding:28px 30px;border-radius:10px 10px 0 0;}
+.hdr-warn{background:linear-gradient(135deg,#fd7e14 0%,#dc3545 100%);}
+.cnt{background:#fff;padding:28px 30px;border:1px solid #d0d7de;border-top:none;border-radius:0 0 10px 10px;}
+.sec{margin:22px 0;}
+.sec-title{color:#24292e;font-size:16px;border-bottom:2px solid #d0d7de;padding-bottom:8px;margin-bottom:14px;}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;}
+table.meta{width:100%;border-collapse:collapse;}
+table.meta td{padding:6px 0;font-size:14px;}
+table.meta td:first-child{color:#57606a;width:130px;}
+.code-box{background:#1b1f23;color:#e1e4e8;padding:14px;border-radius:6px;overflow-x:auto;
+           font-family:'SFMono-Regular',Consolas,Menlo,monospace;font-size:13px;line-height:1.5;white-space:pre;}
+.code-box .eline{background:rgba(248,81,73,.18);display:block;border-left:3px solid #f85149;padding-left:8px;}
+details{margin:4px 0 4px 8px;padding:2px 0 2px 10px;border-left:2px solid #d0d7de;}
+details[open]>summary{margin-bottom:3px;}
+summary{cursor:pointer;list-style:none;padding:3px 4px;}
+summary::-webkit-details-marker{display:none;}
+.nbadge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;color:#fff;}
+.ref-item{background:#ddf4ff;border-left:3px solid #0969da;padding:8px 12px;margin:5px 0;
+           border-radius:0 4px 4px 0;font-size:13px;}
+.proposal-box{background:#f6f8fa;border-left:4px solid #0969da;padding:16px;margin:10px 0;
+               border-radius:0 6px 6px 0;}
+.proposal-box pre{background:#1b1f23;color:#e1e4e8;padding:12px;border-radius:6px;
+                   overflow-x:auto;margin-top:8px;font-size:13px;}
+.progress-bar{background:#d0d7de;border-radius:10px;height:18px;overflow:hidden;margin:6px 0;}
+.progress-fill{height:100%;border-radius:10px;}
+.iter-card{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:10px 14px;margin:5px 0;font-size:13px;}
+.cause-box{background:#fff8c5;border-left:4px solid #d4a72c;padding:10px 16px;margin:8px 0;border-radius:0 6px 6px 0;}
+"""
+
+
+# ════════════════════════════════════════════════════════════════
+#  Email Service
+# ════════════════════════════════════════════════════════════════
 
 class EmailService:
     """
-    Service for sending rich HTML emails.
-    
+    Sends rich HTML emails with accordion-based AST parser trace.
+
     Features:
-    - Analysis result emails with AST trace visualization
-    - High/Low confidence templates based on validation
-    - Code review result emails
-    - Fix proposal summaries
-    - Interactive elements in emails
+      * High / low confidence templates based on validation
+      * Accordion AST tree visualization embedded in the email
+      * Full HTML report saved to ``reports/`` for online viewing
+      * Code review emails for PRs
+      * Zero stack-trace sections -- everything is AST parser trace
     """
-    
-    # Confidence threshold for high vs low confidence templates
+
     CONFIDENCE_THRESHOLD = 75.0
-    
-    def __init__(self, config = None):
-        """
-        Initialize the email service.
-        
-        Args:
-            config: Email configuration (uses global config if not provided)
-        """
+
+    def __init__(self, config=None):
         self.config = config or get_config().email
-        
+
+    # ──────────────────────────────────────────────────────────
+    #  Analysis email (primary entry-point)
+    # ──────────────────────────────────────────────────────────
+
     async def send_analysis_email(
         self,
         to_email: str,
@@ -235,961 +979,723 @@ class EmailService:
         ast_viz: Optional[ASTVisualization] = None,
         ast_trace: Optional['ASTTraceContext'] = None,
         validation_result: Optional['ValidationResult'] = None,
-    ) -> bool:
+        user_id: str = "",
+    ) -> dict:
         """
-        Send an error analysis email with AST trace and confidence validation.
-        
-        Args:
-            to_email: Recipient email address
-            analysis: Root cause analysis
-            proposals: List of fix proposals
-            ast_viz: Optional AST visualization (legacy SVG)
-            ast_trace: AST trace context with error path and references
-            validation_result: Multi-iteration validation result with confidence
-            
-        Returns:
-            True if email was sent successfully
+        Send an error-analysis email with embedded AST parser trace.
+
+        Also saves a full standalone HTML report to ``reports/`` indexed
+        in the SQLite report store so it can be served via API.
+
+        Returns dict with ``report_id``, ``report_path``, and ``email_sent``.
         """
-        if not self.config.enable_notifications:
-            logger.info("Email notifications disabled")
-            return False
-        
-        # Build error summary from analysis
-        error = analysis.error if hasattr(analysis, 'error') and analysis.error else None
+        error = _get_error(analysis)
         error_type = error.error_type if error else "Unknown Error"
-        error_summary = f"{error_type}: {analysis.root_cause[:200] if analysis.root_cause else 'Unknown'}"
-        
-        # Determine confidence level and template type
+
+        # Determine confidence
         confidence_met = True
         confidence_score = 100.0
-        
         if validation_result:
             confidence_met = validation_result.confidence_met
             confidence_score = validation_result.confidence_score
         elif hasattr(analysis, 'confidence'):
             confidence_score = analysis.confidence * 100
             confidence_met = confidence_score >= self.CONFIDENCE_THRESHOLD
-        
-        email_data = AnalysisEmail(
-            recipient=to_email,
-            subject=f"[Self-Healer] {'⚠️ ' if not confidence_met else ''}Error Analysis: {error_type}",
-            error_summary=error_summary,
-            root_cause_analysis=analysis,
-            fix_proposals=proposals or [],
-            ast_visualization=ast_viz,
+
+        # 1. Generate & save the full standalone HTML report
+        report_html = ReportGenerator.generate(
+            analysis=analysis,
+            proposals=proposals,
+            ast_trace=ast_trace,
+            validation_result=validation_result,
+            title=f"Error Analysis: {error_type}",
         )
-        
-        # Build HTML based on confidence level
-        if confidence_met:
-            html_content = self._build_high_confidence_html(
-                email_data, ast_trace, validation_result
+        report_path, report_id = self._save_report(
+            html_content=report_html,
+            error_type=error_type,
+            user_id=user_id,
+            analysis=analysis,
+            proposals=proposals,
+        )
+
+        # 2. Build the email HTML (light theme, email-safe)
+        #    Include the report URL so the user can view it online
+        #    Use full absolute URL so email links work correctly
+        _cfg = get_config()
+        _host = os.getenv("PUBLIC_URL", f"http://localhost:{_cfg.server.port}")
+        report_url = f"{_host}/api/v1/reports/{report_id}/view"
+
+        email_sent = False
+        if self.config.enable_notifications:
+            if confidence_met:
+                email_html = self._build_high_confidence_email(
+                    analysis, proposals, ast_trace, validation_result,
+                    report_path, report_url,
+                )
+            else:
+                email_html = self._build_low_confidence_email(
+                    analysis, proposals, ast_trace, validation_result,
+                    report_path, report_url,
+                )
+
+            subject_pfx = "" if confidence_met else "LOW CONFIDENCE "
+            email_sent = await self._send_email(
+                to=to_email,
+                subject=f"[AutoCure] {subject_pfx}Error Analysis: {error_type}",
+                html_content=email_html,
             )
         else:
-            html_content = self._build_low_confidence_html(
-                email_data, ast_trace, validation_result
-            )
-        
-        return await self._send_email(
-            to=to_email,
-            subject=email_data.subject,
-            html_content=html_content,
-        )
-    
+            logger.info("Email notifications disabled — report saved to disk only")
+
+        return {
+            "report_id": report_id,
+            "report_path": report_path,
+            "report_url": report_url,
+            "email_sent": email_sent,
+        }
+
+    # ──────────────────────────────────────────────────────────
+    #  Code-review email
+    # ──────────────────────────────────────────────────────────
+
     async def send_code_review_email(
         self,
         to_email: str,
         review: CodeReviewResult,
     ) -> bool:
-        """
-        Send a code review result email.
-        
-        Args:
-            to_email: Recipient email address
-            review: Code review result
-            
-        Returns:
-            True if email was sent successfully
-        """
+        """Send a code-review result email for a PR."""
         if not self.config.enable_notifications:
             logger.info("Email notifications disabled")
             return False
-        
-        email_data = CodeReviewEmail(
-            to=to_email,
-            review=review,
-        )
-        
-        html_content = self._build_review_html(email_data)
-        
+
+        html_content = self._build_review_email(review)
         return await self._send_email(
             to=to_email,
-            subject=f"[Self-Healer] Code Review: PR #{review.pr_info.pr_number}",
+            subject=f"[AutoCure] Code Review: PR #{review.pr_info.pr_number} - {review.pr_info.title}",
             html_content=html_content,
         )
-    
-    def _build_analysis_html(self, email: AnalysisEmail) -> str:
-        """Build HTML content for analysis email."""
-        
-        analysis = email.root_cause_analysis
-        error = analysis.error if analysis and hasattr(analysis, 'error') and analysis.error else None
-        
-        # Escape HTML in user-provided content
-        error_msg = html.escape(error.message[:500] if error else email.error_summary[:500])
-        root_cause = html.escape(analysis.root_cause if analysis else "Unknown")
-        
-        # Severity color
-        severity_colors = {
-            "critical": "#dc3545",
-            "high": "#fd7e14",
-            "medium": "#ffc107",
-            "low": "#28a745",
-        }
-        severity_color = severity_colors.get(analysis.severity if analysis else "medium", "#6c757d")
-        
-        # Build proposals HTML
-        proposals_html = ""
-        for i, proposal in enumerate(email.fix_proposals, 1):
-            proposals_html += f"""
-            <div style="background: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin: 10px 0;">
-                <h4 style="margin: 0 0 10px 0; color: #007bff;">Proposal {i}</h4>
-                <p style="margin: 5px 0;"><strong>File:</strong> {html.escape(proposal.target_file or 'Unknown')}</p>
-                <p style="margin: 5px 0;"><strong>Confidence:</strong> {proposal.confidence:.0%}</p>
-                <p style="margin: 10px 0;">{html.escape(proposal.explanation)}</p>
-                {f'<pre style="background: #2d2d2d; color: #f8f8f2; padding: 10px; overflow-x: auto;">{html.escape(proposal.suggested_code)}</pre>' if proposal.suggested_code else ''}
-                {'<p style="color: #856404;"><strong>⚠️ Potential Side Effects:</strong> ' + ', '.join(html.escape(e) for e in proposal.side_effects) + '</p>' if proposal.side_effects else ''}
-            </div>
-            """
-        
-        # AST visualization
-        ast_html = ""
-        if email.ast_visualization and email.ast_visualization.svg_content:
-            ast_html = f"""
-            <div style="margin: 20px 0;">
-                <h3 style="color: #495057;">📊 AST Visualization</h3>
-                <p style="color: #6c757d; font-size: 0.9em;">Click on nodes to expand/collapse. Error location is highlighted in red.</p>
-                <div style="background: white; border: 1px solid #dee2e6; padding: 10px; overflow-x: auto;">
-                    {email.ast_visualization.svg_content}
-                </div>
-            </div>
-            """
-        
-        # Get values with fallbacks
-        error_type = error.error_type if error else "Unknown Error"
-        source_file = error.source_file if error else "Unknown"
-        line_number = error.line_number if error else "?"
-        timestamp = error.timestamp if error else email.timestamp
-        stack_trace = error.stack_trace if error and error.stack_trace else None
-        severity = analysis.severity if analysis else "medium"
+
+    # ──────────────────────────────────────────────────────────
+    #  Report persistence
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _save_report(
+        html_content: str,
+        error_type: str,
+        user_id: str = "",
+        analysis: Optional[RootCauseAnalysis] = None,
+        proposals: Optional[List[FixProposal]] = None,
+    ) -> tuple:
+        """Save HTML report to disk + index in SQLite. Returns (path, report_id)."""
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_name = "".join(c if c.isalnum() else "_" for c in error_type)[:40]
+        filename = f"report_{ts}_{safe_name}_{uuid.uuid4().hex[:6]}.html"
+        path = REPORTS_DIR / filename
+        path.write_text(html_content, encoding="utf-8")
+
+        error = _get_error(analysis) if analysis else None
+        store = get_report_store()
+        report_id = store.insert(
+            file_path=str(path),
+            file_name=filename,
+            report_type="analysis",
+            user_id=user_id,
+            error_type=error_type,
+            severity=(analysis.severity if analysis else "medium"),
+            confidence=(analysis.confidence if analysis else 0.0),
+            root_cause=(analysis.root_cause if analysis else "")[:500],
+            source_file=str(error.source_file) if error else "",
+            line_number=error.line_number if error else 0,
+            proposals_count=len(proposals) if proposals else 0,
+        )
+        logger.info(f"Report saved -> {path} (id={report_id})")
+        return str(path), report_id
+
+    # ══════════════════════════════════════════════════════════
+    #  HIGH-confidence email template
+    # ══════════════════════════════════════════════════════════
+
+    def _build_high_confidence_email(
+        self,
+        analysis: RootCauseAnalysis,
+        proposals: List[FixProposal],
+        ast_trace,
+        validation_result,
+        report_path: str,
+        report_url: str = "",
+    ) -> str:
+        error = _get_error(analysis)
+        error_type = _esc(error.error_type if error else "Unknown")
+        error_msg = _esc((error.message if error else "")[:500])
+        source_file = _esc(str(error.source_file) if error else "unknown")
+        line_number = error.line_number if error else 0
+        severity = (analysis.severity if analysis else "medium").lower()
+        sv_color = _SEVERITY_COLORS.get(severity, "#6c757d")
+        root_cause = _esc(analysis.root_cause if analysis else "Unknown")
+        category = _esc(analysis.error_category if analysis else "unknown")
+        affected = analysis.affected_components if analysis else []
         confidence = analysis.confidence if analysis else 0.5
-        error_category = analysis.error_category if analysis else "unknown"
-        affected_components = analysis.affected_components if analysis else []
-        
-        return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 800px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 8px 8px 0 0; }}
-        .content {{ background: white; padding: 30px; border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 8px 8px; }}
-        .severity-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.85em; font-weight: 600; }}
-        .stack-trace {{ background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.85em; }}
-        .section {{ margin: 25px 0; }}
-        .section-title {{ color: #495057; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1 style="margin: 0;">🔧 Error Analysis Report</h1>
-            <p style="margin: 10px 0 0 0; opacity: 0.9;">Self-Healing Software System</p>
-        </div>
-        
-        <div class="content">
-            <!-- Error Summary -->
-            <div class="section">
-                <h2 class="section-title">🚨 Error Summary</h2>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d; width: 120px;">Type</td>
-                        <td style="padding: 8px 0; font-weight: 600;">{html.escape(error_type)}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Severity</td>
-                        <td style="padding: 8px 0;">
-                            <span class="severity-badge" style="background: {severity_color}; color: white;">
-                                {severity.upper()}
-                            </span>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Location</td>
-                        <td style="padding: 8px 0;">{html.escape(str(source_file))}:{line_number}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Timestamp</td>
-                        <td style="padding: 8px 0;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') if hasattr(timestamp, 'strftime') else str(timestamp)}</td>
-                    </tr>
-                </table>
-                
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 15px;">
-                    <strong>Error Message:</strong><br>
-                    <code style="color: #dc3545;">{error_msg}</code>
-                </div>
-            </div>
-            
-            {f'''
-            <div class="section">
-                <h3 class="section-title">📋 Stack Trace</h3>
-                <pre class="stack-trace">{html.escape(stack_trace[:2000])}</pre>
-            </div>
-            ''' if stack_trace else ''}
-            
-            <!-- Root Cause Analysis -->
-            <div class="section">
-                <h2 class="section-title">🔍 Root Cause Analysis</h2>
-                <div style="background: #e7f3ff; border-left: 4px solid #007bff; padding: 15px;">
-                    <p style="margin: 0;">{root_cause}</p>
-                </div>
-                <p style="color: #6c757d; font-size: 0.9em; margin-top: 10px;">
-                    Analysis confidence: {confidence:.0%} | 
-                    Category: {html.escape(error_category)}
-                </p>
-                {f'<p><strong>Affected Components:</strong> {", ".join(html.escape(c) for c in affected_components)}</p>' if affected_components else ''}
-            </div>
-            
-            <!-- Fix Proposals -->
-            <div class="section">
-                <h2 class="section-title">💡 Fix Proposals</h2>
-                {proposals_html if proposals_html else '<p style="color: #6c757d;">No fix proposals generated.</p>'}
-            </div>
-            
-            {ast_html}
-            
-            <!-- Footer -->
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; color: #6c757d; font-size: 0.85em;">
-                <p>This is an automated analysis. Please review the proposals carefully before applying any changes.</p>
-                <p>Generated by Self-Healing Software System v2.0 at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    
-    # ==========================================
-    # Common Email Styles
-    # ==========================================
-    
-    def _get_common_styles(self) -> str:
-        """Get common CSS styles for emails."""
-        return """
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 8px 8px 0 0; }
-        .header-warning { background: linear-gradient(135deg, #fd7e14 0%, #dc3545 100%); }
-        .content { background: white; padding: 30px; border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 8px 8px; }
-        .severity-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.85em; font-weight: 600; }
-        .confidence-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 0.9em; font-weight: 600; }
-        .section { margin: 25px 0; }
-        .section-title { color: #495057; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; }
-        .ast-trace { background: #f8f9fa; padding: 15px; border-radius: 4px; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.85em; }
-        .code-context { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.85em; white-space: pre; }
-        .error-line { background: rgba(220, 53, 69, 0.3); display: block; }
-        .progress-bar { background: #e9ecef; border-radius: 10px; overflow: hidden; height: 20px; }
-        .progress-fill { height: 100%; border-radius: 10px; transition: width 0.3s; }
-        .iteration-card { background: #f8f9fa; border-radius: 4px; padding: 10px; margin: 5px 0; }
-        .possible-cause { background: #fff3cd; border-left: 4px solid #ffc107; padding: 10px 15px; margin: 8px 0; }
-        .reference-item { background: #e7f3ff; border-left: 3px solid #007bff; padding: 8px 12px; margin: 5px 0; font-size: 0.9em; }
-        """
 
-    # ==========================================
-    # High Confidence Template
-    # ==========================================
-    
-    def _build_high_confidence_html(
+        confidence_score = (
+            validation_result.confidence_score if validation_result
+            else confidence * 100
+        )
+
+        # Build sub-sections
+        validation_html = self._email_validation_section(validation_result)
+        ast_html = self._email_ast_trace_section(ast_trace, line_number)
+        proposals_html = self._email_proposals_section(proposals)
+        deps_html = self._email_deps_section(ast_trace)
+
+        return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>{_EMAIL_CSS}</style></head><body>
+<div class="container">
+  <div class="hdr">
+    <h1 style="margin:0;font-size:20px;">&#9989; Error Analysis Report</h1>
+    <p style="margin:8px 0 0;opacity:.9;font-size:14px;">
+      High Confidence ({confidence_score:.0f}%) &ndash; Fix Proposals Ready</p>
+  </div>
+  <div class="cnt">
+
+    <!-- Confidence Banner -->
+    <div style="background:#dafbe1;border:1px solid #aceebb;border-radius:6px;padding:14px;margin-bottom:18px;">
+      <strong style="color:#1a7f37;">&#9989; Confidence: {confidence_score:.0f}%</strong>
+      <p style="margin:4px 0 0;color:#1a7f37;font-size:13px;">
+        Validation confirmed the root cause. Fix proposals are below.</p>
+    </div>
+
+    <!-- Error Summary -->
+    <div class="sec">
+      <h2 class="sec-title">&#128680; Error Summary</h2>
+      <table class="meta">
+        <tr><td>Type</td><td><strong>{error_type}</strong></td></tr>
+        <tr><td>Severity</td><td><span class="badge" style="background:{sv_color};">{severity.upper()}</span></td></tr>
+        <tr><td>Location</td><td><code>{source_file}:{line_number}</code></td></tr>
+        <tr><td>Category</td><td>{category}</td></tr>
+      </table>
+      <div style="background:#fff1e5;padding:12px;border-radius:4px;margin-top:12px;border:1px solid #ffd8b5;">
+        <strong>Error:</strong> <code style="color:#cf222e;">{error_msg}</code>
+      </div>
+    </div>
+
+    <!-- Report link (placed early to avoid Gmail clipping) -->
+    <div style="text-align:center;margin:18px 0;">
+      {f'<a href="{report_url}" style="display:inline-block;padding:12px 28px;background:#0969da;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;font-size:15px;">&#128196; View Full Report Online</a>' if report_url else ''}
+      <p style="color:#57606a;font-size:12px;margin-top:6px;">The full report contains interactive AST visualization, detailed proposals, and more.</p>
+    </div>
+
+    <!-- Root Cause -->
+    <div class="sec">
+      <h2 class="sec-title">&#128269; Root Cause Analysis</h2>
+      <div style="background:#ddf4ff;border-left:4px solid #0969da;padding:14px;border-radius:0 6px 6px 0;">
+        <p style="margin:0;">{root_cause}</p>
+      </div>
+      {"<p style='margin-top:8px;'><strong>Affected:</strong> " + ", ".join(_esc(c) for c in affected) + "</p>" if affected else ""}
+    </div>
+
+    {validation_html}
+    {proposals_html}
+
+    <!-- AST Trace (collapsed to keep email compact) -->
+    <details style="border:1px solid #d0d7de;border-radius:6px;padding:12px;margin:16px 0;">
+      <summary style="cursor:pointer;font-size:15px;font-weight:600;color:#0969da;list-style:none;padding:4px;">
+        &#127795; AST Parser Trace (click to expand)
+      </summary>
+      <div style="margin-top:10px;">
+        {ast_html}
+      </div>
+    </details>
+
+    {deps_html}
+
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;text-align:center;">
+      Generated by AutoCure Self-Healing System v2.0 &bull; {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+    </div>
+  </div>
+</div></body></html>"""
+
+    # ══════════════════════════════════════════════════════════
+    #  LOW-confidence email template
+    # ══════════════════════════════════════════════════════════
+
+    def _build_low_confidence_email(
         self,
-        email: AnalysisEmail,
-        ast_trace: Optional['ASTTraceContext'] = None,
-        validation_result: Optional['ValidationResult'] = None
+        analysis: RootCauseAnalysis,
+        proposals: List[FixProposal],
+        ast_trace,
+        validation_result,
+        report_path: str,
+        report_url: str = "",
     ) -> str:
-        """
-        Build HTML content for high-confidence analysis email.
-        
-        Shows fix proposals prominently since we're confident in the analysis.
-        """
-        analysis = email.root_cause_analysis
-        error = analysis.error if analysis and hasattr(analysis, 'error') and analysis.error else None
-        
-        # Get values with fallbacks
-        error_type = error.error_type if error else "Unknown Error"
-        error_msg = html.escape(error.message[:500] if error else email.error_summary[:500])
-        source_file = error.source_file if error else "Unknown"
-        line_number = error.line_number if error else "?"
-        timestamp = error.timestamp if error else email.timestamp
-        severity = analysis.severity if analysis else "medium"
-        root_cause = html.escape(analysis.root_cause if analysis else "Unknown")
-        error_category = analysis.error_category if analysis else "unknown"
-        affected_components = analysis.affected_components if analysis else []
-        
-        # Severity color
-        severity_colors = {
-            "critical": "#dc3545", "high": "#fd7e14", 
-            "medium": "#ffc107", "low": "#28a745",
-        }
-        severity_color = severity_colors.get(severity, "#6c757d")
-        
-        # Confidence info
-        confidence_score = validation_result.confidence_score if validation_result else (analysis.confidence * 100 if analysis else 50)
-        
-        # Build sections
-        validation_html = self._build_validation_html(validation_result) if validation_result else ""
-        ast_trace_html = self._build_ast_trace_html(ast_trace, error_line=line_number if isinstance(line_number, int) else 0) if ast_trace else ""
-        proposals_html = self._build_proposals_html(email.fix_proposals)
-        dependencies_html = self._build_dependencies_html(ast_trace) if ast_trace and ast_trace.requirements else ""
-        #         <div class="header">
-        #     <h1 style="margin: 0;">✅ Error Analysis Report</h1>
-        #     <p style="margin: 10px 0 0 0; opacity: 0.9;">High Confidence Analysis - Fix Suggestions Ready</p>
-        # </div>
-        
-        # <div class="content">
-        #     <!-- Confidence Banner -->
-        #     <div style="background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; padding: 15px; margin-bottom: 20px;">
-        #         <div style="display: flex; align-items: center; gap: 10px;">
-        #             <span style="font-size: 1.5em;">✅</span>
-        #             <div>
-        #                 <strong style="color: #155724;">High Confidence Analysis ({confidence_score:.0f}%)</strong>
-        #                 <p style="margin: 5px 0 0 0; color: #155724; font-size: 0.9em;">
-        #                     Multiple validation iterations confirmed the root cause. Fix proposals are provided below.
-        #                 </p>
-        #             </div>
-        #         </div>
-        #     </div>
-        return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>{self._get_common_styles()}</style>
-</head>
-<body>
-    <div class="container">
+        error = _get_error(analysis)
+        error_type = _esc(error.error_type if error else "Unknown")
+        error_msg = _esc((error.message if error else "")[:500])
+        source_file = _esc(str(error.source_file) if error else "unknown")
+        line_number = error.line_number if error else 0
+        severity = (analysis.severity if analysis else "medium").lower()
+        sv_color = _SEVERITY_COLORS.get(severity, "#6c757d")
+        category = _esc(analysis.error_category if analysis else "unknown")
 
-            
-            <!-- Error Summary -->
-            <div class="section">
-                <h2 class="section-title">🚨 Error Summary</h2>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d; width: 120px;">Type</td>
-                        <td style="padding: 8px 0; font-weight: 600;">{html.escape(error_type)}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Severity</td>
-                        <td style="padding: 8px 0;">
-                            <span class="severity-badge" style="background: {severity_color}; color: white;">{severity.upper()}</span>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Location</td>
-                        <td style="padding: 8px 0;"><code>{html.escape(str(source_file))}:{line_number}</code></td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Timestamp</td>
-                        <td style="padding: 8px 0;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') if hasattr(timestamp, 'strftime') else str(timestamp)}</td>
-                    </tr>
-                </table>
-                
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 15px;">
-                    <strong>Error Message:</strong><br>
-                    <code style="color: #dc3545;">{error_msg}</code>
-                </div>
-            </div>
-            
-            {validation_html}
-            
-            {ast_trace_html}
-            
-            <!-- Root Cause Analysis -->
-            <div class="section">
-                <h2 class="section-title">🔍 Root Cause Analysis</h2>
-                <div style="background: #e7f3ff; border-left: 4px solid #007bff; padding: 15px;">
-                    <p style="margin: 0;">{root_cause}</p>
-                </div>
-                <p style="color: #6c757d; font-size: 0.9em; margin-top: 10px;">
-                    Category: {html.escape(error_category)}
-                </p>
-                {f'<p><strong>Affected Components:</strong> {", ".join(html.escape(c) for c in affected_components)}</p>' if affected_components else ''}
-            </div>
-            
-            <!-- Fix Proposals -->
-            <div class="section">
-                <h2 class="section-title">💡 Fix Proposals</h2>
-                {proposals_html if proposals_html else '<p style="color: #6c757d;">No fix proposals generated.</p>'}
-            </div>
-            
-            {dependencies_html}
-            
-            <!-- Footer -->
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; color: #6c757d; font-size: 0.85em;">
-                <p>This is an automated analysis with high confidence. Please review the proposals carefully before applying any changes.</p>
-                <p>Generated by Self-Healing Software System v2.0 at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
-            </div>
-        </div>
+        confidence_score = (
+            validation_result.confidence_score if validation_result
+            else (analysis.confidence * 100 if analysis else 50)
+        )
+
+        validation_html = self._email_validation_section(validation_result)
+        ast_html = self._email_ast_trace_section(ast_trace, line_number)
+        causes_html = self._email_causes_section(validation_result)
+        deps_html = self._email_deps_section(ast_trace)
+
+        return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>{_EMAIL_CSS}</style></head><body>
+<div class="container">
+  <div class="hdr hdr-warn">
+    <h1 style="margin:0;font-size:20px;">&#9888;&#65039; Error Analysis Report</h1>
+    <p style="margin:8px 0 0;opacity:.9;font-size:14px;">
+      Low Confidence ({confidence_score:.0f}%) &ndash; Manual Review Recommended</p>
+  </div>
+  <div class="cnt">
+
+    <!-- Warning Banner -->
+    <div style="background:#fff8c5;border:1px solid #d4a72c;border-radius:6px;padding:14px;margin-bottom:18px;">
+      <strong style="color:#9a6700;">&#9888;&#65039; Low Confidence: {confidence_score:.0f}%</strong>
+      <p style="margin:4px 0 0;color:#9a6700;font-size:13px;">
+        Validation iterations were inconsistent. Possible causes are listed instead of fix proposals.</p>
     </div>
-</body>
-</html>
-"""
 
-    # ==========================================
-    # Low Confidence Template
-    # ==========================================
-    
-    def _build_low_confidence_html(
-        self,
-        email: AnalysisEmail,
-        ast_trace: Optional['ASTTraceContext'] = None,
-        validation_result: Optional['ValidationResult'] = None
-    ) -> str:
-        """
-        Build HTML content for low-confidence analysis email.
-        
-        Shows possible causes instead of fix proposals since we're not confident.
-        """
-        analysis = email.root_cause_analysis
-        error = analysis.error if analysis and hasattr(analysis, 'error') and analysis.error else None
-        
-        # Get values with fallbacks
-        error_type = error.error_type if error else "Unknown Error"
-        error_msg = html.escape(error.message[:500] if error else email.error_summary[:500])
-        source_file = error.source_file if error else "Unknown"
-        line_number = error.line_number if error else "?"
-        timestamp = error.timestamp if error else email.timestamp
-        severity = analysis.severity if analysis else "medium"
-        error_category = analysis.error_category if analysis else "unknown"
-        
-        # Severity color
-        severity_colors = {
-            "critical": "#dc3545", "high": "#fd7e14", 
-            "medium": "#ffc107", "low": "#28a745",
-        }
-        severity_color = severity_colors.get(severity, "#6c757d")
-        
-        # Confidence info
-        confidence_score = validation_result.confidence_score if validation_result else (analysis.confidence * 100 if analysis else 50)
-        
-        # Build sections
-        validation_html = self._build_validation_html(validation_result) if validation_result else ""
-        ast_trace_html = self._build_ast_trace_html(ast_trace, error_line=line_number if isinstance(line_number, int) else 0) if ast_trace else ""
-        possible_causes_html = self._build_possible_causes_html(validation_result) if validation_result else ""
-        dependencies_html = self._build_dependencies_html(ast_trace) if ast_trace and ast_trace.requirements else ""
-        
-        return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>{self._get_common_styles()}</style>
-</head>
-<body>
-    <div class="container">
-        <div class="header header-warning">
-            <h1 style="margin: 0;">⚠️ Error Analysis Report</h1>
-            <p style="margin: 10px 0 0 0; opacity: 0.9;">Low Confidence - Manual Review Recommended</p>
-        </div>
-        
-        <div class="content">
-            <!-- Warning Banner -->
-            <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin-bottom: 20px;">
-                <div style="display: flex; align-items: center; gap: 10px;">
-                    <span style="font-size: 1.5em;">⚠️</span>
-                    <div>
-                        <strong style="color: #856404;">Low Confidence Analysis ({confidence_score:.0f}%)</strong>
-                        <p style="margin: 5px 0 0 0; color: #856404; font-size: 0.9em;">
-                            Validation iterations showed inconsistent results. Possible causes are listed below instead of fix proposals.
-                        </p>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Error Summary -->
-            <div class="section">
-                <h2 class="section-title">🚨 Error Summary</h2>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d; width: 120px;">Type</td>
-                        <td style="padding: 8px 0; font-weight: 600;">{html.escape(error_type)}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Severity</td>
-                        <td style="padding: 8px 0;">
-                            <span class="severity-badge" style="background: {severity_color}; color: white;">{severity.upper()}</span>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Location</td>
-                        <td style="padding: 8px 0;"><code>{html.escape(str(source_file))}:{line_number}</code></td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Timestamp</td>
-                        <td style="padding: 8px 0;">{timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') if hasattr(timestamp, 'strftime') else str(timestamp)}</td>
-                    </tr>
-                </table>
-                
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 15px;">
-                    <strong>Error Message:</strong><br>
-                    <code style="color: #dc3545;">{error_msg}</code>
-                </div>
-            </div>
-            
-            {validation_html}
-            
-            {ast_trace_html}
-            
-            <!-- Possible Causes -->
-            <div class="section">
-                <h2 class="section-title">🤔 Possible Causes</h2>
-                <p style="color: #6c757d; font-size: 0.9em; margin-bottom: 15px;">
-                    Since confidence is below 75%, here are potential causes that should be investigated:
-                </p>
-                {possible_causes_html if possible_causes_html else '<p style="color: #6c757d;">No specific causes identified.</p>'}
-            </div>
-            
-            {dependencies_html}
-            
-            <!-- Footer -->
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; color: #6c757d; font-size: 0.85em;">
-                <p><strong>⚠️ Manual investigation is recommended</strong> due to low confidence in the analysis.</p>
-                <p>Generated by Self-Healing Software System v2.0 at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
-            </div>
-        </div>
+    <!-- Error Summary -->
+    <div class="sec">
+      <h2 class="sec-title">&#128680; Error Summary</h2>
+      <table class="meta">
+        <tr><td>Type</td><td><strong>{error_type}</strong></td></tr>
+        <tr><td>Severity</td><td><span class="badge" style="background:{sv_color};">{severity.upper()}</span></td></tr>
+        <tr><td>Location</td><td><code>{source_file}:{line_number}</code></td></tr>
+        <tr><td>Category</td><td>{category}</td></tr>
+      </table>
+      <div style="background:#fff1e5;padding:12px;border-radius:4px;margin-top:12px;border:1px solid #ffd8b5;">
+        <strong>Error:</strong> <code style="color:#cf222e;">{error_msg}</code>
+      </div>
     </div>
-</body>
-</html>
-"""
 
-    # ==========================================
-    # Helper Methods for Building Sections
-    # ==========================================
-    
-    def _build_validation_html(self, validation_result: Optional['ValidationResult']) -> str:
-        """Build HTML for validation/confidence section."""
-        if not validation_result:
-            return ""
-        
-        confidence_score = validation_result.confidence_score
-        confidence_met = validation_result.confidence_met
-        total_iterations = len(validation_result.iterations) + 1  # +1 for initial
-        matching_iterations = validation_result.matching_iterations + 1  # +1 for initial match
-        
-        # Progress bar color
-        if confidence_score >= 75:
-            bar_color = "#28a745"
-        elif confidence_score >= 50:
-            bar_color = "#ffc107"
-        else:
-            bar_color = "#dc3545"
-        
-        # Build iteration details
-        iteration_items = ""
-        for iteration in validation_result.iterations[:5]:  # Limit to 5
-            match_icon = "✅" if iteration.matches_initial else "❌"
-            match_style = "color: #28a745;" if iteration.matches_initial else "color: #dc3545;"
-            
-            iteration_items += f"""
-            <div class="iteration-card">
-                <span style="{match_style} font-weight: 600;">{match_icon}</span>
-                <strong>Iteration {iteration.iteration_number}</strong> - {html.escape(iteration.payload_variation)}
-                {f'<br><small style="color: #6c757d;">{html.escape(iteration.notes[:100])}</small>' if iteration.notes else ''}
-            </div>
-            """
-        
-        return f"""
-        <div class="section">
-            <h2 class="section-title">📊 Confidence Validation</h2>
-            
-            <!-- Confidence Score -->
-            <div style="margin-bottom: 20px;">
-                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
-                    <span>Confidence Score</span>
-                    <strong style="color: {bar_color};">{confidence_score:.0f}%</strong>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: {confidence_score}%; background: {bar_color};"></div>
-                </div>
-                <p style="color: #6c757d; font-size: 0.85em; margin-top: 5px;">
-                    Threshold: 75% | {matching_iterations}/{total_iterations} iterations matched
-                </p>
-            </div>
-            
-            <!-- Iteration Details -->
-            <details style="margin-top: 15px;">
-                <summary style="cursor: pointer; color: #007bff; font-weight: 600;">View Iteration Details</summary>
-                <div style="margin-top: 10px;">
-                    {iteration_items if iteration_items else '<p style="color: #6c757d;">No iteration data available.</p>'}
-                </div>
-            </details>
-        </div>
-        """
-    
-    def _build_ast_trace_html(
-        self, 
-        ast_trace: Optional['ASTTraceContext'],
-        error_line: int = 0
-    ) -> str:
-        """Build HTML for AST trace section."""
-        if not ast_trace:
-            return ""
-        
-        # Error path visualization
-        error_path_html = ""
-        if ast_trace.error_path:
-            error_path_html = ASTTreeHTMLBuilder.build_error_path_html(ast_trace.error_path)
-        
-        # Code context
-        code_context_html = ""
-        if ast_trace.error_context_code:
-            # Format code with error line highlighting
-            lines = ast_trace.error_context_code.split('\n')
-            formatted_lines = []
-            for line in lines:
-                if line.startswith(">>>"):
-                    formatted_lines.append(f'<span class="error-line">{html.escape(line)}</span>')
-                else:
-                    formatted_lines.append(html.escape(line))
-            code_context_html = '\n'.join(formatted_lines)
-        
-        # AST tree visualization
-        ast_tree_html = ""
-        if ast_trace.main_ast:
-            ast_tree_html = ASTTreeHTMLBuilder.build_ast_tree_html(
-                ast_trace.main_ast,
-                error_line=error_line,
-                error_path=ast_trace.error_path
-            )
-        
-        # Cross-file references
-        references_html = ""
-        if ast_trace.references:
-            ref_items = []
-            for ref in ast_trace.references[:10]:  # Limit to 10
-                resolved = f" → {html.escape(ref.resolved_path)}" if ref.resolved_path else ""
-                ref_items.append(f"""
-                <div class="reference-item">
-                    <strong>{html.escape(ref.symbol_name)}</strong>
-                    <span style="color: #6c757d;">({ref.ref_type})</span>
-                    <br>
-                    <small>from {html.escape(ref.from_file)}:{ref.line_number}{resolved}</small>
-                </div>
-                """)
-            references_html = ''.join(ref_items)
-        
-        return f"""
-        <div class="section">
-            <h2 class="section-title">🌳 AST Trace</h2>
-            
-            <!-- Error Path -->
-            {f'''
-            <div style="margin-bottom: 20px;">
-                <h4 style="color: #495057; margin-bottom: 10px;">Error Path</h4>
-                <p style="color: #6c757d; font-size: 0.85em; margin-bottom: 8px;">Path from module root to error location:</p>
-                {error_path_html}
-            </div>
-            ''' if error_path_html else ''}
-            
-            <!-- Code Context -->
-            {f'''
-            <div style="margin-bottom: 20px;">
-                <h4 style="color: #495057; margin-bottom: 10px;">Code Context</h4>
-                <pre class="code-context">{code_context_html}</pre>
-            </div>
-            ''' if code_context_html else ''}
-            
-            <!-- AST Tree -->
-            {f'''
-            <div style="margin-bottom: 20px;">
-                <h4 style="color: #495057; margin-bottom: 10px;">AST Structure</h4>
-                <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 15px; max-height: 400px; overflow: auto;">
-                    {ast_tree_html}
-                </div>
-            </div>
-            ''' if ast_tree_html else ''}
-            
-            <!-- Cross-file References -->
-            {f'''
-            <div style="margin-bottom: 20px;">
-                <h4 style="color: #495057; margin-bottom: 10px;">Cross-File References</h4>
-                {references_html}
-            </div>
-            ''' if references_html else ''}
-        </div>
-        """
-    
-    def _build_proposals_html(self, proposals: List[FixProposal]) -> str:
-        """Build HTML for fix proposals section."""
-        if not proposals:
-            return '<p style="color: #6c757d;">No fix proposals generated.</p>'
-        
-        items = []
-        for i, proposal in enumerate(proposals, 1):
-            items.append(f"""
-            <div style="background: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin: 10px 0; border-radius: 0 4px 4px 0;">
-                <h4 style="margin: 0 0 10px 0; color: #007bff;">Proposal {i}</h4>
-                <p style="margin: 5px 0;"><strong>File:</strong> <code>{html.escape(proposal.target_file or 'Unknown')}</code></p>
-                <p style="margin: 5px 0;"><strong>Confidence:</strong> {proposal.confidence:.0%}</p>
-                <p style="margin: 10px 0;">{html.escape(proposal.explanation)}</p>
-                {f'''
-                <div style="margin-top: 10px;">
-                    <strong>Suggested Code:</strong>
-                    <pre style="background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 4px; overflow-x: auto; margin-top: 5px;">{html.escape(proposal.suggested_code)}</pre>
-                </div>
-                ''' if proposal.suggested_code else ''}
-                {f'<p style="color: #856404; margin-top: 10px;"><strong>⚠️ Potential Side Effects:</strong> {", ".join(html.escape(e) for e in proposal.side_effects)}</p>' if proposal.side_effects else ''}
-            </div>
-            """)
-        
-        return ''.join(items)
-    
-    def _build_possible_causes_html(self, validation_result: Optional['ValidationResult']) -> str:
-        """Build HTML for possible causes section (low confidence)."""
-        if not validation_result:
-            return ""
-        
-        items = []
-        
-        # Add possible causes
-        for cause in validation_result.possible_causes[:5]:
-            items.append(f"""
-            <div class="possible-cause">
-                <strong>🔸 Possible Cause:</strong>
-                <p style="margin: 5px 0 0 0;">{html.escape(cause)}</p>
-            </div>
-            """)
-        
-        # Add divergent findings
-        if validation_result.divergent_findings:
-            items.append('<h4 style="color: #495057; margin-top: 20px;">Divergent Analysis Results:</h4>')
-            for finding in validation_result.divergent_findings[:3]:
-                items.append(f"""
-                <div style="background: #f8d7da; border-left: 4px solid #dc3545; padding: 10px 15px; margin: 8px 0;">
-                    <p style="margin: 0; font-size: 0.9em;">{html.escape(finding)}</p>
-                </div>
-                """)
-        
-        return ''.join(items) if items else '<p style="color: #6c757d;">No specific causes identified from validation.</p>'
-    
-    def _build_dependencies_html(self, ast_trace: Optional['ASTTraceContext']) -> str:
-        """Build HTML for dependencies section."""
-        if not ast_trace or not ast_trace.requirements:
-            return ""
-        
-        reqs = ast_trace.requirements
-        
-        # Build dependency list
-        dep_items = []
-        all_deps = {**reqs.dependencies, **reqs.dev_dependencies}
-        for name, version in list(all_deps.items())[:15]:  # Limit to 15
-            is_dev = name in reqs.dev_dependencies
-            badge = '<span style="background: #6c757d; color: white; padding: 1px 5px; border-radius: 3px; font-size: 0.7em; margin-left: 5px;">dev</span>' if is_dev else ''
-            dep_items.append(f'<li><code>{html.escape(name)}</code>: {html.escape(version)}{badge}</li>')
-        
-        if len(all_deps) > 15:
-            dep_items.append(f'<li style="color: #6c757d;">... and {len(all_deps) - 15} more</li>')
-        
-        return f"""
-        <div class="section">
-            <h2 class="section-title">📦 Project Dependencies</h2>
-            <p style="color: #6c757d; font-size: 0.9em; margin-bottom: 10px;">
-                From: <code>{html.escape(reqs.manifest_file)}</code> ({html.escape(reqs.language)})
-            </p>
-            <ul style="margin: 0; padding-left: 20px;">
-                {''.join(dep_items)}
-            </ul>
-        </div>
-        """
-        """Build HTML content for code review email."""
-        
-        review = email.review
+    <!-- Report link (placed early to avoid Gmail clipping) -->
+    <div style="text-align:center;margin:18px 0;">
+      {f'<a href="{report_url}" style="display:inline-block;padding:12px 28px;background:#9a6700;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;font-size:15px;">&#128196; View Full Report Online</a>' if report_url else ''}
+      <p style="color:#57606a;font-size:12px;margin-top:6px;">The full report has interactive AST visualization and detailed analysis.</p>
+    </div>
+
+    {validation_html}
+    {causes_html}
+
+    <!-- AST Trace (collapsed to keep email compact) -->
+    <details style="border:1px solid #d0d7de;border-radius:6px;padding:12px;margin:16px 0;">
+      <summary style="cursor:pointer;font-size:15px;font-weight:600;color:#9a6700;list-style:none;padding:4px;">
+        &#127795; AST Parser Trace (click to expand)
+      </summary>
+      <div style="margin-top:10px;">
+        {ast_html}
+      </div>
+    </details>
+
+    {deps_html}
+
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;text-align:center;">
+      <strong>&#9888;&#65039; Manual investigation recommended.</strong><br>
+      Generated by AutoCure Self-Healing System v2.0 &bull; {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+    </div>
+  </div>
+</div></body></html>"""
+
+    # ══════════════════════════════════════════════════════════
+    #  Code Review email
+    # ══════════════════════════════════════════════════════════
+
+    def _build_review_email(self, review: CodeReviewResult) -> str:
         pr = review.pr_info
-        
-        # Assessment color
-        assessment_colors = {
-            "approve": "#28a745",
-            "request_changes": "#dc3545",
-            "comment": "#ffc107",
-        }
-        assessment_color = assessment_colors.get(review.overall_assessment, "#6c757d")
-        
-        assessment_icons = {
-            "approve": "✅",
-            "request_changes": "❌",
-            "comment": "💬",
-        }
-        assessment_icon = assessment_icons.get(review.overall_assessment, "📝")
-        
-        # Build comments HTML
+
+        assess_colors = {"approve": "#1a7f37", "request_changes": "#cf222e", "comment": "#9a6700"}
+        assess_icons = {"approve": "&#9989;", "request_changes": "&#10060;", "comment": "&#128172;"}
+        assess_color = assess_colors.get(review.overall_assessment, "#57606a")
+        assess_icon = assess_icons.get(review.overall_assessment, "&#128221;")
+
         comments_html = ""
-        for comment in review.comments:
-            severity_colors = {
-                "critical": "#dc3545",
-                "warning": "#fd7e14",
-                "suggestion": "#007bff",
-                "nitpick": "#6c757d",
-            }
-            comment_color = severity_colors.get(comment.severity, "#6c757d")
-            
+        for c in review.comments:
+            sev_colors = {"error": "#cf222e", "critical": "#cf222e", "warning": "#bf8700",
+                          "suggestion": "#0969da", "info": "#57606a", "nitpick": "#57606a"}
+            c_color = sev_colors.get(c.severity, "#57606a")
+            snippet_html = ""
+            if c.code_snippet:
+                snippet_html = (
+                    '<div style="background:#f0f4f8;padding:8px;border-radius:4px;margin-top:4px;font-size:12px;">'
+                    f'<strong style="color:#57606a;">Context:</strong><br>'
+                    f'<code style="white-space:pre;font-size:11px;">{_esc(c.code_snippet[:300])}</code></div>'
+                )
             comments_html += f"""
-            <div style="border-left: 4px solid {comment_color}; padding: 10px 15px; margin: 10px 0; background: #f8f9fa;">
-                <p style="margin: 0 0 5px 0; color: #6c757d; font-size: 0.85em;">
-                    {html.escape(comment.file_path)}:{comment.line_number or '?'} • 
-                    <span style="color: {comment_color}; font-weight: 600;">{comment.severity.upper()}</span> • 
-                    {html.escape(comment.category)}
-                </p>
-                <p style="margin: 5px 0;">{html.escape(comment.comment)}</p>
-                {f'<pre style="background: #2d2d2d; color: #f8f8f2; padding: 10px; font-size: 0.85em; margin-top: 10px;">{html.escape(comment.suggestion)}</pre>' if comment.suggestion else ''}
-            </div>
-            """
-        
-        # Highlights
+      <div style="border-left:4px solid {c_color};padding:10px 14px;margin:8px 0;background:#f6f8fa;border-radius:0 4px 4px 0;">
+        <p style="margin:0 0 4px;color:#57606a;font-size:12px;">
+          {_esc(c.file_path)}:{c.line_number or "?"} &bull;
+          <span style="color:{c_color};font-weight:600;">{c.severity.upper()}</span> &bull;
+          {_esc(c.comment_type)}
+        </p>
+        <p style="margin:4px 0;">{_esc(c.message)}</p>
+        {snippet_html}
+        {f'<pre style="background:#1b1f23;color:#e1e4e8;padding:10px;font-size:12px;border-radius:4px;margin-top:6px;">{_esc(c.suggested_fix)}</pre>' if c.suggested_fix else ""}
+      </div>"""
+
         highlights_html = ""
         if review.highlights:
-            highlights_html = "<ul>" + "".join(f"<li>{html.escape(h)}</li>" for h in review.highlights) + "</ul>"
-        
-        return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; }}
-        .container {{ max-width: 800px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 8px 8px 0 0; }}
-        .content {{ background: white; padding: 30px; border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 8px 8px; }}
-        .section {{ margin: 25px 0; }}
-        .section-title {{ color: #495057; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1 style="margin: 0;">📝 Code Review Report</h1>
-            <p style="margin: 10px 0 0 0; opacity: 0.9;">PR #{pr.pr_number}: {html.escape(pr.title or 'Untitled')}</p>
-        </div>
-        
-        <div class="content">
-            <!-- Overall Assessment -->
-            <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 8px; margin-bottom: 20px;">
-                <div style="font-size: 48px;">{assessment_icon}</div>
-                <div style="font-size: 1.2em; font-weight: 600; color: {assessment_color}; text-transform: uppercase;">
-                    {review.overall_assessment.replace('_', ' ')}
-                </div>
-            </div>
-            
-            <!-- Summary -->
-            <div class="section">
-                <h2 class="section-title">📋 Summary</h2>
-                <p>{html.escape(review.summary)}</p>
-            </div>
-            
-            <!-- PR Details -->
-            <div class="section">
-                <h3 class="section-title">🔀 Pull Request Details</h3>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d; width: 120px;">Base Branch</td>
-                        <td style="padding: 8px 0;">{html.escape(pr.base_branch)}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Head Branch</td>
-                        <td style="padding: 8px 0;">{html.escape(pr.head_branch)}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 8px 0; color: #6c757d;">Reviewed At</td>
-                        <td style="padding: 8px 0;">{review.reviewed_at.strftime('%Y-%m-%d %H:%M:%S UTC')}</td>
-                    </tr>
-                </table>
-            </div>
-            
-            <!-- Comments -->
-            <div class="section">
-                <h2 class="section-title">💬 Review Comments ({len(review.comments)})</h2>
-                {comments_html if comments_html else '<p style="color: #6c757d;">No comments.</p>'}
-            </div>
-            
-            {f'''
-            <div class="section">
-                <h3 class="section-title">✨ Highlights</h3>
-                {highlights_html}
-            </div>
-            ''' if highlights_html else ''}
-            
-            <!-- Footer -->
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; color: #6c757d; font-size: 0.85em;">
-                <p>This is an automated code review. Human judgment should be applied before merging.</p>
-                <p>Generated by Self-Healing Software System v2.0</p>
-            </div>
-        </div>
+            highlights_html = (
+                '<div class="sec"><h3 class="sec-title">&#10024; Highlights</h3><ul>'
+                + "".join(f"<li>{_esc(h)}</li>" for h in review.highlights) + "</ul></div>"
+            )
+
+        ast_insights_html = ""
+        if review.ast_insights:
+            ast_insights_html = (
+                '<div class="sec"><h2 class="sec-title">&#127795; AST Analysis Insights</h2>'
+                '<div style="background:#ddf4ff;border-left:4px solid #0969da;padding:14px;border-radius:0 6px 6px 0;">'
+                f'<p style="margin:0;font-size:13px;">{_esc(review.ast_insights)}</p>'
+                '</div></div>'
+            )
+
+        return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>{_EMAIL_CSS}</style></head><body>
+<div class="container">
+  <div class="hdr">
+    <h1 style="margin:0;font-size:20px;">&#128221; Code Review Report</h1>
+    <p style="margin:8px 0 0;opacity:.9;font-size:14px;">PR #{pr.pr_number}: {_esc(pr.title)}</p>
+  </div>
+  <div class="cnt">
+
+    <div style="text-align:center;padding:20px;background:#f6f8fa;border-radius:8px;margin-bottom:18px;">
+      <div style="font-size:42px;">{assess_icon}</div>
+      <div style="font-size:18px;font-weight:600;color:{assess_color};text-transform:uppercase;margin-top:6px;">
+        {review.overall_assessment.replace('_', ' ')}</div>
     </div>
-</body>
-</html>
-"""
-    
-    async def _send_email(
-        self, to: str, subject: str, html_content: str
-    ) -> bool:
-        """Send an email using SMTP."""
-        
+
+    <div class="sec">
+      <h2 class="sec-title">&#128203; Summary</h2>
+      <p>{_esc(review.summary)}</p>
+    </div>
+
+    <div class="sec">
+      <h3 class="sec-title">&#128256; PR Details</h3>
+      <table class="meta">
+        <tr><td>Base</td><td>{_esc(pr.target_branch)}</td></tr>
+        <tr><td>Head</td><td>{_esc(pr.source_branch)}</td></tr>
+        <tr><td>Author</td><td>{_esc(pr.author)}</td></tr>
+        <tr><td>Reviewed</td><td>{review.reviewed_at.strftime('%Y-%m-%d %H:%M:%S UTC')}</td></tr>
+      </table>
+    </div>
+
+    <div class="sec">
+      <h2 class="sec-title">&#128172; Review Comments ({len(review.comments)})</h2>
+      {comments_html or '<p style="color:#57606a;">No comments.</p>'}
+    </div>
+
+    {ast_insights_html}
+    {highlights_html}
+
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;text-align:center;">
+      Automated code review &bull; Human judgement should be applied before merging.<br>
+      AutoCure Self-Healing System v2.0
+    </div>
+  </div>
+</div></body></html>"""
+
+    # ══════════════════════════════════════════════════════════
+    #  Reusable email sub-section builders
+    # ══════════════════════════════════════════════════════════
+
+    def _email_validation_section(self, vr) -> str:
+        """Confidence validation progress bar + iteration details."""
+        if not vr:
+            return ""
+        score = vr.confidence_score
+        total = len(vr.iterations) + 1
+        matching = vr.matching_iterations + 1
+        bar_color = "#1a7f37" if score >= 75 else ("#9a6700" if score >= 50 else "#cf222e")
+
+        iter_items = ""
+        for it in vr.iterations[:6]:
+            icon = "&#9989;" if it.matches_initial else "&#10060;"
+            iter_items += (
+                f'<div class="iter-card">{icon} <strong>Iteration {it.iteration_number}</strong>'
+                f' &ndash; {_esc(it.payload_variation)}'
+                + (f'<br><small style="color:#57606a;">{_esc(it.notes[:120])}</small>' if it.notes else "")
+                + '</div>'
+            )
+
+        return f"""
+    <div class="sec">
+      <h2 class="sec-title">&#128202; Confidence Validation</h2>
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+        <span>Confidence Score</span><strong style="color:{bar_color};">{score:.0f}%</strong>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:{score}%;background:{bar_color};"></div></div>
+      <p style="color:#57606a;font-size:12px;margin-top:4px;">Threshold 75% &bull; {matching}/{total} matched</p>
+      <details style="border-left:none;padding-left:0;margin-top:12px;">
+        <summary style="color:#0969da;font-weight:600;font-size:13px;">View Iteration Details</summary>
+        <div style="margin-top:6px;">{iter_items or "<p style='color:#57606a;'>No data.</p>"}</div>
+      </details>
+    </div>"""
+
+    def _email_ast_trace_section(self, trace, error_line: int) -> str:
+        """
+        THE centrepiece: accordion-based AST parser trace in the email.
+        Replaces legacy stack-trace sections entirely.
+        Shows: error path breadcrumb, code context, full AST accordion
+        tree, cross-file references, and referenced file ASTs.
+        """
+        if not trace:
+            return ""
+
+        parts: List[str] = []
+
+        # 1. Error path breadcrumb
+        if trace.error_path:
+            path_ids = {id(n) for n in trace.error_path}
+            path_html = ASTAccordionBuilder.build_error_path(trace.error_path)
+            parts.append(
+                '<div style="margin-bottom:14px;">'
+                '<h4 style="font-size:14px;margin-bottom:6px;">AST Error Path</h4>'
+                '<p style="color:#57606a;font-size:12px;margin-bottom:6px;">'
+                'Trace from module root to the error location:</p>'
+                f'{path_html}</div>'
+            )
+        else:
+            path_ids = set()
+
+        # 2. Code context
+        if trace.error_context_code:
+            code_lines = trace.error_context_code.split('\n')
+            fmt = []
+            for line in code_lines:
+                if line.startswith(">>>"):
+                    fmt.append(f'<span class="eline">{_esc(line)}</span>')
+                else:
+                    fmt.append(_esc(line))
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;">&#128221; Code Context</summary>'
+                f'<div class="code-box" style="margin-top:6px;">{chr(10).join(fmt)}</div></details>'
+            )
+
+        # 3. Full AST accordion tree (limited depth for email)
+        if trace.main_ast:
+            tree_html = ASTAccordionBuilder.build_tree(
+                trace.main_ast,
+                error_line=error_line,
+                error_path_ids=path_ids,
+                max_depth=4,
+                max_children=10,
+            )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;">'
+                '&#127794; Full AST Tree (click to expand)</summary>'
+                '<div style="background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;'
+                f'padding:14px;margin-top:6px;max-height:500px;overflow:auto;">'
+                f'{tree_html}</div></details>'
+            )
+
+        # 4. Cross-file references
+        if trace.references:
+            ref_items = ""
+            for ref in trace.references[:12]:
+                resolved = f" &rarr; <code>{_esc(ref.resolved_path)}</code>" if ref.resolved_path else ""
+                ref_items += (
+                    f'<div class="ref-item"><strong>{_esc(ref.symbol_name)}</strong> '
+                    f'<span style="color:#57606a;">({ref.ref_type})</span><br>'
+                    f'<small>{_esc(ref.from_file)}:{ref.line_number}{resolved}</small></div>'
+                )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;">'
+                f'&#128279; References ({len(trace.references)})</summary>'
+                f'<div style="margin-top:6px;">{ref_items}</div></details>'
+            )
+
+        # 5. Referenced file ASTs (limited for email compactness)
+        if trace.referenced_files:
+            rf_parts = []
+            for fpath, ast_root in list(trace.referenced_files.items())[:3]:
+                mini = ASTAccordionBuilder.build_tree(ast_root, max_depth=2, max_children=8)
+                rf_parts.append(
+                    '<details style="border-left:none;margin:6px 0;padding-left:0;">'
+                    f'<summary style="font-size:13px;color:#0969da;">'
+                    f'&#128196; {_esc(os.path.basename(fpath))}</summary>'
+                    '<div style="background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;'
+                    f'padding:10px;margin-top:4px;max-height:280px;overflow:auto;">{mini}</div></details>'
+                )
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;">'
+                f'&#128218; Referenced ASTs ({len(trace.referenced_files)})</summary>'
+                f'<div style="margin-top:6px;">{"".join(rf_parts)}</div></details>'
+            )
+
+        if not parts:
+            return ""
+
+        return (
+            '<div class="sec"><h2 class="sec-title">&#127795; AST Parser Trace</h2>'
+            + "\n".join(parts)
+            + '</div>'
+        )
+
+    def _email_proposals_section(self, proposals: List[FixProposal]) -> str:
+        if not proposals:
+            return (
+                '<div class="sec"><h2 class="sec-title">&#128161; Fix Proposals</h2>'
+                '<p style="color:#57606a;">None generated.</p></div>'
+            )
+        items = ""
+        for i, p in enumerate(proposals, 1):
+            sfx = ""
+            if p.side_effects:
+                sfx = (
+                    '<p style="color:#9a6700;margin-top:8px;">'
+                    '<strong>&#9888;&#65039; Side Effects:</strong> '
+                    + ", ".join(_esc(e) for e in p.side_effects) + '</p>'
+                )
+            # Edge test cases (email-safe)
+            tests_html = ""
+            if p.test_cases:
+                test_items = ""
+                for j, tc in enumerate(p.test_cases, 1):
+                    orig_color = "#cf222e" if tc.original_would_fail else "#1a7f37"
+                    orig_label = "FAIL" if tc.original_would_fail else "PASS"
+                    fix_color = "#1a7f37" if tc.fix_would_pass else "#cf222e"
+                    fix_label = "PASS" if tc.fix_would_pass else "FAIL"
+                    test_items += f"""
+              <div style="background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:10px 12px;margin:6px 0;">
+                <div style="margin-bottom:4px;">
+                  <strong style="font-size:13px;color:#24292f;">{_esc(tc.test_name or f'Test {j}')}</strong>
+                  <span style="float:right;font-size:11px;">
+                    <span style="color:{orig_color};font-weight:600;">Original: {orig_label}</span>
+                    &nbsp;|&nbsp;
+                    <span style="color:{fix_color};font-weight:600;">Fixed: {fix_label}</span>
+                  </span>
+                </div>
+                <p style="color:#57606a;font-size:12px;margin:4px 0;">{_esc(tc.description)}</p>
+                {f'<pre style="background:#f0f0f0;padding:8px;border-radius:4px;font-size:12px;line-height:1.4;overflow-x:auto;">{_esc(tc.test_code)}</pre>' if tc.test_code else ''}
+                {f'<p style="color:#1a7f37;font-size:12px;margin-top:4px;"><strong>Expected:</strong> {_esc(tc.expected_behavior)}</p>' if tc.expected_behavior else ''}
+              </div>"""
+                tests_html = (
+                    f'<div style="border-top:1px solid #d0d7de;margin-top:12px;padding-top:10px;">'
+                    f'<strong style="font-size:13px;color:#0969da;">&#129514; Edge Test Cases ({len(p.test_cases)})</strong>'
+                    f'{test_items}</div>'
+                )
+            items += f"""
+      <div class="proposal-box">
+        <h4 style="color:#0969da;margin-bottom:8px;">Proposal {i}</h4>
+        <table class="meta">
+          <tr><td>File</td><td><code>{_esc(p.target_file)}</code></td></tr>
+          <tr><td>Confidence</td><td>{p.confidence:.0%}</td></tr>
+          <tr><td>Risk</td><td>{_esc(p.risk_level)}</td></tr>
+        </table>
+        <p style="margin:10px 0;">{_esc(p.explanation)}</p>
+        {f'<pre>{_esc(p.suggested_code)}</pre>' if p.suggested_code else ""}
+        {sfx}
+        {tests_html}
+      </div>"""
+        return f'<div class="sec"><h2 class="sec-title">&#128161; Fix Proposals</h2>{items}</div>'
+
+    def _email_causes_section(self, vr) -> str:
+        """Build possible-causes section for low-confidence emails."""
+        if not vr:
+            return ""
+        items = ""
+        if hasattr(vr, 'possible_causes') and vr.possible_causes:
+            for cause in vr.possible_causes[:6]:
+                items += (
+                    f'<div class="cause-box"><strong>&#128312; Possible Cause</strong>'
+                    f'<p style="margin:4px 0 0;">{_esc(cause)}</p></div>'
+                )
+        divergent = ""
+        if hasattr(vr, 'divergent_findings') and vr.divergent_findings:
+            for f in vr.divergent_findings[:3]:
+                divergent += (
+                    '<div style="background:#ffebe9;border-left:4px solid #cf222e;'
+                    f'padding:10px 14px;margin:6px 0;border-radius:0 6px 6px 0;font-size:13px;">{_esc(f)}</div>'
+                )
+            divergent = '<h4 style="margin-top:12px;">Divergent Findings</h4>' + divergent
+        if not items and not divergent:
+            return ""
+        return (
+            '<div class="sec"><h2 class="sec-title">&#129300; Possible Causes</h2>'
+            '<p style="color:#57606a;font-size:13px;margin-bottom:10px;">'
+            'Confidence below 75% &ndash; investigate these possible causes:</p>'
+            f'{items}{divergent}</div>'
+        )
+
+    def _email_deps_section(self, trace) -> str:
+        """Dependencies section from project manifest."""
+        if not trace or not getattr(trace, 'requirements', None):
+            return ""
+        reqs = trace.requirements
+        all_deps = {**reqs.dependencies, **reqs.dev_dependencies}
+        if not all_deps:
+            return ""
+        items = ""
+        for name, ver in list(all_deps.items())[:15]:
+            dev = (' <span class="badge" style="background:#6c757d;font-size:10px;">dev</span>'
+                   if name in reqs.dev_dependencies else "")
+            items += f"<li><code>{_esc(name)}</code>: {_esc(ver)}{dev}</li>"
+        if len(all_deps) > 15:
+            items += f'<li style="color:#57606a;">... and {len(all_deps) - 15} more</li>'
+        return (
+            f'<div class="sec"><h2 class="sec-title">&#128230; Dependencies</h2>'
+            f'<p style="color:#57606a;font-size:13px;margin-bottom:6px;">'
+            f'From <code>{_esc(reqs.manifest_file)}</code> ({_esc(reqs.language)})</p>'
+            f'<ul style="padding-left:20px;font-size:13px;">{items}</ul></div>'
+        )
+
+    # ══════════════════════════════════════════════════════════
+    #  SMTP sender
+    # ══════════════════════════════════════════════════════════
+
+    async def _send_email(self, to: str, subject: str, html_content: str) -> bool:
+        """Build MIME message and send via SMTP (TLS)."""
         if not self.config.sender_email or not self.config.sender_password:
             logger.error("Email sender credentials not configured")
             return False
-        
         try:
-            # Create message
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
             msg["From"] = self.config.sender_email
             msg["To"] = to
-            
-            # Attach HTML content
-            html_part = MIMEText(html_content, "html")
-            msg.attach(html_part)
-            
-            # Send email in thread pool to avoid blocking
+            msg.attach(MIMEText(html_content, "html"))
+
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                self._send_smtp,
-                msg,
-            )
-            
-            logger.info(f"✓ Email sent to {to}")
+            await loop.run_in_executor(None, self._send_smtp, msg)
+            logger.info(f"Email sent to {to}")
             return True
-            
         except Exception as e:
             logger.error(f"Failed to send email: {e}")
             return False
-    
+
     def _send_smtp(self, msg: MIMEMultipart):
-        """Send email via SMTP (blocking call)."""
-        
+        """Blocking SMTP send (called via executor)."""
         with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port) as server:
             server.starttls()
             server.login(self.config.sender_email, self.config.sender_password)
             server.send_message(msg)
 
 
-# Singleton instance
+# ════════════════════════════════════════════════════════════════
+#  Singleton
+# ════════════════════════════════════════════════════════════════
+
 _email_service: Optional[EmailService] = None
 
 
 def get_email_service() -> EmailService:
-    """Get or create the email service singleton."""
+    """Get or create the email-service singleton."""
     global _email_service
     if _email_service is None:
         _email_service = EmailService()

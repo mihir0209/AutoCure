@@ -109,7 +109,7 @@ class GitHubService:
             shutil.rmtree(local_path)
         
         # Build clone URL with token
-        token = user.access_token or self.default_token
+        token = user.access_token or user.repo_token or self.default_token
         if token:
             if "github.com" in user.repo_url:
                 clone_url = user.repo_url.replace(
@@ -129,17 +129,20 @@ class GitHubService:
             # Clone the repository
             logger.info(f"Cloning repository: {user.repo_url} -> {local_path}")
             
-            process = await asyncio.create_subprocess_exec(
-                "git", "clone", "--depth", "1", "-b", user.base_branch,
-                clone_url, str(local_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"Git clone failed: {stderr.decode()}")
+            import subprocess as _sp
+            try:
+                # Use subprocess.run for cross-platform reliability (async subprocess
+                # can fail in background tasks on Windows)
+                proc = _sp.run(
+                    ["git", "clone", "--depth", "1", "-b", user.base_branch,
+                     clone_url, str(local_path)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if proc.returncode != 0:
+                    logger.error(f"Git clone failed: {proc.stderr}")
+                    return None
+            except _sp.TimeoutExpired:
+                logger.error("Git clone timed out after 120s")
                 return None
             
             logger.info(f"✓ Repository cloned successfully: {local_path}")
@@ -167,22 +170,20 @@ class GitHubService:
             return False
         
         try:
-            process = await asyncio.create_subprocess_exec(
-                "git", "pull", "--rebase",
+            import subprocess as _sp
+            proc = _sp.run(
+                ["git", "pull", "--rebase"],
                 cwd=str(repo_info.local_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                capture_output=True, text=True, timeout=60,
             )
             
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"Git pull failed: {stderr.decode()}")
+            if proc.returncode != 0:
+                logger.error(f"Git pull failed: {proc.stderr}")
                 return False
             
             # Update repo info
             repo_info.last_pulled = datetime.utcnow()
-            repo_info.latest_commit = await self._get_latest_commit(repo_info.local_path)
+            repo_info.latest_commit = self._get_latest_commit_sync(Path(repo_info.local_path))
             
             logger.info(f"✓ Repository pulled: {repo_info.local_path}")
             return True
@@ -198,42 +199,40 @@ class GitHubService:
             return None
         
         try:
+            import subprocess as _sp
             # Get current branch
-            branch_process = await asyncio.create_subprocess_exec(
-                "git", "rev-parse", "--abbrev-ref", "HEAD",
+            branch_proc = _sp.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 cwd=str(local_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                capture_output=True, text=True, timeout=15,
             )
-            branch_stdout, _ = await branch_process.communicate()
-            current_branch = branch_stdout.decode().strip()
+            current_branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "unknown"
             
             # Get latest commit
-            latest_commit = await self._get_latest_commit(local_path)
+            latest_commit = self._get_latest_commit_sync(local_path)
             
             return RepositoryInfo(
                 user_id=user_id,
-                local_path=local_path,
+                local_path=str(local_path),
                 current_branch=current_branch,
                 latest_commit=latest_commit,
                 last_pulled=datetime.utcnow(),
             )
             
         except Exception as e:
-            logger.error(f"Error getting repo info: {e}")
+            logger.error(f"Error getting repo info: {e}", exc_info=True)
             return None
     
-    async def _get_latest_commit(self, local_path: Path) -> str:
-        """Get the latest commit hash."""
+    def _get_latest_commit_sync(self, local_path: Path) -> str:
+        """Get the latest commit hash (sync for Windows compatibility)."""
         try:
-            process = await asyncio.create_subprocess_exec(
-                "git", "rev-parse", "HEAD",
+            import subprocess as _sp
+            proc = _sp.run(
+                ["git", "rev-parse", "HEAD"],
                 cwd=str(local_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                capture_output=True, text=True, timeout=15,
             )
-            stdout, _ = await process.communicate()
-            return stdout.decode().strip()
+            return proc.stdout.strip() if proc.returncode == 0 else "unknown"
         except Exception:
             return "unknown"
     
@@ -247,7 +246,7 @@ class GitHubService:
         from the base branch, which is more useful for code review.
         """
         host, owner, repo_name = self._parse_repo_url(user.repo_url)
-        token = user.access_token or self.default_token
+        token = user.access_token or user.repo_token or self.default_token
         
         if not token:
             logger.error("No token available for API calls")
@@ -328,6 +327,76 @@ class GitHubService:
             logger.error(f"Error getting PR diff: {e}")
             return None
     
+    async def get_commit_diff(
+        self, owner: str, repo_name: str, commit_sha: str, token: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get diff information for a specific commit from GitHub API."""
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo_name}/commits/{commit_sha}"
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get commit info: {response.status}")
+                        return None
+                    commit_data = await response.json()
+
+                files_data = commit_data.get("files", [])
+                return {
+                    "sha": commit_sha,
+                    "message": commit_data.get("commit", {}).get("message", ""),
+                    "author": commit_data.get("commit", {}).get("author", {}).get("name", ""),
+                    "date": commit_data.get("commit", {}).get("author", {}).get("date", ""),
+                    "files": [
+                        {
+                            "filename": f.get("filename", ""),
+                            "status": f.get("status", ""),
+                            "additions": f.get("additions", 0),
+                            "deletions": f.get("deletions", 0),
+                            "patch": f.get("patch", ""),
+                        }
+                        for f in files_data
+                    ],
+                    "additions": commit_data.get("stats", {}).get("additions", 0),
+                    "deletions": commit_data.get("stats", {}).get("deletions", 0),
+                    "changed_files": len(files_data),
+                }
+        except Exception as e:
+            logger.error(f"Error getting commit diff: {e}")
+            return None
+
+    async def get_latest_commits(
+        self, owner: str, repo_name: str, token: str, count: int = 1
+    ) -> List[Dict[str, Any]]:
+        """Get the latest N commits from a GitHub repo."""
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo_name}/commits?per_page={count}"
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get commits: {response.status}")
+                        return []
+                    commits = await response.json()
+                    return [
+                        {
+                            "sha": c.get("sha", ""),
+                            "message": c.get("commit", {}).get("message", ""),
+                            "author": c.get("commit", {}).get("author", {}).get("name", ""),
+                            "date": c.get("commit", {}).get("author", {}).get("date", ""),
+                        }
+                        for c in commits
+                    ]
+        except Exception as e:
+            logger.error(f"Error getting latest commits: {e}")
+            return []
+
     async def read_file(
         self, user_id: str, file_path: str
     ) -> Optional[str]:
@@ -395,6 +464,7 @@ def get_github_service(repos_base_path: Optional[Path] = None) -> GitHubService:
     global _github_service
     if _github_service is None:
         if repos_base_path is None:
-            repos_base_path = Path("repos")
+            # Use absolute path relative to project root (parent of src/)
+            repos_base_path = Path(__file__).parent.parent.parent / "repos"
         _github_service = GitHubService(repos_base_path)
     return _github_service

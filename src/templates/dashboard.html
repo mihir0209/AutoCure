@@ -1,0 +1,411 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block page_title %}<i class="ph ph-chart-line-up"></i> Dashboard{% endblock %}
+
+{% block content %}
+<!-- Stats -->
+<div class="stats-grid mb-6">
+  <div class="stat-card">
+    <div class="stat-icon blue"><i class="ph ph-plugs-connected"></i></div>
+    <div><div class="stat-value" id="statConnections">--</div><div class="stat-label">Active Connections</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon green"><i class="ph ph-users"></i></div>
+    <div><div class="stat-value" id="statUsers">--</div><div class="stat-label">Registered Users</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon red"><i class="ph ph-warning-circle"></i></div>
+    <div><div class="stat-value" id="statErrors">--</div><div class="stat-label">Total Errors</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon yellow"><i class="ph ph-file-text"></i></div>
+    <div><div class="stat-value" id="statReports">--</div><div class="stat-label">Reports Generated</div></div>
+  </div>
+</div>
+
+<!-- Repository AST Visualization -->
+<div class="card mb-6">
+  <div class="card-header">
+    <h2><i class="ph ph-tree-structure"></i> Repository AST Visualization</h2>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <select id="repoSelect" class="input" style="min-width:200px;" onchange="loadRepoFiles()">
+        <option value="">Select a repository...</option>
+      </select>
+      <a href="/visualizer" class="btn btn-sm btn-primary" target="_blank"><i class="ph ph-arrow-square-out"></i> Full Visualizer</a>
+    </div>
+  </div>
+  <div class="card-body">
+    <div id="repoAstContainer" style="display:none;">
+      <div style="display:flex;gap:16px;height:560px;">
+        <!-- File tree -->
+        <div style="width:240px;border-right:1px solid var(--border);overflow-y:auto;padding-right:12px;flex-shrink:0;">
+          <div style="margin-bottom:8px;">
+            <input type="text" id="fileFilter" class="input" placeholder="Filter files..." onkeyup="filterFiles()" style="width:100%;font-size:12px;padding:4px 8px;">
+          </div>
+          <div id="fileList" style="font-size:13px;"></div>
+        </div>
+        <!-- AST tree view -->
+        <div style="flex:1;display:flex;flex-direction:column;">
+          <div id="astFileInfo" style="padding:6px 0;font-size:13px;color:var(--text-muted);display:none;">
+            <span id="astFileName"></span> &bull; <span id="astLang"></span>
+          </div>
+          <div id="astTreeView" style="flex:1;overflow:auto;background:var(--bg-secondary);border-radius:6px;border:1px solid var(--border);padding:12px;font-family:monospace;font-size:13px;">
+            <div class="empty-state">
+              <i class="ph ph-tree-structure"></i>
+              <p>Select a file to visualize its AST</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="repoAstEmpty">
+      <div class="empty-state">
+        <i class="ph ph-tree-structure"></i>
+        <p>No repositories registered yet. Register a service with a repo_url to see AST visualization.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recent Code Reviews -->
+<div class="card mb-6">
+  <div class="card-header">
+    <h2><i class="ph ph-code"></i> Recent Code Reviews</h2>
+    <a href="/reports" class="btn btn-sm btn-ghost"><i class="ph ph-arrow-square-out"></i> All Reports</a>
+  </div>
+  <div class="card-body" style="padding:0;">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Assessment</th>
+            <th>Commit / PR</th>
+            <th>User</th>
+            <th>Comments</th>
+            <th>Created</th>
+            <th style="text-align:right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="reviewTableBody">
+          <tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet. Push a commit to trigger automatic review.</p></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Server Logs (last entries from app.log) -->
+<div class="card mb-6">
+  <div class="card-header">
+    <h2><i class="ph ph-terminal-window"></i> Server Logs</h2>
+    <div style="display:flex;gap:8px;">
+      <button class="btn btn-sm btn-ghost" onclick="loadServerLogs()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
+      <a href="/logs" class="btn btn-sm btn-ghost"><i class="ph ph-arrow-square-out"></i> Full Logs</a>
+    </div>
+  </div>
+  <div class="card-body" style="padding:0;">
+    <div class="log-stream" id="serverLogStream" style="max-height:300px;overflow-y:auto;">
+      <div class="empty-state" id="serverLogEmpty">
+        <i class="ph ph-terminal-window"></i>
+        <p>Loading server logs...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <!-- Activity Feed -->
+  <div class="card">
+    <div class="card-header">
+      <h2><i class="ph ph-activity"></i> Live Activity</h2>
+      <button class="btn btn-sm btn-ghost" onclick="clearActivity()"><i class="ph ph-trash"></i> Clear</button>
+    </div>
+    <div class="card-body">
+      <div class="activity-feed" id="activityFeed">
+        <div class="empty-state" id="activityEmpty">
+          <i class="ph ph-activity"></i>
+          <p>No activity yet. Events will appear here in real-time once services connect.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Info -->
+  <div class="card">
+    <div class="card-header">
+      <h2><i class="ph ph-gear-six"></i> System Info</h2>
+      <button class="btn btn-sm btn-ghost" onclick="loadDashboard()"><i class="ph ph-arrows-clockwise"></i></button>
+    </div>
+    <div class="card-body">
+      <table>
+        <tbody>
+          <tr><td class="text-muted">AI Provider</td><td id="sysProvider">--</td></tr>
+          <tr><td class="text-muted">Server Version</td><td>v2.0.0</td></tr>
+          <tr><td class="text-muted">Repos Synced</td><td id="sysRepos">--</td></tr>
+          <tr><td class="text-muted">WebSocket URL</td><td class="mono text-sm">ws://{{ request.url.netloc }}/ws/logs/&lt;user_id&gt;</td></tr>
+          <tr><td class="text-muted">API Base</td><td class="mono text-sm">{{ request.url.scheme }}://{{ request.url.netloc }}/api/v1</td></tr>
+          <tr><td class="text-muted">Log Cache</td><td>Auto-flush every 10 min (errors retained)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadDashboard() {
+  try {
+    var data = await api('/api/v1/dashboard/summary');
+    document.getElementById('statConnections').textContent = data.active_connections;
+    document.getElementById('statUsers').textContent = data.registered_users;
+    document.getElementById('statErrors').textContent = data.total_errors;
+    document.getElementById('statReports').textContent = data.total_reports || 0;
+    document.getElementById('sysProvider').textContent = data.ai_provider;
+    document.getElementById('sysRepos').textContent = data.repositories_synced;
+  } catch(e) {
+    showToast('Failed to load dashboard data', 'error');
+  }
+}
+
+var ACTIVITY_ICONS = {
+  error:          { cls: 'error',      icon: 'ph-warning-circle' },
+  analysis:       { cls: 'analysis',   icon: 'ph-magnifying-glass' },
+  fix:            { cls: 'fix',        icon: 'ph-wrench' },
+  connection:     { cls: 'connection', icon: 'ph-plugs-connected' },
+  disconnection:  { cls: 'connection', icon: 'ph-plug' },
+  log:            { cls: 'log',        icon: 'ph-terminal-window' },
+  review_complete:{ cls: 'fix',        icon: 'ph-code' },
+};
+
+function addActivity(data) {
+  var feed = document.getElementById('activityFeed');
+  var empty = document.getElementById('activityEmpty');
+  if (empty) empty.remove();
+  var info = ACTIVITY_ICONS[data.type] || ACTIVITY_ICONS.log;
+  var item = document.createElement('div');
+  item.className = 'activity-item';
+  item.innerHTML =
+    '<div class="activity-icon ' + info.cls + '"><i class="ph ' + info.icon + '"></i></div>' +
+    '<div class="activity-content">' +
+      '<div class="activity-message">' + escapeHtml(data.message || data.type) + '</div>' +
+      '<div class="activity-time">' + (data.user_id ? escapeHtml(data.user_id) + ' &middot; ' : '') + 'just now</div>' +
+    '</div>';
+  feed.prepend(item);
+  while (feed.children.length > 50) feed.lastChild.remove();
+}
+
+function clearActivity() {
+  document.getElementById('activityFeed').innerHTML =
+    '<div class="empty-state" id="activityEmpty"><i class="ph ph-activity"></i><p>Cleared.</p></div>';
+}
+
+dashboardWS.onMessage(function(data) {
+  addActivity(data);
+  if (data.type === 'connection') {
+    var el = document.getElementById('statConnections');
+    el.textContent = parseInt(el.textContent || '0') + 1;
+    showToast('Service connected: ' + (data.user_id || ''), 'success');
+  }
+  if (data.type === 'disconnection') {
+    var el = document.getElementById('statConnections');
+    el.textContent = Math.max(0, parseInt(el.textContent || '1') - 1);
+    showToast('Service disconnected: ' + (data.user_id || ''), 'warning');
+  }
+  if (data.type === 'error') {
+    var el = document.getElementById('statErrors');
+    el.textContent = parseInt(el.textContent || '0') + 1;
+    showToast(data.message || 'Error detected', 'error');
+  }
+});
+
+loadDashboard();
+setInterval(loadDashboard, 30000);
+
+// ── Repository AST Visualization ──────────────────────────────
+var _repoFiles = [];
+var _selectedRepoUser = '';
+
+async function loadRepos() {
+  try {
+    var data = await api('/api/v1/repos/registered');
+    var sel = document.getElementById('repoSelect');
+    sel.innerHTML = '<option value="">Select a repository...</option>';
+    (data.repos || []).forEach(function(r) {
+      if (r.status === 'ready') {
+        var opt = document.createElement('option');
+        opt.value = r.user_id;
+        opt.textContent = r.repo_url.replace('https://github.com/', '') + ' (' + r.user_id + ')';
+        sel.appendChild(opt);
+      }
+    });
+    if (data.repos && data.repos.length > 0) {
+      document.getElementById('repoAstEmpty').style.display = 'none';
+      document.getElementById('repoAstContainer').style.display = 'block';
+    }
+  } catch(e) { console.error('Failed to load repos:', e); }
+}
+
+async function loadRepoFiles() {
+  var userId = document.getElementById('repoSelect').value;
+  if (!userId) return;
+  _selectedRepoUser = userId;
+  try {
+    var data = await api('/api/v1/repo/' + userId + '/files');
+    _repoFiles = data.files || [];
+    renderFileList(_repoFiles);
+  } catch(e) { showToast('Failed to load repo files', 'error'); }
+}
+
+function filterFiles() {
+  var q = document.getElementById('fileFilter').value.toLowerCase();
+  var filtered = _repoFiles.filter(function(f) { return f.path.toLowerCase().includes(q); });
+  renderFileList(filtered);
+}
+
+function renderFileList(files) {
+  var el = document.getElementById('fileList');
+  var langIcons = {
+    python:'ph-file-py', javascript:'ph-file-js', typescript:'ph-file-ts',
+    java:'ph-file-code', go:'ph-file-code', rust:'ph-file-rs',
+    c:'ph-file-c', cpp:'ph-file-cpp', ruby:'ph-file-code', php:'ph-file-code'
+  };
+  el.innerHTML = files.map(function(f) {
+    var iconClass = langIcons[f.language] || 'ph-file';
+    return '<div class="file-item" onclick="loadFileAst(\'' + escapeHtml(f.path) + '\')" ' +
+           'style="padding:4px 6px;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px;" ' +
+           'onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">' +
+           '<i class="ph ' + iconClass + '" style="font-size:14px;color:var(--accent);"></i>' +
+           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(f.path) + '</span>' +
+           '<span style="color:var(--text-muted);font-size:10px;">' + escapeHtml(f.language) + '</span></div>';
+  }).join('');
+}
+
+async function loadFileAst(filePath) {
+  if (!_selectedRepoUser) return;
+  document.getElementById('astTreeView').innerHTML = '<div class="empty-state"><i class="ph ph-spinner"></i><p>Parsing AST...</p></div>';
+  document.getElementById('astFileInfo').style.display = 'block';
+  document.getElementById('astFileName').textContent = filePath;
+  try {
+    var data = await api('/api/v1/repo/' + _selectedRepoUser + '/ast', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({file_path: filePath})
+    });
+    document.getElementById('astLang').textContent = data.language || '';
+    renderAstTree(data.tree || data);
+  } catch(e) {
+    document.getElementById('astTreeView').innerHTML = '<div class="empty-state" style="color:var(--danger);"><i class="ph ph-warning"></i><p>Failed to parse: ' + escapeHtml(e.message || String(e)) + '</p></div>';
+  }
+}
+
+function renderAstTree(tree) {
+  var container = document.getElementById('astTreeView');
+  if (!tree) { container.innerHTML = '<p style="color:var(--text-muted);">No AST data</p>'; return; }
+  var colors = {
+    module:'#9C27B0',program:'#9C27B0',class:'#2196F3',class_definition:'#2196F3',
+    'function':'#4CAF50',function_definition:'#4CAF50',method:'#8BC34A',
+    import:'#FF9800',import_statement:'#FF9800',import_from_statement:'#FF9800',
+    call:'#E91E63',call_expression:'#E91E63','if':'#673AB7',if_statement:'#673AB7',
+    'for':'#3F51B5',for_statement:'#3F51B5','try':'#FFC107',try_statement:'#FFC107',
+    'return':'#CDDC39',return_statement:'#CDDC39'
+  };
+  var defColor = '#9E9E9E';
+  function c(t){return colors[(t||'').toLowerCase()]||defColor;}
+  var nodeId = 0;
+  function renderNode(node, depth) {
+    if (!node || depth > 15) return '';
+    var id = 'dn' + (nodeId++);
+    var hasKids = node.children && node.children.length > 0;
+    var type = node.type || node.node_type || '?';
+    var name = node.name || type;
+    var line = (node.loc ? 'L' + node.loc.start.line : (node.start_line ? 'L' + node.start_line : ''));
+    var col = c(type);
+    var badge = '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;color:#fff;background:' + col + ';">' + escapeHtml(type) + '</span>';
+    var lbl = ' <strong>' + escapeHtml(name) + '</strong> <span style="color:var(--text-muted);font-size:10px;">' + line + '</span>';
+    if (!hasKids) {
+      return '<div style="margin-left:' + (depth*16) + 'px;padding:2px 4px;border-left:2px solid ' + col + '44;">' +
+             '<span style="color:var(--text-muted);font-size:10px;margin-right:4px;">●</span>' + badge + lbl + '</div>';
+    }
+    var kidsHtml = node.children.map(function(ch){return renderNode(ch, depth+1);}).join('');
+    return '<details ' + (depth < 2 ? 'open' : '') + ' style="margin-left:' + (depth*16) + 'px;border-left:2px solid ' + col + '44;padding-left:4px;">' +
+           '<summary style="cursor:pointer;padding:2px 4px;list-style:none;border-radius:3px;" ' +
+           'onmouseover="this.style.background=\'rgba(255,255,255,.05)\'" onmouseout="this.style.background=\'\'">' +
+           '<span style="font-size:10px;margin-right:4px;">▶</span>' + badge + lbl +
+           ' <span style="color:var(--text-muted);font-size:10px;">(' + node.children.length + ')</span></summary>' +
+           kidsHtml + '</details>';
+  }
+  container.innerHTML = renderNode(tree, 0);
+}
+
+// ── Recent Code Reviews ──
+var ASSESS_BADGES = {
+  approve: '<span class="badge badge-success">Approve</span>',
+  request_changes: '<span class="badge badge-danger">Changes Requested</span>',
+  comment: '<span class="badge badge-warning">Comment</span>',
+};
+
+async function loadReviews() {
+  try {
+    var data = await api('/api/v1/reports?report_type=review&limit=8');
+    var reviews = data.reports || [];
+    var tbody = document.getElementById('reviewTableBody');
+    if (reviews.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet. Push a commit to trigger automatic review.</p></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = reviews.map(function(r) {
+      var assessBadge = ASSESS_BADGES[r.severity] || '<span class="badge badge-info">' + escapeHtml(r.severity) + '</span>';
+      return '<tr>' +
+        '<td>' + assessBadge + '</td>' +
+        '<td class="text-sm" style="max-width:250px;"><div class="truncate">' + escapeHtml(r.error_type.replace('Code Review: ', '')) + '</div></td>' +
+        '<td class="text-sm text-muted">' + escapeHtml(r.user_id) + '</td>' +
+        '<td>' + r.proposals_count + '</td>' +
+        '<td class="text-sm text-muted">' + timeAgo(r.created_at) + '</td>' +
+        '<td style="text-align:right"><a href="' + r.view_url + '" target="_blank" class="btn btn-sm btn-primary"><i class="ph ph-eye"></i> View</a></td>' +
+      '</tr>';
+    }).join('');
+  } catch(e) { console.error('Failed to load reviews:', e); }
+}
+
+// ── Server Logs ──
+async function loadServerLogs() {
+  try {
+    var data = await api('/api/v1/logs/server?limit=50');
+    var stream = document.getElementById('serverLogStream');
+    var logs = data.logs || [];
+    if (logs.length === 0) {
+      stream.innerHTML = '<div class="empty-state"><i class="ph ph-terminal-window"></i><p>No server logs.</p></div>';
+      return;
+    }
+    stream.innerHTML = logs.map(function(l) {
+      var level = (l.level || 'INFO').toUpperCase();
+      var levelCls = level.indexOf('ERR') >= 0 || level === 'CRITICAL' ? 'error'
+        : level.indexOf('WARN') >= 0 ? 'warning'
+        : level === 'DEBUG' ? 'debug' : 'info';
+      return '<div class="log-entry ' + levelCls + '" style="padding:4px 12px;font-size:12px;">' +
+        '<span class="log-time">' + escapeHtml(l.timestamp || '') + '</span>' +
+        '<span class="log-level ' + levelCls + '">' + level + '</span>' +
+        '<span class="log-user">[' + escapeHtml(l.logger || 'server') + ']</span>' +
+        '<span class="log-message">' + escapeHtml(l.message || '') + '</span>' +
+      '</div>';
+    }).join('');
+    stream.scrollTop = stream.scrollHeight;
+  } catch(e) { console.error('Failed to load server logs:', e); }
+}
+
+// Also refresh reviews on WebSocket review_complete event
+dashboardWS.onMessage(function(data) {
+  if (data.type === 'review_complete') {
+    loadReviews();
+  }
+});
+
+loadRepos();
+loadReviews();
+loadServerLogs();
+// Auto-refresh server logs every 15 seconds
+setInterval(loadServerLogs, 15000);
+</script>
+{% endblock %}

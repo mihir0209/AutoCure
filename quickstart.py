@@ -66,7 +66,7 @@ async def check_prerequisites():
     print()
     
     if issues:
-        print("⚠️  Issues found:")
+        print("[!] Issues found:")
         for issue in issues:
             print(f"   • {issue}")
         print()

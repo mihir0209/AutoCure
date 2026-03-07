@@ -4,6 +4,10 @@
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 
+# Template engine & form parsing (for HTML dashboard)
+jinja2>=3.1.0
+python-multipart>=0.0.6
+
 # WebSocket support
 websockets>=12.0
 
@@ -34,8 +38,12 @@ rich>=13.7.0
 # Type hints support
 typing-extensions>=4.9.0
 
-# AST parsing (optional - install language-specific grammars separately)
-# tree-sitter>=0.20.0
+# AST parsing - tree-sitter with language grammars
+tree-sitter>=0.21.0
+tree-sitter-languages>=1.10.0  # Pre-built grammars for 30+ languages
+# Individual language packages (optional, tree-sitter-languages covers most)
+tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0
 
 # JSON schema validation
 jsonschema>=4.21.0
@@ -51,10 +59,9 @@ pytest-asyncio>=0.23.0
 black>=24.1.0
 isort>=5.13.0
 
+# Microsoft AutoGen multi-agent AI framework
+autogen-agentchat>=0.7.0
+autogen-ext[openai]>=0.7.0
+
 # Static type checking (development)
 mypy>=1.8.0
-
-# === AST TREE-SITTER ===
-tree-sitter>=0.21.0
-tree-sitter-python>=0.21.0
-tree-sitter-javascript>=0.21.0

@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Connections{% endblock %}
+{% block page_title %}<i class="ph ph-plugs-connected"></i> Connections{% endblock %}
+
+{% block content %}
+<div class="mb-6" style="display:flex;gap:16px;align-items:center;">
+  <div class="stat-card" style="flex:1;">
+    <div class="stat-icon green"><i class="ph ph-plugs-connected"></i></div>
+    <div><div class="stat-value" id="connCount">--</div><div class="stat-label">Active Connections</div></div>
+  </div>
+  <div class="stat-card" style="flex:1;">
+    <div class="stat-icon blue"><i class="ph ph-users"></i></div>
+    <div><div class="stat-value" id="regCount">--</div><div class="stat-label">Registered Users</div></div>
+  </div>
+  <button class="btn" onclick="loadConnections()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
+</div>
+
+<div class="card">
+  <div class="card-header"><h2><i class="ph ph-list"></i> Connected Services</h2></div>
+  <div class="card-body" style="padding:0;">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>User ID</th>
+            <th>Connected At</th>
+            <th>Last Heartbeat</th>
+            <th>Logs Received</th>
+            <th>Errors Detected</th>
+          </tr>
+        </thead>
+        <tbody id="connTableBody">
+          <tr><td colspan="6"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No active connections. Services will appear here when they connect via WebSocket.</p></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadConnections() {
+  try {
+    var data = await api('/api/v1/connections');
+    var conns = data.connections || [];
+    document.getElementById('connCount').textContent = conns.length;
+
+    var summary = await api('/api/v1/dashboard/summary');
+    document.getElementById('regCount').textContent = summary.registered_users || 0;
+
+    var tbody = document.getElementById('connTableBody');
+    if (conns.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No active connections.</p></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = conns.map(function(c) {
+      return '<tr>' +
+        '<td><span class="status-dot online"></span></td>' +
+        '<td class="mono">' + escapeHtml(c.user_id) + '</td>' +
+        '<td class="text-sm text-muted">' + formatDate(c.connected_at) + '</td>' +
+        '<td class="text-sm text-muted">' + timeAgo(c.last_heartbeat) + '</td>' +
+        '<td>' + c.logs_received + '</td>' +
+        '<td>' + c.errors_detected + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch(e) {
+    showToast('Failed to load connections', 'error');
+  }
+}
+
+dashboardWS.onMessage(function(data) {
+  if (data.type === 'connection' || data.type === 'disconnection') {
+    loadConnections();
+    showToast(data.message || data.type, data.type === 'connection' ? 'success' : 'warning');
+  }
+});
+
+loadConnections();
+setInterval(loadConnections, 10000);
+</script>
+{% endblock %}

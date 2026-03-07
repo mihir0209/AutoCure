@@ -8,6 +8,7 @@ Contains:
 - error_replicator: Replicate errors with payload variations
 - ai_analyzer: AI-powered root cause analysis and code review
 - email_service: Rich HTML email notifications
+- report_store (via database.report_store): SQLite-backed HTML report index
 """
 
 from .log_analyzer import LogAnalyzer
@@ -15,6 +16,11 @@ from .ast_service import ASTService
 from .github_service import GitHubService
 from .error_replicator import ErrorReplicator
 from .ai_analyzer import AIAnalyzer
+try:
+    from .autogen_analyzer import AutoGenAnalyzer, get_autogen_analyzer
+except ImportError:
+    AutoGenAnalyzer = None  # type: ignore
+    get_autogen_analyzer = None  # type: ignore
 from .email_service import EmailService
 from .ast_trace_service import ASTTraceService, get_ast_trace_service
 from .confidence_validator import ConfidenceValidator, get_confidence_validator
@@ -63,6 +69,7 @@ def get_error_replicator() -> ErrorReplicator:
 
 
 def get_ai_analyzer() -> AIAnalyzer:
+    """Returns the AI analyzer (uses Azure OpenAI / Groq / Cerebras based on config)."""
     global _ai_analyzer
     if _ai_analyzer is None:
         _ai_analyzer = AIAnalyzer()
@@ -82,6 +89,7 @@ __all__ = [
     "GitHubService",
     "ErrorReplicator",
     "AIAnalyzer",
+    "AutoGenAnalyzer",
     "EmailService",
     "ASTTraceService",
     "ConfidenceValidator",

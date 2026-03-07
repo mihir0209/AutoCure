@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block page_title %}<i class="ph ph-terminal-window"></i> Logs{% endblock %}
+
+{% block content %}
+<div class="filter-bar mb-4">
+  <select class="form-select" id="logUserFilter" onchange="loadLogs()">
+    <option value="">All Users</option>
+    <option value="__server__">Server (app.log)</option>
+  </select>
+  <select class="form-select" id="logLevelFilter" onchange="filterLogs()">
+    <option value="">All Levels</option>
+    <option value="CRITICAL">CRITICAL</option>
+    <option value="ERROR">ERROR</option>
+    <option value="WARNING">WARNING</option>
+    <option value="INFO">INFO</option>
+    <option value="DEBUG">DEBUG</option>
+  </select>
+  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);margin-left:auto;">
+    <input type="checkbox" id="autoScroll" checked> Auto-scroll
+  </label>
+  <button class="btn btn-sm" id="btnClear" onclick="clearLogsServer()"><i class="ph ph-trash"></i> Clear Logs</button>
+  <button class="btn btn-sm btn-ghost" onclick="loadLogs()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
+</div>
+
+<!-- Error-retention banner (shown when buffer has errors) -->
+<div class="alert" id="errorRetainBanner" style="display:none;margin-bottom:12px;background:var(--bg-danger);border:1px solid #da363040;border-radius:8px;padding:10px 16px;font-size:13px;color:var(--text-secondary);display:none;align-items:center;gap:8px;">
+  <i class="ph ph-warning-circle" style="color:var(--danger);font-size:18px;"></i>
+  <span>Error logs detected &mdash; auto-flush is paused for this user. Use <strong>Clear Logs</strong> to remove them manually.</span>
+</div>
+
+<div class="card">
+  <div class="card-body" style="padding:0;">
+    <div class="log-stream" id="logStream">
+      <div class="empty-state" id="logEmpty">
+        <i class="ph ph-terminal-window"></i>
+        <p>No logs yet. Connect a service to start streaming.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+var logStream = document.getElementById('logStream');
+
+function appendLog(log) {
+  var empty = document.getElementById('logEmpty');
+  if (empty) empty.remove();
+
+  var level = (log.level || 'INFO').toUpperCase();
+  if (level === 'WARN') level = 'WARNING';
+  var levelCls = level.indexOf('ERR') >= 0 || level === 'FATAL' || level === 'CRITICAL' ? 'error'
+    : level.indexOf('WARN') >= 0 ? 'warning'
+    : level === 'DEBUG' ? 'debug' : 'info';
+
+  // Apply level filter
+  var filter = document.getElementById('logLevelFilter').value;
+  if (filter && level !== filter) return;
+
+  var el = document.createElement('div');
+  el.className = 'log-entry ' + levelCls;
+  el.dataset.level = level;
+  el.innerHTML =
+    '<span class="log-time">' + (log.timestamp && log.timestamp.indexOf('T') >= 0 ? formatTime(log.timestamp) : escapeHtml(log.timestamp || '')) + '</span>' +
+    '<span class="log-level ' + levelCls + '">' + level + '</span>' +
+    '<span class="log-user">[' + escapeHtml(log.user_id || log.logger || '') + ']</span>' +
+    '<span class="log-message">' + escapeHtml(log.message || '') + '</span>';
+  logStream.appendChild(el);
+
+  if (logStream.children.length > 500) logStream.firstChild.remove();
+  if (document.getElementById('autoScroll').checked) {
+    logStream.scrollTop = logStream.scrollHeight;
+  }
+}
+
+async function loadLogs() {
+  var userId = document.getElementById('logUserFilter').value;
+  try {
+    var data;
+    if (userId === '__server__') {
+      // Load server-side logs from app.log
+      var levelFilter = document.getElementById('logLevelFilter').value;
+      var url = '/api/v1/logs/server?limit=300';
+      if (levelFilter) url += '&level=' + encodeURIComponent(levelFilter);
+      data = await api(url);
+    } else if (userId) {
+      data = await api('/api/v1/logs/' + encodeURIComponent(userId) + '?limit=200');
+    } else {
+      data = await api('/api/v1/logs?limit=200');
+    }
+    logStream.innerHTML = '';
+    var logs = data.logs || [];
+    if (logs.length === 0) {
+      logStream.innerHTML = '<div class="empty-state" id="logEmpty"><i class="ph ph-terminal-window"></i><p>No logs available.</p></div>';
+    } else {
+      logs.forEach(function(l){ appendLog(l); });
+    }
+    // Show / hide the error-retention banner
+    var banner = document.getElementById('errorRetainBanner');
+    if (userId && data.has_errors) {
+      banner.style.display = 'flex';
+    } else {
+      banner.style.display = 'none';
+    }
+  } catch(e) {
+    showToast('Failed to load logs', 'error');
+  }
+}
+
+async function loadUserOptions() {
+  try {
+    // Load from auth users list (all service accounts)
+    var data = await api('/api/v1/users');
+    var select = document.getElementById('logUserFilter');
+    var cur = select.value;
+    select.innerHTML = '<option value="">All Users</option><option value="__server__">Server (app.log)</option>';
+    (data.users || []).forEach(function(u) {
+      if (u.username === 'admin') return; // skip admin in user filter
+      var o = document.createElement('option');
+      o.value = u.username; o.textContent = u.username;
+      select.appendChild(o);
+    });
+    // Also add any connected users not in auth DB
+    var connData = await api('/api/v1/connections');
+    var existing = new Set(Array.from(select.options).map(function(o){ return o.value; }));
+    (connData.connections || []).forEach(function(c) {
+      if (!existing.has(c.user_id)) {
+        var o = document.createElement('option');
+        o.value = c.user_id; o.textContent = c.user_id;
+        select.appendChild(o);
+      }
+    });
+    select.value = cur;
+  } catch(e) { /* ignore */ }
+}
+
+function filterLogs() {
+  var filter = document.getElementById('logLevelFilter').value;
+  document.querySelectorAll('.log-entry').forEach(function(el) {
+    el.style.display = (!filter || el.dataset.level === filter) ? '' : 'none';
+  });
+}
+
+async function clearLogsServer() {
+  var userId = document.getElementById('logUserFilter').value;
+  if (!userId) {
+    showToast('Select a specific user to clear logs', 'warning');
+    return;
+  }
+  try {
+    await api('/api/v1/logs/' + encodeURIComponent(userId), { method: 'DELETE' });
+    showToast('Logs cleared for ' + userId, 'success');
+    loadLogs();
+  } catch(e) {
+    showToast('Failed to clear logs', 'error');
+  }
+}
+
+// Real-time logs from dashboard WebSocket
+dashboardWS.onMessage(function(data) {
+  if (data.type === 'log' || data.type === 'error') {
+    var selectedUser = document.getElementById('logUserFilter').value;
+    if (selectedUser && data.user_id !== selectedUser) return;
+    appendLog({
+      level: data.level || (data.type === 'error' ? 'ERROR' : 'INFO'),
+      message: data.message || '',
+      user_id: data.user_id || '',
+      timestamp: data.timestamp || new Date().toISOString(),
+    });
+  }
+});
+
+loadUserOptions();
+loadLogs();
+</script>
+{% endblock %}

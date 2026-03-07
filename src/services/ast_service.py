@@ -1,458 +1,562 @@
 """
 AST Service for the Self-Healing Software System v2.0
 
-Provides AST (Abstract Syntax Tree) building and analysis using tree-sitter.
+Provides AST (Abstract Syntax Tree) building and analysis using tree-sitter
+with compiled language grammars for multi-language support.
+
 Used for:
-- Building AST from source code files
+- Building AST from source code files (30+ languages via tree-sitter)
 - Tracing error locations to specific AST nodes
 - Extracting context around error nodes (parent functions, classes, etc.)
-- Generating interactive AST visualizations for emails
+- Cross-file import/export reference resolution
+- Symbol table extraction for codebase understanding
+- Generating interactive AST visualizations for emails and dashboard
 """
 
 import os
+import re
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 
 from utils.models import ASTNode, ASTContext, ASTVisualization
 from utils.logger import setup_colored_logger
 
-
 logger = setup_colored_logger("ast_service")
 
+# ---------------------------------------------------------------------------
+# Try to import tree-sitter  (Python bindings >= 0.21)
+# ---------------------------------------------------------------------------
+TREE_SITTER_AVAILABLE = False
+TS_LANGUAGES_AVAILABLE = False
+_ts_parsers: Dict[str, Any] = {}   # lang -> parser
+_ts_languages: Dict[str, Any] = {} # lang -> Language object
 
-# Try to import tree-sitter
 try:
-    import tree_sitter
-    from tree_sitter import Language, Parser
+    from tree_sitter import Language, Parser as TSParser
     TREE_SITTER_AVAILABLE = True
 except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    logger.warning("tree-sitter not installed. AST features will be limited.")
+    logger.warning("tree-sitter not installed. pip install tree-sitter tree-sitter-languages")
 
+# Try the pre-built multi-language pack
+try:
+    import tree_sitter_languages
+    TS_LANGUAGES_AVAILABLE = True
+except ImportError:
+    pass
+
+# ---------------------------------------------------------------------------
+# File extension -> language name mapping
+# ---------------------------------------------------------------------------
+EXTENSION_TO_LANGUAGE: Dict[str, str] = {
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".py": "python", ".pyw": "python",
+    ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".scala": "scala",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    ".cs": "c_sharp",
+    ".go": "go",
+    ".rs": "rust",
+    ".html": "html", ".htm": "html",
+    ".css": "css",
+    ".json": "json",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml",
+    ".rb": "ruby",
+    ".php": "php",
+    ".lua": "lua",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".swift": "swift",
+    ".ex": "elixir", ".exs": "elixir",
+    ".elm": "elm",
+    ".ml": "ocaml", ".mli": "ocaml",
+    ".sol": "solidity",
+    ".zig": "zig",
+    ".dart": "dart",
+    ".r": "r", ".R": "r",
+    ".sql": "sql",
+}
+
+LANGUAGE_DISPLAY: Dict[str, str] = {
+    "javascript": "JavaScript", "typescript": "TypeScript", "tsx": "TypeScript (TSX)",
+    "python": "Python", "java": "Java", "kotlin": "Kotlin", "scala": "Scala",
+    "c": "C", "cpp": "C++", "c_sharp": "C#", "go": "Go", "rust": "Rust",
+    "html": "HTML", "css": "CSS", "json": "JSON", "yaml": "YAML", "toml": "TOML",
+    "ruby": "Ruby", "php": "PHP", "lua": "Lua", "bash": "Bash", "swift": "Swift",
+    "elixir": "Elixir", "elm": "Elm", "ocaml": "OCaml", "solidity": "Solidity",
+    "zig": "Zig", "dart": "Dart", "r": "R", "sql": "SQL",
+}
+
+
+# ============================================================================
+# AST Service
+# ============================================================================
 
 class ASTService:
     """
-    Service for building and analyzing ASTs using tree-sitter.
-    
-    Supports multiple languages:
-    - JavaScript/TypeScript
-    - Python
-    - Java
-    - More can be added by installing tree-sitter language grammars
+    Service for building and analysing ASTs using tree-sitter.
+
+    Supports 30+ languages via pre-compiled tree-sitter-languages package
+    or individually installed tree-sitter-<lang> packages.
+    Falls back to regex-based extraction when tree-sitter is unavailable.
     """
-    
-    # Language to file extension mapping
-    LANGUAGE_EXTENSIONS = {
-        "javascript": [".js", ".jsx", ".mjs", ".cjs"],
-        "typescript": [".ts", ".tsx"],
-        "python": [".py", ".pyw"],
-        "java": [".java"],
-        "go": [".go"],
-        "rust": [".rs"],
-        "c": [".c", ".h"],
-        "cpp": [".cpp", ".cc", ".cxx", ".hpp", ".hh"],
-    }
-    
+
     def __init__(self, languages_path: Optional[Path] = None):
-        """
-        Initialize the AST service.
-        
-        Args:
-            languages_path: Path to compiled language libraries for tree-sitter
-        """
-        self.parsers: Dict[str, Any] = {}
+        self._parsers: Dict[str, Any] = {}
+        self._languages: Dict[str, Any] = {}
         self.languages_path = languages_path
-        
+
         if TREE_SITTER_AVAILABLE:
             self._initialize_parsers()
         else:
-            logger.warning("AST parsing disabled - install tree-sitter for full functionality")
-    
+            logger.warning("AST parsing limited – install tree-sitter for full functionality")
+
+    # ------------------------------------------------------------------
+    # Initialisation – load tree-sitter language grammars
+    # ------------------------------------------------------------------
+
     def _initialize_parsers(self):
         """Initialize tree-sitter parsers for supported languages."""
-        # Note: In a real implementation, you would compile and load language grammars
-        # For now, we'll use a fallback approach
-        pass
-    
+        if TS_LANGUAGES_AVAILABLE:
+            # tree-sitter-languages bundles grammars for many languages
+            for lang_name in LANGUAGE_DISPLAY:
+                try:
+                    language = tree_sitter_languages.get_language(lang_name)
+                    parser = tree_sitter_languages.get_parser(lang_name)
+                    self._languages[lang_name] = language
+                    self._parsers[lang_name] = parser
+                except Exception:
+                    pass  # grammar not in bundle
+            loaded = list(self._parsers.keys())
+            logger.info(f"tree-sitter ready with {len(loaded)} languages via tree-sitter-languages")
+        else:
+            # Try individual tree-sitter-<lang> packages (pip install tree-sitter-python etc.)
+            for lang_name in ("python", "javascript", "typescript", "java", "go", "rust", "c", "cpp"):
+                try:
+                    mod = __import__(f"tree_sitter_{lang_name}")
+                    language = Language(mod.language())
+                    parser = TSParser(language)
+                    self._languages[lang_name] = language
+                    self._parsers[lang_name] = parser
+                except Exception:
+                    pass
+            if self._parsers:
+                logger.info(f"tree-sitter ready with individual packages: {list(self._parsers.keys())}")
+            else:
+                logger.warning("No tree-sitter language grammars found – using regex fallback")
+
+    def _get_parser(self, language: str):
+        """Return (parser, language_obj) for a given language name."""
+        if language in self._parsers:
+            return self._parsers[language], self._languages.get(language)
+        # Lazy-load if tree-sitter-languages available
+        if TS_LANGUAGES_AVAILABLE:
+            try:
+                lang_obj = tree_sitter_languages.get_language(language)
+                parser = tree_sitter_languages.get_parser(language)
+                self._languages[language] = lang_obj
+                self._parsers[language] = parser
+                return parser, lang_obj
+            except Exception:
+                pass
+        return None, None
+
+    # ------------------------------------------------------------------
+    # Language detection
+    # ------------------------------------------------------------------
+
     def detect_language(self, file_path: str) -> Optional[str]:
-        """Detect the programming language from file extension."""
+        """Detect language from file extension."""
         ext = Path(file_path).suffix.lower()
-        
-        for language, extensions in self.LANGUAGE_EXTENSIONS.items():
-            if ext in extensions:
-                return language
-        
-        return None
-    
+        return EXTENSION_TO_LANGUAGE.get(ext)
+
+    def get_language_name(self, lang_key: str) -> str:
+        return LANGUAGE_DISPLAY.get(lang_key, lang_key)
+
+    def get_supported_extensions(self) -> List[str]:
+        return list(EXTENSION_TO_LANGUAGE.keys())
+
+    def is_supported(self, file_path: str) -> bool:
+        return self.detect_language(file_path) is not None
+
+    # ------------------------------------------------------------------
+    # Parsing (public API)
+    # ------------------------------------------------------------------
+
     def parse_file(self, file_path: str) -> Optional[ASTNode]:
-        """
-        Parse a file and return its AST root node.
-        
-        Args:
-            file_path: Path to the source file
-            
-        Returns:
-            Root ASTNode or None if parsing fails
-        """
+        """Parse a source file and return its AST root node."""
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
             return None
-        
         language = self.detect_language(file_path)
         if not language:
-            logger.warning(f"Unknown language for file: {file_path}")
+            logger.warning(f"Unsupported language for: {file_path}")
             return None
-        
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 source_code = f.read()
-            
             return self.parse_code(source_code, language, file_path)
-            
         except Exception as e:
-            logger.error(f"Error parsing file {file_path}: {e}")
+            logger.error(f"Error parsing {file_path}: {e}")
             return None
-    
+
     def parse_code(
         self, source_code: str, language: str, file_path: Optional[str] = None
     ) -> Optional[ASTNode]:
-        """
-        Parse source code and return its AST root node.
-        
-        This is a fallback implementation using regex-based parsing
-        when tree-sitter is not available.
-        """
-        if TREE_SITTER_AVAILABLE and language in self.parsers:
-            return self._parse_with_tree_sitter(source_code, language, file_path)
-        else:
-            return self._parse_fallback(source_code, language, file_path)
-    
-    def _parse_with_tree_sitter(
-        self, source_code: str, language: str, file_path: Optional[str]
-    ) -> Optional[ASTNode]:
-        """Parse using tree-sitter (when available)."""
-        # This would be the tree-sitter implementation
-        # For now, fall back to regex-based parsing
+        """Parse source code and return its AST root node."""
+        parser, _ = self._get_parser(language)
+        if parser is not None:
+            return self._parse_tree_sitter(parser, source_code, language, file_path)
         return self._parse_fallback(source_code, language, file_path)
-    
+
+    # ------------------------------------------------------------------
+    # tree-sitter parsing
+    # ------------------------------------------------------------------
+
+    def _parse_tree_sitter(
+        self, parser, source_code: str, language: str, file_path: Optional[str]
+    ) -> Optional[ASTNode]:
+        """Build ASTNode tree from tree-sitter parse tree."""
+        try:
+            tree = parser.parse(source_code.encode("utf-8"))
+            root = tree.root_node
+            return self._ts_node_to_ast(root, source_code, file_path or "unknown", depth=0)
+        except Exception as e:
+            logger.error(f"tree-sitter parse error: {e}")
+            return self._parse_fallback(source_code, language, file_path)
+
+    def _ts_node_to_ast(
+        self, node, source_code: str, file_path: str,
+        depth: int = 0, max_depth: int = 20
+    ) -> ASTNode:
+        """Recursively convert a tree-sitter node to our ASTNode model."""
+        if depth > max_depth:
+            return ASTNode(
+                node_id=f"{node.type}_{node.start_point[0]}_{node.start_point[1]}",
+                node_type=node.type,
+                name="...",
+                file_path=file_path,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                start_col=node.start_point[1],
+                end_col=node.end_point[1],
+            )
+
+        name = self._extract_node_name(node, source_code)
+
+        # Collect named children (skip anonymous punctuation)
+        children: List[ASTNode] = []
+        for child in (node.named_children if hasattr(node, "named_children") else node.children):
+            if child and getattr(child, "is_named", True):
+                children.append(
+                    self._ts_node_to_ast(child, source_code, file_path, depth + 1, max_depth)
+                )
+
+        # Short snippet for leaf nodes
+        snippet = ""
+        if node.child_count == 0 and node.end_byte - node.start_byte < 120:
+            snippet = source_code[node.start_byte:node.end_byte]
+
+        return ASTNode(
+            node_id=f"{node.type}_{node.start_point[0]}_{node.start_point[1]}_{id(node) % 10000}",
+            node_type=node.type,
+            name=name or "",
+            file_path=file_path,
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            start_col=node.start_point[1],
+            end_col=node.end_point[1],
+            code_snippet=snippet,
+            children=children,
+        )
+
+    @staticmethod
+    def _extract_node_name(node, source_code: str) -> Optional[str]:
+        """Extract a meaningful name from a tree-sitter node."""
+        if node.type in (
+            "identifier", "property_identifier", "type_identifier",
+            "field_identifier", "shorthand_property_identifier",
+        ):
+            return node.text.decode("utf-8") if isinstance(node.text, bytes) else str(node.text)
+
+        name_child = node.child_by_field_name("name") if hasattr(node, "child_by_field_name") else None
+        if name_child:
+            text = name_child.text
+            return text.decode("utf-8") if isinstance(text, bytes) else str(text)
+
+        if "literal" in node.type or node.type in ("string", "number", "true", "false", "null", "none"):
+            text = node.text.decode("utf-8") if isinstance(node.text, bytes) else str(node.text)
+            return text[:40] + ("..." if len(text) > 40 else "") if text else None
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Regex fallback parsing (when tree-sitter is unavailable)
+    # ------------------------------------------------------------------
+
     def _parse_fallback(
         self, source_code: str, language: str, file_path: Optional[str]
     ) -> Optional[ASTNode]:
-        """
-        Fallback AST parsing using regex for basic structure extraction.
-        
-        This extracts functions, classes, and methods - enough for context building.
-        """
+        """Regex-based parsing for basic structure extraction."""
         lines = source_code.split("\n")
-        
-        if language in ["javascript", "typescript"]:
-            return self._parse_javascript_fallback(lines, file_path)
+        fp = file_path or "unknown"
+
+        if language in ("javascript", "typescript", "tsx"):
+            children = self._fb_js(lines, fp)
         elif language == "python":
-            return self._parse_python_fallback(lines, file_path)
+            children = self._fb_python(lines, fp)
         elif language == "java":
-            return self._parse_java_fallback(lines, file_path)
+            children = self._fb_java(lines, fp)
+        elif language in ("go",):
+            children = self._fb_go(lines, fp)
+        elif language in ("c", "cpp"):
+            children = self._fb_c(lines, fp)
         else:
-            # Generic fallback - just create a root node
-            return ASTNode(
-                node_type="source_file",
-                name=file_path or "unknown",
-                start_line=1,
-                end_line=len(lines),
-                children=[],
-                source_text=source_code[:1000],  # First 1000 chars
-            )
-    
-    def _parse_javascript_fallback(
-        self, lines: List[str], file_path: Optional[str]
-    ) -> ASTNode:
-        """Parse JavaScript/TypeScript using regex."""
-        import re
-        
-        children = []
-        
-        # Pattern for functions
-        func_patterns = [
-            r"^\s*(?:async\s+)?function\s+(\w+)\s*\(",  # function name()
-            r"^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(",  # const name = (
-            r"^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function",  # const name = function
-            r"^\s*(\w+)\s*:\s*(?:async\s+)?function",  # name: function (in object)
-            r"^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*{",  # method name() { in class
-        ]
-        
-        # Pattern for classes
-        class_pattern = r"^\s*class\s+(\w+)"
-        
-        # Pattern for exports
-        export_pattern = r"^\s*(?:module\.)?exports\s*[.=]"
-        
-        for i, line in enumerate(lines, 1):
-            # Check for class
-            class_match = re.match(class_pattern, line)
-            if class_match:
-                children.append(ASTNode(
-                    node_type="class_declaration",
-                    name=class_match.group(1),
-                    start_line=i,
-                    end_line=i,  # Will be updated
-                    children=[],
-                ))
-                continue
-            
-            # Check for functions
-            for pattern in func_patterns:
-                func_match = re.match(pattern, line)
-                if func_match:
-                    children.append(ASTNode(
-                        node_type="function_declaration",
-                        name=func_match.group(1),
-                        start_line=i,
-                        end_line=i,
-                        children=[],
-                    ))
-                    break
-        
+            children = []
+
         return ASTNode(
+            node_id="root",
             node_type="source_file",
-            name=file_path or "unknown.js",
+            name=fp,
+            file_path=fp,
             start_line=1,
             end_line=len(lines),
             children=children,
+            code_snippet=source_code[:500],
         )
-    
-    def _parse_python_fallback(
-        self, lines: List[str], file_path: Optional[str]
-    ) -> ASTNode:
-        """Parse Python using regex."""
-        import re
-        
+
+    # --- JS fallback ---
+    def _fb_js(self, lines, fp):
         children = []
-        
-        func_pattern = r"^\s*(?:async\s+)?def\s+(\w+)\s*\("
-        class_pattern = r"^\s*class\s+(\w+)"
-        
+        func_pats = [
+            r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(",
+            r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(",
+            r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function",
+            r"^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{",
+        ]
+        class_pat = r"^\s*(?:export\s+)?class\s+(\w+)"
         for i, line in enumerate(lines, 1):
-            # Check for class
-            class_match = re.match(class_pattern, line)
-            if class_match:
-                children.append(ASTNode(
-                    node_type="class_definition",
-                    name=class_match.group(1),
-                    start_line=i,
-                    end_line=i,
-                    children=[],
-                ))
+            m = re.match(class_pat, line)
+            if m:
+                children.append(ASTNode(node_id=f"class_{i}", node_type="class_declaration",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
                 continue
-            
-            # Check for function
-            func_match = re.match(func_pattern, line)
-            if func_match:
-                children.append(ASTNode(
-                    node_type="function_definition",
-                    name=func_match.group(1),
-                    start_line=i,
-                    end_line=i,
-                    children=[],
-                ))
-        
-        return ASTNode(
-            node_type="module",
-            name=file_path or "unknown.py",
-            start_line=1,
-            end_line=len(lines),
-            children=children,
-        )
-    
-    def _parse_java_fallback(
-        self, lines: List[str], file_path: Optional[str]
-    ) -> ASTNode:
-        """Parse Java using regex."""
-        import re
-        
+            for p in func_pats:
+                m = re.match(p, line)
+                if m:
+                    children.append(ASTNode(node_id=f"func_{i}", node_type="function_declaration",
+                                            name=m.group(1), file_path=fp, start_line=i, end_line=i))
+                    break
+        return children
+
+    # --- Python fallback ---
+    def _fb_python(self, lines, fp):
         children = []
-        
-        class_pattern = r"^\s*(?:public|private|protected)?\s*(?:abstract|final)?\s*class\s+(\w+)"
-        method_pattern = r"^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:\w+)\s+(\w+)\s*\("
-        
         for i, line in enumerate(lines, 1):
-            class_match = re.match(class_pattern, line)
-            if class_match:
-                children.append(ASTNode(
-                    node_type="class_declaration",
-                    name=class_match.group(1),
-                    start_line=i,
-                    end_line=i,
-                    children=[],
-                ))
+            m = re.match(r"^\s*class\s+(\w+)", line)
+            if m:
+                children.append(ASTNode(node_id=f"class_{i}", node_type="class_definition",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
                 continue
-            
-            method_match = re.match(method_pattern, line)
-            if method_match:
-                children.append(ASTNode(
-                    node_type="method_declaration",
-                    name=method_match.group(1),
-                    start_line=i,
-                    end_line=i,
-                    children=[],
-                ))
-        
-        return ASTNode(
-            node_type="compilation_unit",
-            name=file_path or "Unknown.java",
-            start_line=1,
-            end_line=len(lines),
-            children=children,
-        )
-    
-    def find_node_at_line(
-        self, root: ASTNode, line_number: int
-    ) -> Optional[ASTNode]:
+            m = re.match(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", line)
+            if m:
+                children.append(ASTNode(node_id=f"func_{i}", node_type="function_definition",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+        return children
+
+    # --- Java fallback ---
+    def _fb_java(self, lines, fp):
+        children = []
+        for i, line in enumerate(lines, 1):
+            m = re.match(r"^\s*(?:public|private|protected)?\s*(?:abstract|final)?\s*class\s+(\w+)", line)
+            if m:
+                children.append(ASTNode(node_id=f"class_{i}", node_type="class_declaration",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+                continue
+            m = re.match(r"^\s*(?:public|private|protected)?\s*(?:static)?\s*\w+\s+(\w+)\s*\(", line)
+            if m:
+                children.append(ASTNode(node_id=f"method_{i}", node_type="method_declaration",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+        return children
+
+    # --- Go fallback ---
+    def _fb_go(self, lines, fp):
+        children = []
+        for i, line in enumerate(lines, 1):
+            m = re.match(r"^\s*func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)\s*\(", line)
+            if m:
+                children.append(ASTNode(node_id=f"func_{i}", node_type="function_declaration",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+            m2 = re.match(r"^\s*type\s+(\w+)\s+struct", line)
+            if m2:
+                children.append(ASTNode(node_id=f"struct_{i}", node_type="type_declaration",
+                                        name=m2.group(1), file_path=fp, start_line=i, end_line=i))
+        return children
+
+    # --- C/C++ fallback ---
+    def _fb_c(self, lines, fp):
+        children = []
+        for i, line in enumerate(lines, 1):
+            m = re.match(r"^\s*(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{", line)
+            if m:
+                children.append(ASTNode(node_id=f"func_{i}", node_type="function_definition",
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+        return children
+
+    # ------------------------------------------------------------------
+    # AST querying helpers
+    # ------------------------------------------------------------------
+
+    def find_node_at_line(self, root: ASTNode, line_number: int) -> Optional[ASTNode]:
         """Find the most specific AST node containing the given line."""
-        
         if not (root.start_line <= line_number <= root.end_line):
             return None
-        
-        # Check children first for more specific match
+        best = root
         for child in root.children:
             result = self.find_node_at_line(child, line_number)
             if result:
-                return result
-        
-        # Return this node if it contains the line
-        return root
-    
+                best = result
+        return best
+
+    def find_path_to_line(self, root: ASTNode, line_number: int) -> List[ASTNode]:
+        """Return the path from root to the node at the given line."""
+        path: List[ASTNode] = []
+
+        def walk(n: ASTNode) -> bool:
+            if n.start_line <= line_number <= n.end_line:
+                path.append(n)
+                for child in n.children:
+                    if walk(child):
+                        return True
+                return True
+            return False
+
+        walk(root)
+        return path
+
     def get_context(
         self, root: ASTNode, line_number: int, context_lines: int = 10
     ) -> ASTContext:
         """
         Get context information for a specific line in the AST.
-        
-        Returns information about:
-        - The containing function/method
-        - The containing class
-        - Surrounding code
+
+        Returns an ASTContext matching the model schema with:
+        - error_node, parent_nodes, child_nodes, sibling_nodes
         """
         node = self.find_node_at_line(root, line_number)
-        
-        # Find parent function
+        path = self.find_path_to_line(root, line_number)
+
         parent_function = None
         parent_class = None
-        
-        def find_parents(n: ASTNode, path: List[ASTNode] = None):
-            nonlocal parent_function, parent_class
-            path = path or []
-            
-            if n.start_line <= line_number <= n.end_line:
-                if n.node_type in ["function_declaration", "function_definition", 
-                                   "method_declaration", "method_definition"]:
-                    parent_function = n
-                elif n.node_type in ["class_declaration", "class_definition"]:
-                    parent_class = n
-                
-                for child in n.children:
-                    find_parents(child, path + [n])
-        
-        find_parents(root)
-        
+
+        for n in path:
+            nt = n.node_type.lower()
+            if any(kw in nt for kw in ("function", "method", "def")):
+                parent_function = n
+            elif "class" in nt:
+                parent_class = n
+
+        # Siblings = other children of the parent function/class
+        parent = parent_function or parent_class or root
+        siblings = [c for c in parent.children if c != node]
+
         return ASTContext(
             error_node=node,
-            parent_function=parent_function,
-            parent_class=parent_class,
-            context_start_line=max(1, line_number - context_lines),
-            context_end_line=line_number + context_lines,
-            sibling_nodes=[],
-            imports=[],
+            parent_nodes=path[:-1] if path else [],
+            child_nodes=node.children if node else [],
+            sibling_nodes=siblings,
         )
-    
+
+    # ------------------------------------------------------------------
+    # Visualization
+    # ------------------------------------------------------------------
+
     def generate_visualization(
-        self, root: ASTNode, error_line: Optional[int] = None, max_depth: int = 4
+        self, root: ASTNode, error_line: Optional[int] = None, max_depth: int = 5
     ) -> ASTVisualization:
-        """
-        Generate an SVG visualization of the AST for email display.
-        
-        The visualization is interactive - nodes can be clicked to expand/collapse.
-        Error nodes are highlighted.
-        """
-        svg_content = self._generate_svg(root, error_line, max_depth)
-        
-        return ASTVisualization(
-            svg_content=svg_content,
-            root_node=root,
-            highlighted_line=error_line,
-            interactive=True,
-        )
-    
-    def _generate_svg(
-        self, root: ASTNode, error_line: Optional[int], max_depth: int
-    ) -> str:
-        """Generate SVG content for AST visualization."""
-        
-        # Calculate dimensions
+        """Generate an interactive SVG visualization of the AST."""
         width = 800
-        node_height = 40
-        indent = 30
-        
-        nodes_data = []
-        
-        def collect_nodes(node: ASTNode, depth: int = 0, y_offset: int = 0):
+        node_height = 35
+        indent = 25
+
+        nodes_data: List[Dict[str, Any]] = []
+
+        def collect(node: ASTNode, depth: int = 0, y_offset: int = 0) -> int:
             if depth > max_depth:
                 return y_offset
-            
-            is_error = (error_line and 
-                       node.start_line <= error_line <= node.end_line)
-            
+            is_error = bool(error_line and node.start_line <= error_line <= node.end_line)
             nodes_data.append({
-                "node": node,
+                "name": node.name or node.node_type,
+                "type": node.node_type,
                 "depth": depth,
                 "y": y_offset,
+                "line": node.start_line,
                 "is_error": is_error,
             })
-            
             y = y_offset + node_height
-            
-            for child in node.children[:10]:  # Limit children
-                y = collect_nodes(child, depth + 1, y)
-            
+            for child in node.children[:15]:
+                y = collect(child, depth + 1, y)
             return y
-        
-        total_height = collect_nodes(root)
-        
-        # Build SVG
+
+        total_h = collect(root)
+
         svg_parts = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {total_height + 20}" '
-            f'style="font-family: monospace; font-size: 12px;">',
-            '<style>',
-            '.node { cursor: pointer; }',
-            '.node:hover rect { fill: #e0e0e0; }',
-            '.error-node rect { fill: #ffcccc !important; stroke: #ff0000; stroke-width: 2; }',
-            '.node-text { pointer-events: none; }',
-            '</style>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {total_h + 20}" '
+            f'style="font-family:monospace;font-size:12px;">',
+            '<style>.node:hover rect{fill:#e0e0e0}'
+            '.err rect{fill:#ffcccc!important;stroke:#ff0000;stroke-width:2}</style>',
         ]
-        
-        for data in nodes_data:
-            node = data["node"]
-            x = data["depth"] * indent + 10
-            y = data["y"] + 10
-            is_error = data["is_error"]
-            
-            # Node rectangle
-            rect_class = "error-node" if is_error else ""
+        for d in nodes_data:
+            x = d["depth"] * indent + 10
+            y = d["y"] + 10
+            cls = "node err" if d["is_error"] else "node"
             svg_parts.append(
-                f'<g class="node {rect_class}" data-line="{node.start_line}">'
-                f'<rect x="{x}" y="{y}" width="{width - x - 20}" height="{node_height - 5}" '
-                f'fill="#f0f0f0" rx="3" />'
-                f'<text class="node-text" x="{x + 5}" y="{y + 20}">'
-                f'{node.node_type}: {node.name or ""} (L{node.start_line})'
-                f'</text>'
-                f'</g>'
+                f'<g class="{cls}" data-line="{d["line"]}">'
+                f'<rect x="{x}" y="{y}" width="{width - x - 20}" height="{node_height - 4}" '
+                f'fill="#f0f0f0" rx="3"/>'
+                f'<text x="{x + 5}" y="{y + 18}" fill="#333">'
+                f'{d["type"]}: {d["name"]} (L{d["line"]})</text></g>'
             )
-        
-        svg_parts.append('</svg>')
-        
-        return "\n".join(svg_parts)
+        svg_parts.append("</svg>")
+
+        return ASTVisualization(
+            svg_content="\n".join(svg_parts),
+            html_content="",
+            nodes_data=nodes_data,
+            tree_depth=max_depth,
+            total_nodes=len(nodes_data),
+        )
+
+    # ------------------------------------------------------------------
+    # Utility – convert ASTNode to JSON-friendly dict (for API responses)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def ast_to_dict(node: ASTNode, max_depth: int = 15, depth: int = 0) -> Dict[str, Any]:
+        """Convert ASTNode tree to a plain dict for JSON serialisation."""
+        if depth > max_depth:
+            return {"type": node.node_type, "name": node.name, "truncated": True}
+        return {
+            "id": node.node_id,
+            "type": node.node_type,
+            "name": node.name,
+            "loc": {
+                "start": {"line": node.start_line, "column": node.start_col},
+                "end": {"line": node.end_line, "column": node.end_col},
+            },
+            "snippet": (node.code_snippet or "")[:100],
+            "children": [
+                ASTService.ast_to_dict(c, max_depth, depth + 1)
+                for c in node.children
+            ],
+        }
 
 
-# Singleton instance
+# ============================================================================
+# Singleton
+# ============================================================================
+
 _ast_service: Optional[ASTService] = None
 
 
