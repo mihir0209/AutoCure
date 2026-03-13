@@ -112,7 +112,17 @@ user_repos: Dict[str, RepositoryInfo] = {}
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     config = get_config()
-    
+    logger.info(r"""
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                                                               ║
+    ║           ░█▀█░█░█░▀█▀░█▀█░░░░░█▀▀░█░█░█▀▄░█▀▀                ║    
+    ║           ░█▀█░█░█░░█░░█░█░▄▄▄░█░░░█░█░█▀▄░█▀▀                ║
+    ║           ░▀░▀░▀▀▀░░▀░░▀▀▀░░░░░▀▀▀░▀▀▀░▀░▀░▀▀▀                ║
+    ║                                                               ║
+    ║           AI-Driven AUTO-CURE Software System                 ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+        """)
     logger.info("═" * 60)
     logger.info("   SELF-HEALING SOFTWARE SYSTEM v2.0 - STARTING")
     logger.info("═" * 60)

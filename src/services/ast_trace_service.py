@@ -544,7 +544,7 @@ class ASTTraceService:
         Build a rich context string for AI analysis using AST tracing.
 
         Strategy (bottom-up from error):
-        1. Parse the stack-trace / call chain to identify multi-file frames.
+        1. Parse the AST trace / call chain to identify multi-file frames.
         2. For the bottom 3 frames (closest to error): include **full function bodies**.
         3. For frames above that: include only the call-site lines + surrounding context.
         4. Prepend import lines of every involved file.
@@ -556,7 +556,7 @@ class ASTTraceService:
         sections.append(f"## Error Location\n")
         sections.append(f"File: `{trace.error_file}` | Line: {trace.error_line}\n")
 
-        # ── 2. Parse call chain from stack trace (if available) ──
+        # ── 2. Parse call chain from AST trace (if available) ──
         call_chain = trace.call_chain  # filled by main.py _build_call_chain
 
         # ── 3. Collect full function bodies for the bottom N frames ──
@@ -564,7 +564,7 @@ class ASTTraceService:
         traced_functions: dict[str, str] = {}  # "file:func_name" -> body text
 
         if call_chain:
-            sections.append("\n## Call Chain (from stack trace, innermost first)\n")
+            sections.append("\n## Call Chain (from AST trace, innermost first)\n")
             for idx, (cc_file, cc_line, cc_func) in enumerate(call_chain):
                 tag = "→ " if idx == 0 else "  "
                 sections.append(f"{tag}`{cc_file}:{cc_line}` in `{cc_func or '?'}`\n")

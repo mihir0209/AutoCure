@@ -810,7 +810,17 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     config = get_config()
-    
+    logger.info(r"""
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                                                               ║
+    ║           ░█▀█░█░█░▀█▀░█▀█░░░░░█▀▀░█░█░█▀▄░█▀▀                ║    
+    ║           ░█▀█░█░█░░█░░█░█░▄▄▄░█░░░█░█░█▀▄░█▀▀                ║
+    ║           ░▀░▀░▀▀▀░░▀░░▀▀▀░░░░░▀▀▀░▀▀▀░▀░▀░▀▀▀                ║
+    ║                                                               ║
+    ║           AI-Driven AUTO-CURE Software System                 ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+        """)
     logger.info("═" * 60)
     logger.info("   SELF-HEALING SOFTWARE SYSTEM v2.0 - STARTING")
     logger.info("═" * 60)
@@ -2629,7 +2639,7 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 def main():
     """Entry point for the server."""
     try:
-        print(r"""
+        logger.info(r"""
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
     ║           ░█▀█░█░█░▀█▀░█▀█░░░░░█▀▀░█░█░█▀▄░█▀▀                ║    
