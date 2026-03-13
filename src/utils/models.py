@@ -317,6 +317,9 @@ class CodeReviewResult(BaseModel):
     issues_count: Dict[str, int] = Field(default_factory=dict)
     approved: bool = False
     ast_insights: str = ""  # AST-based analysis findings
+    ast_diffs: List[Dict[str, Any]] = Field(default_factory=list)
+    reference_traces: List[Dict[str, Any]] = Field(default_factory=list)
+    manual_flags: List[Dict[str, Any]] = Field(default_factory=list)
     reviewed_at: datetime = Field(default_factory=datetime.now)
 
 

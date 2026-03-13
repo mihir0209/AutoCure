@@ -18,6 +18,7 @@ from datetime import datetime
 import aiohttp
 
 from config import get_config
+from services.ast_review_service import get_ast_review_service
 from utils.models import (
     DetectedError, ASTContext, RootCauseAnalysis, FixProposal,
     PRInfo, CodeReviewComment, CodeReviewResult, ErrorReplicationSummary
@@ -89,6 +90,7 @@ class AIAnalyzer:
         self.config = config or get_config().ai
         self.max_retries = self.config.max_retries
         self.base_delay = self.config.initial_retry_delay
+        self.ast_review_service = get_ast_review_service()
 
     # ──────────────────────────────────────────────────────────
     #  Public API
@@ -165,11 +167,20 @@ class AIAnalyzer:
         pr_diff: Dict[str, Any],
         pr_info: PRInfo,
         user_id: str = "",
+        repo_path: str = "",
+        base_ref: str = "",
+        head_ref: str = "",
     ) -> CodeReviewResult:
         """Perform AI-powered code review on a pull request."""
-        prompt = self._build_review_prompt(pr_diff, pr_info)
+        ast_review = self.ast_review_service.analyze_review_diff(
+            pr_diff,
+            repo_path=repo_path,
+            base_ref=base_ref,
+            head_ref=head_ref,
+        )
+        prompt = self._build_review_prompt(pr_diff, pr_info, ast_review)
         response = await self._call_ai_simple(prompt, system_prompt=self._get_review_system_prompt())
-        return self._parse_review_response(response, pr_info)
+        return self._parse_review_response(response, pr_info, ast_review=ast_review)
 
     # ══════════════════════════════════════════════════════════
     #  System Prompts (concise — shared for analysis + fix)
@@ -207,12 +218,14 @@ class AIAnalyzer:
             "You are an expert code reviewer. Focus on correctness, security, best practices.\n"
             "Respond ONLY with JSON:\n"
             "{\"overall_assessment\":\"approve|request_changes|comment\","
+            " \"overall_score\": 0-100,"
             " \"summary\":\"...\","
             " \"comments\":[{\"file_path\":\"...\", \"line_number\":42,"
             " \"severity\":\"critical|warning|suggestion|info\","
             " \"comment_type\":\"bug|security|performance|style|documentation|best_practice\","
             " \"message\":\"...\", \"suggested_fix\":\"...\"}],"
-            " \"highlights\":[\"good thing\"]}"
+            " \"highlights\":[\"good thing\"],"
+            " \"ast_insights\":\"explain AST old-vs-new usefulness/redundancy and reference impact\"}"
         )
 
     # ══════════════════════════════════════════════════════════
@@ -308,6 +321,7 @@ class AIAnalyzer:
         self,
         pr_diff: Dict[str, Any],
         pr_info: PRInfo,
+        ast_review: Optional[Dict[str, Any]] = None,
     ) -> str:
         files_summary = []
         for f in pr_diff.get("files", [])[:15]:
@@ -316,15 +330,57 @@ class AIAnalyzer:
             files_summary.append(f"- {f.get('filename', '?')} (+{additions}/-{deletions})")
 
         diff_excerpt = pr_diff.get("diff", "")[:10000]
+        ast_context = self._format_ast_review_context(ast_review)
 
         return (
             f"## PR Review: {pr_diff.get('title', pr_info.title)}\n"
             f"Author: {pr_diff.get('author', pr_info.author)}\n"
             f"Base: {pr_info.target_branch} ← {pr_info.source_branch}\n\n"
             f"### Files Changed\n{chr(10).join(files_summary)}\n\n"
+            f"{ast_context}\n"
             f"### Diff\n```diff\n{diff_excerpt}\n```\n\n"
-            "Review for bugs, security, performance. JSON only."
+            "Review for bugs, security, performance, and AST-level redundancy/usefulness. "
+            "If a change appears redundant or unused by references, call it out clearly. JSON only."
         )
+
+    @staticmethod
+    def _format_ast_review_context(ast_review: Optional[Dict[str, Any]]) -> str:
+        if not ast_review:
+            return ""
+        parts = ["### AST Comparison Context"]
+        summary = ast_review.get("summary", "")
+        if summary:
+            parts.append(f"- Summary: {summary}")
+
+        for d in (ast_review.get("ast_diffs", []) or [])[:10]:
+            parts.append(
+                f"- {d.get('file_path', '?')}: "
+                f"added={len(d.get('added_symbols', []))}, "
+                f"changed={len(d.get('changed_symbols', []))}, "
+                f"removed={len(d.get('removed_symbols', []))}"
+            )
+            if d.get("redundancy_candidates"):
+                sample = d["redundancy_candidates"][:3]
+                parts.append(
+                    "  redundancy: " + "; ".join(
+                        f"{r.get('symbol', '?')}~{r.get('matched_symbol', '?')}" for r in sample
+                    )
+                )
+
+        refs = ast_review.get("reference_traces", []) or []
+        if refs:
+            parts.append("- Reference traces (top):")
+            for r in refs[:8]:
+                parts.append(f"  {r.get('symbol', '?')}: {r.get('total_references', 0)} refs")
+
+        flags = ast_review.get("manual_flags", []) or []
+        if flags:
+            parts.append("- Manual flags:")
+            for f in flags[:8]:
+                parts.append(
+                    f"  {f.get('file_path', '?')}::{f.get('symbol', '?')} -> {f.get('reason', '')}"
+                )
+        return "\n".join(parts) + "\n\n"
 
     # ══════════════════════════════════════════════════════════
     #  AI API — tool-calling loop (with chat history)
@@ -534,7 +590,12 @@ class AIAnalyzer:
 
         return proposals
 
-    def _parse_review_response(self, response: str, pr_info: PRInfo) -> CodeReviewResult:
+    def _parse_review_response(
+        self,
+        response: str,
+        pr_info: PRInfo,
+        ast_review: Optional[Dict[str, Any]] = None,
+    ) -> CodeReviewResult:
         data = _extract_json(response)
 
         comments = []
@@ -551,10 +612,16 @@ class AIAnalyzer:
 
         return CodeReviewResult(
             pr_info=pr_info,
+            overall_score=float(data.get("overall_score", 0.0)),
             overall_assessment=data.get("overall_assessment", "comment"),
             summary=data.get("summary", "Review completed"),
             comments=comments,
             highlights=data.get("highlights", []),
+            approved=data.get("overall_assessment", "comment") == "approve",
+            ast_insights=data.get("ast_insights", (ast_review or {}).get("summary", "")),
+            ast_diffs=(ast_review or {}).get("ast_diffs", []),
+            reference_traces=(ast_review or {}).get("reference_traces", []),
+            manual_flags=(ast_review or {}).get("manual_flags", []),
             reviewed_at=datetime.utcnow(),
         )
 

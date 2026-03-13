@@ -1789,6 +1789,15 @@ async def review_branch(user_id: str, request: Request, background_tasks: Backgr
 
     async def _review_branch():
         try:
+            repo_info = user_repos.get(user_id)
+            if repo_info and repo_info.local_path:
+                await github_service.pull_repository(user_id, token=token)
+            else:
+                cloned = await github_service.clone_repository(registration)
+                if cloned:
+                    user_repos[user_id] = cloned
+                    repo_info = cloned
+
             # Get branch diff
             diff = await github_service.get_branch_diff(owner, repo_name, branch, base_branch, token)
             if not diff:
@@ -1806,7 +1815,14 @@ async def review_branch(user_id: str, request: Request, background_tasks: Backgr
                 repo_url=registration.repo_url,
             )
 
-            review_result = await ai_analyzer.review_pull_request(diff, pr_info, user_id=user_id)
+            review_result = await ai_analyzer.review_pull_request(
+                diff,
+                pr_info,
+                user_id=user_id,
+                repo_path=str(repo_info.local_path) if repo_info and repo_info.local_path else "",
+                base_ref=base_branch,
+                head_ref=branch,
+            )
             logger.info(f"Branch {branch} reviewed: score={review_result.overall_score}")
 
             # Save report
@@ -1814,7 +1830,8 @@ async def review_branch(user_id: str, request: Request, background_tasks: Backgr
             store = get_report_store()
             import uuid as _uuid
             ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            rpt_filename = f"review_{ts}_branch_{branch}_{_uuid.uuid4().hex[:6]}.html"
+            safe_branch = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in branch)
+            rpt_filename = f"review_{ts}_branch_{safe_branch}_{_uuid.uuid4().hex[:6]}.html"
             rpt_path = REPORTS_DIR / rpt_filename
             rpt_path.write_text(report_html, encoding="utf-8")
             report_id = store.insert(
@@ -1876,6 +1893,16 @@ async def review_pull_request(user_id: str, pr_info: PRInfo, background_tasks: B
 
     async def _review():
         try:
+            repo_info = user_repos.get(user_id)
+            token = registration.access_token or registration.repo_token or ""
+            if repo_info and repo_info.local_path:
+                await github_service.pull_repository(user_id, token=token)
+            else:
+                cloned = await github_service.clone_repository(registration)
+                if cloned:
+                    user_repos[user_id] = cloned
+                    repo_info = cloned
+
             # Fetch the PR diff from GitHub
             pr_diff = await github_service.get_pr_diff(registration, pr_info.pr_number)
             if not pr_diff:
@@ -1883,7 +1910,14 @@ async def review_pull_request(user_id: str, pr_info: PRInfo, background_tasks: B
                 return
 
             # Run AI code review
-            review_result = await ai_analyzer.review_pull_request(pr_diff, pr_info, user_id=user_id)
+            review_result = await ai_analyzer.review_pull_request(
+                pr_diff,
+                pr_info,
+                user_id=user_id,
+                repo_path=str(repo_info.local_path) if repo_info and repo_info.local_path else "",
+                base_ref=pr_info.target_branch,
+                head_ref=pr_info.source_branch,
+            )
             logger.info(f"PR #{pr_info.pr_number} reviewed: score={review_result.overall_score}")
 
             # Send review email
@@ -1991,6 +2025,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         repo_url = payload.get("repository", {}).get("html_url", "")
         commits = payload.get("commits", [])
         ref = payload.get("ref", "")  # e.g. refs/heads/main
+        before_sha = payload.get("before", "")
 
         # Find user by repo URL (exact match after normalisation)
         target_user = _find_user_by_repo_url(repo_url)
@@ -2015,6 +2050,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                         result = await github_service.clone_repository(registration)
                         if result:
                             user_repos[target_user] = result
+                            repo_info = result
                             logger.info(f"Webhook: cloned repo for {target_user}")
 
                     # 2. Get diff for the latest commit
@@ -2065,7 +2101,14 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     # 4. Run AI code review on the commit
                     logger.info(f"Webhook: sending commit diff to AI analyzer ({len(commit_diff.get('files', []))} files changed)...")
-                    review_result = await ai_analyzer.review_pull_request(commit_diff, pr_info, user_id=target_user)
+                    review_result = await ai_analyzer.review_pull_request(
+                        commit_diff,
+                        pr_info,
+                        user_id=target_user,
+                        repo_path=str(repo_info.local_path) if repo_info and repo_info.local_path else "",
+                        base_ref=before_sha,
+                        head_ref=commit_sha,
+                    )
                     logger.info(f"Webhook: commit {commit_sha[:8]} reviewed, score={review_result.overall_score}, "
                                 f"comments={len(review_result.comments)}, assessment={review_result.overall_assessment}")
 

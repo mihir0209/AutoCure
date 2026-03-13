@@ -1386,6 +1386,67 @@ class EmailService:
                 '</div></div>'
             )
 
+        ast_diffs_html = ""
+        if review.ast_diffs:
+            cards = []
+            for d in review.ast_diffs[:12]:
+                cards.append(
+                    "<div style=\"border-left:4px solid #0969da;padding:10px 14px;margin:8px 0;"
+                    "background:#f6f8fa;border-radius:0 4px 4px 0;\">"
+                    f"<p style=\"margin:0 0 6px;\"><strong>{_esc(d.get('file_path', '?'))}</strong></p>"
+                    f"<p style=\"margin:0;font-size:12px;color:#57606a;\">"
+                    f"Added: {len(d.get('added_symbols', []))} &bull; "
+                    f"Changed: {len(d.get('changed_symbols', []))} &bull; "
+                    f"Removed: {len(d.get('removed_symbols', []))}</p>"
+                    + (
+                        f"<p style=\"margin:6px 0 0;font-size:12px;\">"
+                        f"Redundancy candidates: {_esc(', '.join(r.get('symbol', '?') for r in d.get('redundancy_candidates', [])[:5]))}"
+                        "</p>"
+                        if d.get("redundancy_candidates")
+                        else ""
+                    )
+                    + "</div>"
+                )
+            ast_diffs_html = (
+                '<div class="sec"><h2 class="sec-title">&#128202; AST Change Matrix</h2>'
+                + "".join(cards) +
+                "</div>"
+            )
+
+        ref_trace_html = ""
+        if review.reference_traces:
+            items = []
+            for r in review.reference_traces[:15]:
+                items.append(
+                    "<li><code>"
+                    + _esc(r.get("symbol", "?"))
+                    + "</code> &mdash; "
+                    + str(r.get("total_references", 0))
+                    + " reference(s)</li>"
+                )
+            ref_trace_html = (
+                '<div class="sec"><h2 class="sec-title">&#128279; Reference Trace</h2><ul>'
+                + "".join(items) + "</ul></div>"
+            )
+
+        manual_flags_html = ""
+        if review.manual_flags:
+            flags = []
+            for f in review.manual_flags[:15]:
+                flags.append(
+                    "<li><strong>"
+                    + _esc(f.get("file_path", "?"))
+                    + "</strong> :: <code>"
+                    + _esc(f.get("symbol", "?"))
+                    + "</code> &mdash; "
+                    + _esc(f.get("reason", ""))
+                    + "</li>"
+                )
+            manual_flags_html = (
+                '<div class="sec"><h2 class="sec-title">&#9888;&#65039; Manual AST Flags</h2><ul>'
+                + "".join(flags) + "</ul></div>"
+            )
+
         return f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>{_EMAIL_CSS}</style></head><body>
@@ -1423,6 +1484,9 @@ class EmailService:
     </div>
 
     {ast_insights_html}
+    {ast_diffs_html}
+    {ref_trace_html}
+    {manual_flags_html}
     {highlights_html}
 
     <div style="margin-top:24px;padding-top:16px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;text-align:center;">
