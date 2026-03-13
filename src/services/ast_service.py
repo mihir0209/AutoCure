@@ -356,14 +356,33 @@ class ASTService:
         for i, line in enumerate(lines, 1):
             m = re.match(r"^\s*class\s+(\w+)", line)
             if m:
+                indent = len(line) - len(line.lstrip())
+                end = self._fb_python_block_end(lines, i, indent)
                 children.append(ASTNode(node_id=f"class_{i}", node_type="class_definition",
-                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=end))
                 continue
             m = re.match(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", line)
             if m:
+                indent = len(line) - len(line.lstrip())
+                end = self._fb_python_block_end(lines, i, indent)
                 children.append(ASTNode(node_id=f"func_{i}", node_type="function_definition",
-                                        name=m.group(1), file_path=fp, start_line=i, end_line=i))
+                                        name=m.group(1), file_path=fp, start_line=i, end_line=end))
         return children
+
+    @staticmethod
+    def _fb_python_block_end(lines, start_1based: int, def_indent: int) -> int:
+        """Find the last line of a Python block by tracking indentation."""
+        last = start_1based
+        for i in range(start_1based, len(lines)):  # 0-based index = start_1based
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue  # blank / comment — don't break yet
+            cur_indent = len(line) - len(line.lstrip())
+            if cur_indent <= def_indent and stripped:
+                break
+            last = i + 1  # back to 1-based
+        return last
 
     # --- Java fallback ---
     def _fb_java(self, lines, fp):

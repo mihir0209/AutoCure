@@ -37,7 +37,7 @@ logger = logging.getLogger("notification")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
-## ---------- AUTOCURE INTEGRATION (uncomment to enable) ---------- ###
+# ---------- AUTOCURE INTEGRATION (uncomment to enable) ---------- ###
 
 import os
 from pathlib import Path
@@ -45,12 +45,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from autocure_client import AutoCureHandler
 
 AUTOCURE_WS = os.getenv("AUTOCURE_WS",
-                         "ws://localhost:8000/ws/logs/notification-svc")
+                         "ws://localhost:9292/ws/logs/notification-svc")
 _autocure = AutoCureHandler(ws_url=AUTOCURE_WS, level=logging.DEBUG)
 _autocure.setFormatter(logging.Formatter("%(name)s - %(message)s"))
 logger.addHandler(_autocure)
 
-## ---------------------------------------------------------------- ###
+# ---------------------------------------------------------------- ###
 
 # ─── In-memory data ───────────────────────────────────────────────
 
@@ -108,7 +108,7 @@ async def _error_injector():
     await asyncio.sleep(10)
     logger.info("Error injector started (interval 15-20s)")
     while True:
-        delay = random.randint(15, 20)
+        delay = random.randint(5, 10)
         await asyncio.sleep(delay)
         fn = random.choice(ERROR_FUNCS)
         try:
@@ -128,9 +128,8 @@ async def _error_injector():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Notification Service starting on port 9003")
-    # ### AUTOCURE INTEGRATION (uncomment to enable) ###
-    # _autocure.start_background()
-    # logger.info(f"AutoCure WebSocket: {AUTOCURE_WS}")
+    _autocure.start_background()
+    logger.info(f"AutoCure WebSocket: {AUTOCURE_WS}")
     task = asyncio.create_task(_error_injector())
     yield
     task.cancel()

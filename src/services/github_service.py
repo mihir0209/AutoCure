@@ -101,7 +101,10 @@ class GitHubService:
         # Check if already cloned
         if local_path.exists() and not force:
             logger.info(f"Repository already exists: {local_path}")
-            return await self.get_repo_info(user.user_id, local_path)
+            repo_info = await self.get_repo_info(user.user_id, local_path)
+            if repo_info:
+                self.repos[user.user_id] = repo_info
+            return repo_info
         
         # Remove existing if force
         if local_path.exists() and force:
@@ -158,9 +161,12 @@ class GitHubService:
             logger.error(f"Error cloning repository: {e}")
             return None
     
-    async def pull_repository(self, user_id: str) -> bool:
+    async def pull_repository(self, user_id: str, token: str = "") -> bool:
         """
         Pull latest changes for a user's repository.
+        
+        Args:
+            token: Optional PAT token for authenticated pull (private repos).
         
         Returns True if successful, False otherwise.
         """
@@ -171,11 +177,61 @@ class GitHubService:
         
         try:
             import subprocess as _sp
+            cwd = str(repo_info.local_path)
+
+            # ── Ensure clean working tree before pulling ──
+            # Fix-branch operations may leave uncommitted changes that block rebase.
+            # These repos are remote mirrors — local edits are never intentional.
+            _sp.run(["git", "reset", "--hard", "HEAD"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15)
+            _sp.run(["git", "clean", "-fd"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15)
+
+            # Unshallow if needed (repos cloned with --depth 1)
+            is_shallow = _sp.run(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=cwd, capture_output=True, text=True, timeout=15,
+            )
+            if is_shallow.stdout.strip() == "true":
+                logger.info(f"Unshallowing repo for {user_id}...")
+                # Inject token for fetch auth if available
+                if token:
+                    remote_proc = _sp.run(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=cwd, capture_output=True, text=True, timeout=15,
+                    )
+                    original_url = remote_proc.stdout.strip()
+                    auth_url = self._inject_token_in_url(original_url, token)
+                    _sp.run(["git", "remote", "set-url", "origin", auth_url],
+                            cwd=cwd, capture_output=True, text=True, timeout=15)
+
+                _sp.run(["git", "fetch", "--unshallow"],
+                        cwd=cwd, capture_output=True, text=True, timeout=120)
+
+                # Restore URL
+                if token:
+                    self._strip_token_from_remote(cwd)
+
+            # Inject token for pull auth if available
+            if token:
+                remote_proc = _sp.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15,
+                )
+                original_url = remote_proc.stdout.strip()
+                auth_url = self._inject_token_in_url(original_url, token)
+                _sp.run(["git", "remote", "set-url", "origin", auth_url],
+                        cwd=cwd, capture_output=True, text=True, timeout=15)
+
             proc = _sp.run(
                 ["git", "pull", "--rebase"],
-                cwd=str(repo_info.local_path),
+                cwd=cwd,
                 capture_output=True, text=True, timeout=60,
             )
+
+            # Restore URL (strip token)
+            if token:
+                self._strip_token_from_remote(cwd)
             
             if proc.returncode != 0:
                 logger.error(f"Git pull failed: {proc.stderr}")
@@ -191,6 +247,32 @@ class GitHubService:
         except Exception as e:
             logger.error(f"Error pulling repository: {e}")
             return False
+
+    def _inject_token_in_url(self, url: str, token: str) -> str:
+        """Inject a PAT token into a git remote URL for authenticated operations."""
+        for prefix in ("https://", "http://"):
+            if url.startswith(prefix):
+                after = url[len(prefix):]
+                if "@" in after.split("/")[0]:
+                    after = after.split("@", 1)[1]
+                return f"{prefix}x-access-token:{token}@{after}"
+        return url
+
+    def _strip_token_from_remote(self, cwd: str):
+        """Remove token from the git remote URL for security."""
+        import subprocess as _sp
+        remote_proc = _sp.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+        current = remote_proc.stdout.strip()
+        if "@" in current:
+            proto = "https://" if current.startswith("https://") else "http://"
+            after_at = current.split("@", 1)[1] if "@" in current else current
+            _sp.run(
+                ["git", "remote", "set-url", "origin", f"{proto}{after_at}"],
+                cwd=cwd, capture_output=True, text=True, timeout=15,
+            )
     
     async def get_repo_info(self, user_id: str, local_path: Path) -> Optional[RepositoryInfo]:
         """Get information about a cloned repository."""
@@ -406,7 +488,7 @@ class GitHubService:
         if not repo_info:
             return None
         
-        full_path = repo_info.local_path / file_path
+        full_path = Path(repo_info.local_path) / file_path
         
         if not full_path.exists():
             return None
@@ -418,6 +500,317 @@ class GitHubService:
             logger.error(f"Error reading file: {e}")
             return None
     
+    async def create_branch(self, user_id: str, branch_name: str, base_branch: str = "main") -> bool:
+        """Create a new branch from the base branch in the user's local repo."""
+        repo_info = self.repos.get(user_id)
+        if not repo_info:
+            logger.warning(f"No repository found for user: {user_id}")
+            return False
+
+        try:
+            import subprocess as _sp
+            cwd = str(repo_info.local_path)
+
+            # Fetch latest from remote
+            _sp.run(["git", "fetch", "origin"], cwd=cwd, capture_output=True, text=True, timeout=60)
+
+            # Create new branch from origin/base_branch
+            proc = _sp.run(
+                ["git", "checkout", "-b", branch_name, f"origin/{base_branch}"],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                # Branch may already exist, try switching to it
+                proc = _sp.run(
+                    ["git", "checkout", branch_name],
+                    cwd=cwd, capture_output=True, text=True, timeout=30,
+                )
+                if proc.returncode != 0:
+                    logger.error(f"Failed to create/switch to branch {branch_name}: {proc.stderr}")
+                    return False
+
+            logger.info(f"✓ Created/switched to branch: {branch_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating branch: {e}")
+            return False
+
+    async def apply_fix_to_file(
+        self, user_id: str, file_path: str, original_code: str, suggested_code: str
+    ) -> bool:
+        """Apply a code fix by replacing original_code with suggested_code in the file."""
+        repo_info = self.repos.get(user_id)
+        if not repo_info:
+            return False
+
+        full_path = Path(repo_info.local_path) / file_path
+        if not full_path.exists():
+            logger.error(f"File not found: {full_path}")
+            return False
+
+        # Safety: ensure file is within the repo
+        try:
+            full_path.resolve().relative_to(Path(repo_info.local_path).resolve())
+        except ValueError:
+            logger.error(f"Path traversal attempt blocked: {file_path}")
+            return False
+
+        try:
+            content = full_path.read_text(encoding="utf-8")
+
+            orig = original_code.strip() if original_code else ""
+            repl = suggested_code.strip() if suggested_code else ""
+
+            # Strip AI-generated line-number markers like ">>>   18 |" or "  18 |"
+            import re as _re_mod
+            _line_marker = _re_mod.compile(r'^(?:>>>)?\s*\d+\s*\|\s?', _re_mod.MULTILINE)
+            orig = _line_marker.sub('', orig).strip()
+            repl = _line_marker.sub('', repl).strip()
+
+            if not orig or not repl:
+                logger.warning(f"Empty original_code or suggested_code for {file_path}")
+                return False
+
+            if orig in content:
+                new_content = content.replace(orig, repl, 1)
+            else:
+                # Fuzzy match: normalise whitespace before comparing
+                import re as _ws_re
+                _norm = lambda s: _ws_re.sub(r'\s+', ' ', s.strip())
+                if _norm(orig) in _norm(content):
+                    # Line-by-line fallback: find matching lines and replace
+                    orig_lines = [l.strip() for l in orig.splitlines() if l.strip()]
+                    content_lines = content.splitlines(keepends=True)
+                    matched_start = None
+                    for i in range(len(content_lines)):
+                        if orig_lines and orig_lines[0] in content_lines[i]:
+                            # Check if subsequent lines match
+                            match = True
+                            for j, ol in enumerate(orig_lines):
+                                if i + j >= len(content_lines) or ol not in content_lines[i + j]:
+                                    match = False
+                                    break
+                            if match:
+                                matched_start = i
+                                break
+                    if matched_start is not None:
+                        before = content_lines[:matched_start]
+                        after = content_lines[matched_start + len(orig_lines):]
+                        # Preserve the indentation of the first matched line
+                        indent = content_lines[matched_start][:len(content_lines[matched_start]) - len(content_lines[matched_start].lstrip())]
+                        repl_lines = repl.splitlines(keepends=True)
+                        indented_repl = []
+                        for k, rl in enumerate(repl_lines):
+                            indented_repl.append(indent + rl.lstrip() if k > 0 else indent + rl.lstrip())
+                        new_content = "".join(before) + "".join(indented_repl) + ("\n" if indented_repl and not indented_repl[-1].endswith("\n") else "") + "".join(after)
+                        logger.info(f"Fix applied to {file_path} (fuzzy whitespace match)")
+                    else:
+                        logger.warning(f"Original code not found in {file_path} — fix skipped")
+                        return False
+                else:
+                    logger.warning(f"Original code not found in {file_path} — fix skipped")
+                    return False
+
+            full_path.write_text(new_content, encoding="utf-8")
+            logger.info(f"✓ Fix applied to {file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error applying fix to {file_path}: {e}")
+            return False
+
+    async def commit_and_push(
+        self, user_id: str, branch_name: str, commit_message: str, token: str = ""
+    ) -> Optional[str]:
+        """Stage all changes, commit, and push the branch to remote.
+
+        Returns the commit SHA on success, None on failure.
+        """
+        repo_info = self.repos.get(user_id)
+        if not repo_info:
+            return None
+
+        try:
+            import subprocess as _sp
+            cwd = str(repo_info.local_path)
+
+            # Stage only tracked/modified files (avoid picking up untracked utility files)
+            proc = _sp.run(["git", "add", "-u"], cwd=cwd, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                logger.error(f"git add -u failed: {proc.stderr}")
+                # Fallback: try adding only .py/.js/.ts files
+                proc = _sp.run(["git", "add", "*.py", "*.js", "*.ts", "*.jsx", "*.tsx"], cwd=cwd, capture_output=True, text=True, timeout=30)
+                if proc.returncode != 0:
+                    logger.error(f"git add fallback also failed: {proc.stderr}")
+                    return None
+
+            # Check if there are changes to commit
+            status = _sp.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=15)
+            if not status.stdout.strip():
+                logger.warning("No changes to commit")
+                return None
+
+            # Commit
+            proc = _sp.run(
+                ["git", "commit", "-m", commit_message],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+                env={**os.environ, "GIT_AUTHOR_NAME": "AutoCure Bot",
+                     "GIT_AUTHOR_EMAIL": "autocure@selfhealer.ai",
+                     "GIT_COMMITTER_NAME": "AutoCure Bot",
+                     "GIT_COMMITTER_EMAIL": "autocure@selfhealer.ai"},
+            )
+            if proc.returncode != 0:
+                logger.error(f"git commit failed: {proc.stderr}")
+                return None
+
+            # Get the commit SHA
+            sha_proc = _sp.run(["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, timeout=15)
+            commit_sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else "unknown"
+
+            # Set remote URL with token for push auth
+            if token:
+                remote_proc = _sp.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15,
+                )
+                remote_url = remote_proc.stdout.strip()
+                auth_url = self._inject_token_in_url(remote_url, token)
+                _sp.run(
+                    ["git", "remote", "set-url", "origin", auth_url],
+                    cwd=cwd, capture_output=True, text=True, timeout=15,
+                )
+
+            # Push
+            proc = _sp.run(
+                ["git", "push", "-u", "origin", branch_name],
+                cwd=cwd, capture_output=True, text=True, timeout=120,
+            )
+
+            # Restore original remote URL (strip token)
+            if token:
+                self._strip_token_from_remote(cwd)
+
+            if proc.returncode != 0:
+                logger.error(f"git push failed: {proc.stderr}")
+                return None
+
+            logger.info(f"✓ Pushed branch {branch_name} (commit {commit_sha[:8]})")
+            return commit_sha
+        except Exception as e:
+            logger.error(f"Error committing and pushing: {e}")
+            return None
+
+    async def switch_branch(self, user_id: str, branch_name: str) -> bool:
+        """Switch to a specific branch in the user's repo, ensuring a clean state."""
+        repo_info = self.repos.get(user_id)
+        if not repo_info:
+            return False
+        try:
+            import subprocess as _sp
+            cwd = str(repo_info.local_path)
+            # Discard any leftover changes before switching
+            _sp.run(["git", "reset", "--hard", "HEAD"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15)
+            _sp.run(["git", "clean", "-fd"],
+                    cwd=cwd, capture_output=True, text=True, timeout=15)
+            proc = _sp.run(
+                ["git", "checkout", branch_name],
+                cwd=cwd,
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                logger.error(f"Failed to switch to {branch_name}: {proc.stderr}")
+                return False
+            logger.info(f"✓ Switched to branch: {branch_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error switching branch: {e}")
+            return False
+
+    async def list_remote_branches(self, user_id: str, token: str = "") -> List[str]:
+        """List remote branches for the user's repo via GitHub API."""
+        repo_info = self.repos.get(user_id)
+        if not repo_info:
+            return []
+
+        # Try to get owner/repo from remote URL
+        try:
+            import subprocess as _sp
+            remote_proc = _sp.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(repo_info.local_path),
+                capture_output=True, text=True, timeout=15,
+            )
+            remote_url = remote_proc.stdout.strip()
+            host, owner, repo_name = self._parse_repo_url(remote_url)
+        except Exception:
+            return []
+
+        if not token:
+            token = self.default_token or ""
+        if not token:
+            return []
+
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo_name}/branches?per_page=100"
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        return []
+                    branches = await response.json()
+                    return [b["name"] for b in branches]
+        except Exception as e:
+            logger.error(f"Error listing branches: {e}")
+            return []
+
+    async def get_branch_diff(
+        self, owner: str, repo_name: str, branch: str, base_branch: str, token: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get diff between a branch and the base branch via GitHub API."""
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo_name}/compare/{base_branch}...{branch}"
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get branch diff: {response.status}")
+                        return None
+                    data = await response.json()
+
+                files_data = data.get("files", [])
+                commits = data.get("commits", [])
+                return {
+                    "branch": branch,
+                    "base_branch": base_branch,
+                    "ahead_by": data.get("ahead_by", 0),
+                    "behind_by": data.get("behind_by", 0),
+                    "total_commits": len(commits),
+                    "message": commits[-1]["commit"]["message"] if commits else "",
+                    "author": commits[-1]["commit"]["author"]["name"] if commits else "",
+                    "files": [
+                        {
+                            "filename": f.get("filename", ""),
+                            "status": f.get("status", ""),
+                            "additions": f.get("additions", 0),
+                            "deletions": f.get("deletions", 0),
+                            "patch": f.get("patch", ""),
+                        }
+                        for f in files_data
+                    ],
+                    "additions": sum(f.get("additions", 0) for f in files_data),
+                    "deletions": sum(f.get("deletions", 0) for f in files_data),
+                    "changed_files": len(files_data),
+                }
+        except Exception as e:
+            logger.error(f"Error getting branch diff: {e}")
+            return None
+
     async def list_files(
         self, user_id: str, directory: str = "", extensions: Optional[List[str]] = None
     ) -> List[str]:
@@ -427,7 +820,7 @@ class GitHubService:
         if not repo_info:
             return []
         
-        base_path = repo_info.local_path / directory
+        base_path = Path(repo_info.local_path) / directory
         
         if not base_path.exists():
             return []

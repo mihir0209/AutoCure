@@ -134,7 +134,7 @@ class ConfidenceValidator:
             return result
         
         # Run error replication with variations
-        replicator = get_error_replicator(base_url)
+        replicator = get_error_replicator()
         
         try:
             async with replicator:
@@ -273,7 +273,10 @@ class ConfidenceValidator:
         if len(result.iterations) > 0:
             match_ratio = result.matching_iterations / len(result.iterations)
         else:
-            match_ratio = 0.0
+            # No replication was possible — trust initial analysis as-is
+            result.confidence_score = min(100.0, max(0.0, initial_confidence * 100))
+            result.consistent_root_cause = result.initial_analysis.root_cause
+            return result
         
         # Calculate weighted confidence
         confidence = (

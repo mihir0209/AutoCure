@@ -6,6 +6,8 @@ Provides consistent logging across all components.
 import logging
 import os
 import sys
+import collections
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -18,6 +20,37 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 _LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _APP_LOG_FILE = _LOG_DIR / "app.log"
+
+# Thread-safe buffer for real-time WebSocket log broadcasting
+_ws_log_buffer: collections.deque = collections.deque(maxlen=500)
+_ws_log_lock = threading.Lock()
+
+
+class WebSocketLogHandler(logging.Handler):
+    """Logging handler that pushes formatted records to an in-memory buffer
+    for real-time broadcasting to dashboard WebSocket clients."""
+
+    def emit(self, record):
+        try:
+            entry = {
+                "timestamp": self.format_time(record),
+                "logger": record.name,
+                "level": record.levelname,
+                "message": record.getMessage(),
+            }
+            with _ws_log_lock:
+                _ws_log_buffer.append(entry)
+        except Exception:
+            pass
+
+    @staticmethod
+    def format_time(record):
+        return datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_ws_log_buffer():
+    """Return the global WebSocket log buffer (deque) and its lock."""
+    return _ws_log_buffer, _ws_log_lock
 
 
 def setup_logger(
@@ -62,6 +95,11 @@ def setup_logger(
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+    # WebSocket broadcast handler (real-time dashboard)
+    ws_handler = WebSocketLogHandler()
+    ws_handler.setLevel(level)
+    logger.addHandler(ws_handler)
 
     # Additional file handler
     if log_file:
@@ -130,5 +168,10 @@ def setup_colored_logger(name: str, level: int = logging.INFO) -> logging.Logger
         datefmt="%Y-%m-%d %H:%M:%S"
     ))
     logger.addHandler(file_handler)
+
+    # WebSocket broadcast handler (real-time dashboard)
+    ws_handler = WebSocketLogHandler()
+    ws_handler.setLevel(level)
+    logger.addHandler(ws_handler)
     
     return logger

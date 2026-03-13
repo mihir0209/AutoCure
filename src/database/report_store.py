@@ -48,6 +48,11 @@ class ReportRecord:
     report_type: str        # "analysis" | "review"
     proposals_count: int
     created_at: str         # ISO-8601
+    proposals_json: str = ""  # JSON array of fix proposals
+    branch_name: str = ""     # e.g. "autocure/fix-20260311_111933"
+    branch_url: str = ""      # GitHub tree URL for the branch
+    compare_url: str = ""     # GitHub compare URL (base...branch)
+    fix_status: str = "pending"  # "pushed" | "failed" | "no_token" | "low_confidence" | "pending"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -91,6 +96,7 @@ class ReportStore:
                     file_name   TEXT NOT NULL,
                     report_type TEXT NOT NULL DEFAULT 'analysis',
                     proposals_count INTEGER NOT NULL DEFAULT 0,
+                    proposals_json TEXT NOT NULL DEFAULT '',
                     created_at  TEXT NOT NULL
                 );
 
@@ -103,6 +109,18 @@ class ReportStore:
                 CREATE INDEX IF NOT EXISTS idx_reports_error_type
                     ON reports(error_type);
             """)
+            # Migrate existing DBs: add proposals_json if missing
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(reports)").fetchall()]
+            if "proposals_json" not in cols:
+                conn.execute("ALTER TABLE reports ADD COLUMN proposals_json TEXT NOT NULL DEFAULT ''")
+            if "branch_name" not in cols:
+                conn.execute("ALTER TABLE reports ADD COLUMN branch_name TEXT NOT NULL DEFAULT ''")
+            if "branch_url" not in cols:
+                conn.execute("ALTER TABLE reports ADD COLUMN branch_url TEXT NOT NULL DEFAULT ''")
+            if "compare_url" not in cols:
+                conn.execute("ALTER TABLE reports ADD COLUMN compare_url TEXT NOT NULL DEFAULT ''")
+            if "fix_status" not in cols:
+                conn.execute("ALTER TABLE reports ADD COLUMN fix_status TEXT NOT NULL DEFAULT 'pending'")
             conn.commit()
             logger.info(f"Report store ready: {self.db_path}")
         finally:
@@ -123,6 +141,7 @@ class ReportStore:
         source_file: str = "",
         line_number: int = 0,
         proposals_count: int = 0,
+        proposals_json: str = "",
     ) -> str:
         """Insert a new report record. Returns the generated report_id."""
         report_id = uuid.uuid4().hex[:12]
@@ -135,12 +154,14 @@ class ReportStore:
                 INSERT INTO reports
                     (report_id, user_id, error_type, severity, confidence,
                      root_cause, source_file, line_number,
-                     file_path, file_name, report_type, proposals_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     file_path, file_name, report_type, proposals_count,
+                     proposals_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (report_id, user_id, error_type, severity, confidence,
-                 root_cause[:500], source_file, line_number,
-                 file_path, file_name, report_type, proposals_count, now),
+                 root_cause[:500], source_file, int(line_number or 0),
+                 file_path, file_name, report_type, proposals_count,
+                 proposals_json, now),
             )
             conn.commit()
             logger.info(f"Report indexed: {report_id} ({report_type})")
@@ -158,6 +179,28 @@ class ReportStore:
             if not row:
                 return None
             return ReportRecord(**dict(row))
+        finally:
+            conn.close()
+
+    def update_branch_info(
+        self,
+        report_id: str,
+        branch_name: str = "",
+        branch_url: str = "",
+        compare_url: str = "",
+        fix_status: str = "pending",
+    ) -> bool:
+        """Update branch/fix info after auto-apply push."""
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                """UPDATE reports
+                   SET branch_name = ?, branch_url = ?, compare_url = ?, fix_status = ?
+                   WHERE report_id = ?""",
+                (branch_name, branch_url, compare_url, fix_status, report_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
         finally:
             conn.close()
 

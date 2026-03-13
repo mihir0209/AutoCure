@@ -8,6 +8,18 @@
     <div class="stat-icon yellow"><i class="ph ph-file-text"></i></div>
     <div><div class="stat-value" id="rptTotal">--</div><div class="stat-label">Total Reports</div></div>
   </div>
+  <div class="stat-card">
+    <div class="stat-icon blue"><i class="ph ph-chart-bar"></i></div>
+    <div><div class="stat-value" id="rptConfidence">--</div><div class="stat-label">Avg Confidence</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon red"><i class="ph ph-warning-circle"></i></div>
+    <div><div class="stat-value" id="rptErrors">--</div><div class="stat-label">Unique Errors</div></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon green"><i class="ph ph-wrench"></i></div>
+    <div><div class="stat-value" id="rptFixes">--</div><div class="stat-label">Fix Proposals</div></div>
+  </div>
 </div>
 
 <div class="filter-bar mb-4">
@@ -40,16 +52,41 @@
   </div>
 </div>
 <div class="pagination" id="rptPagination"></div>
+
+<!-- Show Changes Modal -->
+<div id="showChangesModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.55);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--card-bg,#1e1e2e);border-radius:12px;width:700px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.4);">
+    <div style="padding:16px 20px;border-bottom:1px solid var(--border,#333);display:flex;align-items:center;justify-content:space-between;">
+      <h3 style="margin:0;font-size:1.1rem;"><i class="ph ph-git-branch"></i> Changes Applied</h3>
+      <button class="btn btn-sm btn-ghost" onclick="closeChangesModal()"><i class="ph ph-x"></i></button>
+    </div>
+    <div id="showChangesBody" style="padding:20px;overflow-y:auto;flex:1;"></div>
+    <div id="showChangesFooter" style="padding:12px 20px;border-top:1px solid var(--border,#333);display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn btn-sm btn-ghost" onclick="closeChangesModal()">Close</button>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
 var rptPage = 0, RPT_LIMIT = 20;
+var USER_ROLE = '{{ user.role }}';
+var USER_NAME = '{{ user.username }}';
 
 var SEV_BADGE = {
   critical: 'badge-danger', high: 'badge-danger',
   medium: 'badge-warning', low: 'badge-info',
   approve: 'badge-success', request_changes: 'badge-danger', comment: 'badge-warning',
+};
+
+var STATUS_BADGE = {
+  pushed: '<span class="badge badge-success" style="font-size:0.7rem;"><i class="ph ph-check-circle"></i> Pushed</span>',
+  failed: '<span class="badge badge-danger" style="font-size:0.7rem;"><i class="ph ph-x-circle"></i> Failed</span>',
+  no_token: '<span class="badge badge-warning" style="font-size:0.7rem;"><i class="ph ph-key"></i> No Token</span>',
+  no_repo: '<span class="badge badge-warning" style="font-size:0.7rem;"><i class="ph ph-folder-notch-minus"></i> No Repo</span>',
+  low_confidence: '<span class="badge badge-info" style="font-size:0.7rem;"><i class="ph ph-chart-bar"></i> Low Conf</span>',
+  pending: '<span class="badge" style="font-size:0.7rem;background:#6c757d;"><i class="ph ph-clock"></i> Pending</span>',
 };
 
 async function loadStats() {
@@ -67,6 +104,12 @@ async function loadReports() {
     var params = new URLSearchParams({ limit: RPT_LIMIT, offset: rptPage * RPT_LIMIT });
     var user = document.getElementById('rptFilterUser').value.trim();
     var errType = document.getElementById('rptFilterError').value.trim();
+    // Viewers always filter by their own user
+    if (USER_ROLE !== 'admin') {
+      user = USER_NAME;
+      document.getElementById('rptFilterUser').value = USER_NAME;
+      document.getElementById('rptFilterUser').disabled = true;
+    }
     if (user) params.set('user_id', user);
     if (errType) params.set('error_type', errType);
 
@@ -81,16 +124,26 @@ async function loadReports() {
     } else {
       tbody.innerHTML = reports.map(function(r) {
         var confCls = r.confidence >= 0.75 ? 'badge-success' : (r.confidence >= 0.5 ? 'badge-warning' : 'badge-danger');
+        var fixStatus = r.fix_status || 'pending';
+        var statusHtml = STATUS_BADGE[fixStatus] || STATUS_BADGE.pending;
+        var changesBtn = '';
+        if (r.proposals_count > 0) {
+          changesBtn = '<button class="btn btn-sm btn-primary" onclick="openChangesModal(\'' +
+            r.report_id + '\',\'' + escapeHtml(r.user_id||'') + '\',\'' +
+            escapeHtml(r.compare_url||'') + '\',\'' + escapeHtml(r.branch_name||'') + '\',\'' +
+            fixStatus + '\')"><i class="ph ph-git-diff"></i> Show Changes</button> ';
+        }
         return '<tr>' +
           '<td><span class="badge ' + (SEV_BADGE[r.severity]||'badge-info') + '">' + escapeHtml(r.severity) + '</span></td>' +
           '<td class="mono text-sm">' + escapeHtml(r.error_type) + '</td>' +
           '<td class="text-sm text-muted truncate" style="max-width:200px">' + (r.source_file ? escapeHtml(r.source_file)+':'+r.line_number : '&mdash;') + '</td>' +
           '<td><span class="badge ' + confCls + '">' + (r.confidence*100).toFixed(0) + '%</span></td>' +
-          '<td>' + r.proposals_count + '</td>' +
+          '<td>' + r.proposals_count + ' ' + statusHtml + '</td>' +
           '<td class="text-sm text-muted">' + timeAgo(r.created_at) + '</td>' +
           '<td style="text-align:right">' +
             '<a href="'+r.view_url+'" target="_blank" class="btn btn-sm btn-primary"><i class="ph ph-eye"></i> View</a> ' +
-            '<button class="btn btn-sm btn-danger" onclick="deleteReport(\''+r.report_id+'\')"><i class="ph ph-trash"></i></button>' +
+            changesBtn +
+            (USER_ROLE === 'admin' ? '<button class="btn btn-sm btn-danger" onclick="deleteReport(\''+r.report_id+'\')"><i class="ph ph-trash"></i></button>' : '') +
           '</td>' +
         '</tr>';
       }).join('');
@@ -123,5 +176,82 @@ async function deleteReport(id) {
 
 loadStats();
 loadReports();
+
+// ── Show Changes Modal ──
+var _changesReportId = '', _changesUserId = '', _changesCompareUrl = '', _changesBranch = '', _changesStatus = '';
+
+async function openChangesModal(reportId, userId, compareUrl, branchName, fixStatus) {
+  _changesReportId = reportId;
+  _changesUserId = userId;
+  _changesCompareUrl = compareUrl;
+  _changesBranch = branchName;
+  _changesStatus = fixStatus;
+
+  var modal = document.getElementById('showChangesModal');
+  var body = document.getElementById('showChangesBody');
+  var footer = document.getElementById('showChangesFooter');
+  modal.style.display = 'flex';
+  body.innerHTML = '<p class="text-muted">Loading proposals…</p>';
+
+  // Build footer buttons based on fix status
+  var footerHtml = '<button class="btn btn-sm btn-ghost" onclick="closeChangesModal()">Close</button>';
+  if (fixStatus === 'pushed' && compareUrl) {
+    footerHtml = '<button class="btn btn-sm btn-ghost" onclick="closeChangesModal()">Close</button>' +
+      '<a href="' + escapeHtml(compareUrl) + '" target="_blank" class="btn btn-sm btn-success">' +
+      '<i class="ph ph-github-logo"></i> View Changes on GitHub</a>';
+  }
+  footer.innerHTML = footerHtml;
+
+  try {
+    var data = await api('/api/v1/reports/' + reportId + '/proposals');
+    var proposals = data.proposals || [];
+    _changesUserId = data.user_id || userId;
+
+    // Status banner
+    var bannerHtml = '';
+    if (fixStatus === 'pushed' && branchName) {
+      bannerHtml = '<div style="background:rgba(26,127,55,0.15);border:1px solid rgba(26,127,55,0.3);border-radius:8px;padding:12px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">' +
+        '<i class="ph ph-check-circle" style="font-size:1.4rem;color:#1a7f37;"></i>' +
+        '<div><strong style="color:#1a7f37;">Fix branch pushed successfully</strong>' +
+        '<p class="text-sm text-muted" style="margin:2px 0 0;">Branch: <code>' + escapeHtml(branchName) + '</code></p></div></div>';
+    } else if (fixStatus === 'failed') {
+      bannerHtml = '<div style="background:rgba(207,34,46,0.15);border:1px solid rgba(207,34,46,0.3);border-radius:8px;padding:12px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">' +
+        '<i class="ph ph-x-circle" style="font-size:1.4rem;color:#cf222e;"></i>' +
+        '<div><strong style="color:#cf222e;">Auto-fix push failed</strong>' +
+        '<p class="text-sm text-muted" style="margin:2px 0 0;">The fix proposals are shown below for reference.</p></div></div>';
+    } else if (fixStatus === 'no_token') {
+      bannerHtml = '<div style="background:rgba(130,80,223,0.15);border:1px solid rgba(130,80,223,0.3);border-radius:8px;padding:12px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">' +
+        '<i class="ph ph-key" style="font-size:1.4rem;color:#8250df;"></i>' +
+        '<div><strong style="color:#8250df;">No PAT token configured</strong>' +
+        '<p class="text-sm text-muted" style="margin:2px 0 0;">Register a token to enable auto-push.</p></div></div>';
+    }
+
+    if (proposals.length === 0) {
+      body.innerHTML = bannerHtml + '<div class="empty-state"><i class="ph ph-info"></i><p>No fix proposals stored for this report.</p></div>';
+      return;
+    }
+
+    body.innerHTML = bannerHtml + proposals.map(function(p, i) {
+      return '<div style="border:1px solid var(--border,#333);border-radius:8px;padding:12px;margin-bottom:12px;">' +
+        '<div style="display:flex;align-items:center;gap:8px;">' +
+          '<span class="mono text-sm" style="color:var(--primary,#7c3aed);">' + escapeHtml(p.target_file||'unknown') + '</span>' +
+          (p.line_number ? ' <span class="text-muted text-sm">:' + p.line_number + '</span>' : '') +
+          (p.risk_level ? ' <span class="badge ' + (p.risk_level==='low'?'badge-success':(p.risk_level==='medium'?'badge-warning':'badge-danger')) + '">' + escapeHtml(p.risk_level) + '</span>' : '') +
+        '</div>' +
+        (p.explanation ? '<p class="text-sm text-muted" style="margin:8px 0 4px;">' + escapeHtml(p.explanation) + '</p>' : '') +
+        '<div style="display:flex;gap:8px;margin-top:8px;">' +
+          '<div style="flex:1;"><div class="text-sm text-muted" style="margin-bottom:2px;">Original</div><pre style="background:var(--bg,#181825);padding:8px;border-radius:6px;font-size:0.8rem;overflow-x:auto;max-height:120px;">' + escapeHtml(p.original_code||'') + '</pre></div>' +
+          '<div style="flex:1;"><div class="text-sm text-muted" style="margin-bottom:2px;">Suggested</div><pre style="background:var(--bg,#181825);padding:8px;border-radius:6px;font-size:0.8rem;overflow-x:auto;max-height:120px;">' + escapeHtml(p.suggested_code||'') + '</pre></div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    body.innerHTML = '<div class="empty-state"><i class="ph ph-warning"></i><p>Failed to load proposals.</p></div>';
+  }
+}
+
+function closeChangesModal() {
+  document.getElementById('showChangesModal').style.display = 'none';
+}
 </script>
 {% endblock %}

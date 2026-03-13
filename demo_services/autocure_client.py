@@ -27,7 +27,7 @@ class AutoCureHandler(logging.Handler):
 
     Usage:
         handler = AutoCureHandler(
-            ws_url="ws://localhost:8000/ws/logs/my-service",
+            ws_url="ws://localhost:9292/ws/logs/my-service",
             level=logging.DEBUG,      # send everything
         )
         logging.getLogger().addHandler(handler)

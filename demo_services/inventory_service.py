@@ -30,7 +30,7 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).parent))
 from autocure_client import AutoCureHandler
 
-AUTOCURE_WS = os.getenv("AUTOCURE_WS", "ws://localhost:8000/ws/logs/inventory-svc")
+AUTOCURE_WS = os.getenv("AUTOCURE_WS", "ws://localhost:9292/ws/logs/inventory-svc")
 
 autocure = AutoCureHandler(ws_url=AUTOCURE_WS, level=logging.DEBUG)
 autocure.setFormatter(logging.Formatter("%(name)s - %(message)s"))

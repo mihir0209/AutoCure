@@ -44,6 +44,8 @@
 {% block scripts %}
 <script>
 var logStream = document.getElementById('logStream');
+var USER_ROLE = '{{ user.role }}';
+var USER_NAME = '{{ user.username }}';
 
 function appendLog(log) {
   var empty = document.getElementById('logEmpty');
@@ -111,9 +113,16 @@ async function loadLogs() {
 
 async function loadUserOptions() {
   try {
-    // Load from auth users list (all service accounts)
-    var data = await api('/api/v1/users');
     var select = document.getElementById('logUserFilter');
+    // Viewers can only see their own logs
+    if (USER_ROLE !== 'admin') {
+      select.innerHTML = '<option value="' + escapeHtml(USER_NAME) + '">' + escapeHtml(USER_NAME) + '</option>';
+      select.value = USER_NAME;
+      loadLogs();
+      return;
+    }
+    // Admin sees all users
+    var data = await api('/api/v1/users');
     var cur = select.value;
     select.innerHTML = '<option value="">All Users</option><option value="__server__">Server (app.log)</option>';
     (data.users || []).forEach(function(u) {

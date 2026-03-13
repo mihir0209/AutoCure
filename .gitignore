@@ -119,3 +119,8 @@ ai-fix-*
 
 reports/
 repos/
+
+# Data directory (SQLite DBs, tokens, registrations)
+data/
+data/*.db
+data/registrations.json

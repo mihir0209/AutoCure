@@ -116,6 +116,20 @@ class AuthManager:
         conn.close()
         return cur.rowcount > 0
 
+    def get_user_by_username(self, username: str) -> Optional[User]:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return User(id=row["id"], username=row["username"], role=row["role"], created_at=row["created_at"])
+
+    def user_exists(self, username: str) -> bool:
+        conn = self._conn()
+        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        return row is not None
+
     def change_password(self, user_id: int, new_password: str):
         h, salt = self._hash(new_password)
         conn = self._conn()

@@ -29,9 +29,11 @@
         <a href="/reports" class="sidebar-link {% if page == 'reports' %}active{% endif %}">
           <i class="ph ph-file-text"></i><span>Reports</span>
         </a>
+        {% if user.role == 'admin' %}
         <a href="/integration" class="sidebar-link {% if page == 'integration' %}active{% endif %}">
           <i class="ph ph-code-block"></i><span>Integration</span>
         </a>
+        {% endif %}
         <a href="/visualizer" class="sidebar-link {% if page == 'visualizer' %}active{% endif %}">
           <i class="ph ph-tree-structure"></i><span>AST Visualizer</span>
         </a>
@@ -39,7 +41,7 @@
       <div class="sidebar-footer">
         <div class="sidebar-user">
           <i class="ph ph-user-circle"></i>
-          <span>{{ user.username }}</span>
+          <span>{{ user.username }} <small style="opacity:.5;font-size:11px;">({{ user.role }})</small></span>
         </div>
         <a href="/logout" class="sidebar-link">
           <i class="ph ph-sign-out"></i><span>Logout</span>

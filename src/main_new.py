@@ -464,6 +464,7 @@ def main():
         host=config.server.host,
         port=config.server.port,
         reload=True,
+        reload_dirs=["src"],
         log_level="info",
     )
 

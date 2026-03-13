@@ -13,7 +13,7 @@
  *   const SelfHealerClient = require('./self-healer-client');
  *
  *   const client = new SelfHealerClient({
- *     serverUrl: 'ws://localhost:8000/ws/logs/your-user-id',
+ *     serverUrl: 'ws://localhost:9292/ws/logs/your-user-id',
  *     serviceName: 'my-node-service'
  *   });
  *
@@ -30,7 +30,7 @@ class SelfHealerClient {
     /**
      * Create a new Self-Healer client.
      * @param {Object} options - Configuration options
-     * @param {string} options.serverUrl - WebSocket URL (e.g., ws://localhost:8000/ws/logs/user123)
+     * @param {string} options.serverUrl - WebSocket URL (e.g., ws://localhost:9292/ws/logs/user123)
      * @param {string} [options.serviceName='unknown'] - Name of your service
      * @param {boolean} [options.autoReconnect=true] - Auto-reconnect on disconnect
      * @param {number} [options.reconnectDelay=5000] - Milliseconds before reconnecting
@@ -299,7 +299,7 @@ class SelfHealerClient {
  */
 function createClient(userId, options = {}) {
     const serverHost = options.serverHost || 'localhost';
-    const serverPort = options.serverPort || 8000;
+    const serverPort = options.serverPort || 9292;
     const serverUrl = `ws://${serverHost}:${serverPort}/ws/logs/${userId}`;
 
     const client = new SelfHealerClient({

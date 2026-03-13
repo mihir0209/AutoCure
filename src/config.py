@@ -25,7 +25,7 @@ class AIConfig(BaseModel):
     # Azure OpenAI
     azure_openai_endpoint: Optional[str] = None
     azure_openai_api_key: Optional[str] = None
-    azure_openai_deployment: str = "gpt-4o-mini"
+    azure_openai_deployment: str = "gpt-4.1-mini"
     azure_api_version: str = "2024-12-01-preview"
     max_retries: int = 5
     initial_retry_delay: float = 2.0
@@ -103,7 +103,7 @@ class GitHubConfig(BaseModel):
 class ServerConfig(BaseModel):
     """Server Configuration"""
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 9292
     websocket_path: str = "/ws/logs"
     api_prefix: str = "/api/v1"
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
@@ -157,7 +157,7 @@ def load_config() -> SystemConfig:
         cerebras_model=os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        azure_openai_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
+        azure_openai_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini"),
         azure_api_version=os.getenv("API_VERSION", "2024-12-01-preview"),
         max_retries=int(os.getenv("AI_MAX_RETRIES", "5")),
         initial_retry_delay=float(os.getenv("AI_INITIAL_RETRY_DELAY", "2.0")),
@@ -202,7 +202,7 @@ def load_config() -> SystemConfig:
     
     server_config = ServerConfig(
         host=os.getenv("SERVER_HOST", "0.0.0.0"),
-        port=int(os.getenv("SERVER_PORT", "8000")),
+        port=int(os.getenv("SERVER_PORT", "9292")),
         websocket_path=os.getenv("WEBSOCKET_PATH", "/ws/logs"),
         api_prefix=os.getenv("API_PREFIX", "/api/v1"),
         jwt_secret=os.getenv("JWT_SECRET", "change-this-jwt-secret-in-production"),

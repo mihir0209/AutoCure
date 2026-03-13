@@ -14,7 +14,7 @@ Example:
     
     # Initialize (once at startup)
     client = SelfHealerClient(
-        server_url="ws://localhost:8000/ws/logs/your-user-id",
+        server_url="ws://localhost:9292/ws/logs/your-user-id",
         service_name="my-service"
     )
     client.connect()
@@ -63,7 +63,7 @@ class SelfHealerClient:
         Initialize the Self-Healer client.
         
         Args:
-            server_url: WebSocket URL (e.g., ws://localhost:8000/ws/logs/user123)
+            server_url: WebSocket URL (e.g., ws://localhost:9292/ws/logs/user123)
             service_name: Name of your service for identification
             auto_reconnect: Whether to automatically reconnect on disconnect
             reconnect_delay: Seconds to wait before reconnecting
@@ -265,7 +265,7 @@ class SelfHealerClient:
 def create_client(
     user_id: str,
     server_host: str = "localhost",
-    server_port: int = 8000,
+    server_port: int = 9292,
     service_name: str = "python-service",
 ) -> SelfHealerClient:
     """

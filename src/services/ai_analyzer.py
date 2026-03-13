@@ -1,9 +1,11 @@
 """
 AI Analyzer Service for the Self-Healing Software System v2.0
 
-Provides AI-powered analysis using Groq/Cerebras:
-- Deep root cause analysis from error context, AST, and replication data
-- Exact fix proposal generation (precise code diffs, not vague advice)
+Features:
+- Root cause analysis with AST context + tool-calling
+- Exact fix proposal generation (precise code diffs)
+- Chat history: analysis → fix conversation is shared (saves tokens)
+- Repository tools: search_code, dir_tree, read_file (AI calls on demand)
 - Code review for pull requests
 - Robust JSON extraction with fallback parsing
 """
@@ -11,7 +13,7 @@ Provides AI-powered analysis using Groq/Cerebras:
 import asyncio
 import json
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 import aiohttp
 
@@ -75,14 +77,12 @@ def _extract_json(text: str) -> dict:
 
 class AIAnalyzer:
     """
-    AI-powered analysis service using Groq or Cerebras.
+    AI-powered analysis service with tool-calling and chat history.
 
-    Features:
-    - Root cause analysis with AST context
-    - Exact fix proposal generation (concrete code, not just advice)
-    - Code review for PRs
+    Key features:
+    - Tool calling: AI can search_code, dir_tree, read_file on demand
+    - Chat history: analysis → fix share one conversation (saves tokens)
     - Exponential backoff for rate limiting
-    - Robust JSON extraction from AI responses
     """
 
     def __init__(self, config=None):
@@ -101,26 +101,64 @@ class AIAnalyzer:
         ast_context=None,
         replication_summary: Optional[ErrorReplicationSummary] = None,
         user_id: str = "",
+        repo_path: str = "",
+        conversation: Optional[List[Dict]] = None,
     ) -> RootCauseAnalysis:
-        """Perform root cause analysis on a detected error."""
-        prompt = self._build_analysis_prompt(error, source_code, ast_context, replication_summary)
-        response = await self._call_ai(prompt, system_prompt=self._get_analysis_system_prompt())
-        return self._parse_analysis_response(response, error)
+        """
+        Perform root cause analysis on a detected error.
+
+        Args:
+            repo_path: Local repo path — enables tool-calling (search, tree, read).
+            conversation: Mutable list that will hold chat history.
+                          Pass the same list to generate_fix_proposals() to
+                          continue the same conversation (saves tokens).
+        """
+        conv = conversation if conversation is not None else []
+
+        # Build initial messages
+        system = self._get_system_prompt()
+        user_msg = self._build_analysis_prompt(error, source_code, ast_context, replication_summary)
+
+        if not conv:
+            conv.append({"role": "system", "content": system})
+        conv.append({"role": "user", "content": user_msg})
+
+        # Call AI with tool support
+        response_text = await self._call_ai_with_tools(conv, repo_path=repo_path)
+
+        return self._parse_analysis_response(response_text, error)
 
     async def generate_fix_proposals(
         self,
         error: DetectedError,
         analysis: RootCauseAnalysis,
         source_code: str,
+        ast_context=None,
         user_id: str = "",
+        repo_path: str = "",
+        conversation: Optional[List[Dict]] = None,
     ) -> List[FixProposal]:
         """
         Generate *exact* fix proposals — concrete code that can be applied.
-        These are suggestions only; the user decides whether to apply them.
+
+        If *conversation* contains the chat history from analyze_error(),
+        the AI already has all context.  Only a short follow-up message is sent,
+        saving ~60 % of tokens compared to rebuilding the full prompt.
         """
-        prompt = self._build_fix_prompt(error, analysis, source_code)
-        response = await self._call_ai(prompt, system_prompt=self._get_fix_system_prompt())
-        return self._parse_fix_response(response, error)
+        conv = conversation if conversation is not None else []
+
+        if conv:
+            # Continue existing conversation — AI already has the context
+            conv.append({"role": "user", "content": self._build_fix_followup(error)})
+        else:
+            # Standalone call (no prior conversation)
+            conv.append({"role": "system", "content": self._get_system_prompt()})
+            conv.append({"role": "user", "content": self._build_fix_prompt(
+                error, analysis, source_code, ast_context=ast_context,
+            )})
+
+        response_text = await self._call_ai_with_tools(conv, repo_path=repo_path)
+        return self._parse_fix_response(response_text, error)
 
     async def review_pull_request(
         self,
@@ -130,92 +168,52 @@ class AIAnalyzer:
     ) -> CodeReviewResult:
         """Perform AI-powered code review on a pull request."""
         prompt = self._build_review_prompt(pr_diff, pr_info)
-        response = await self._call_ai(prompt, system_prompt=self._get_review_system_prompt())
+        response = await self._call_ai_simple(prompt, system_prompt=self._get_review_system_prompt())
         return self._parse_review_response(response, pr_info)
 
     # ══════════════════════════════════════════════════════════
-    #  System Prompts (hardened for precision)
+    #  System Prompts (concise — shared for analysis + fix)
     # ══════════════════════════════════════════════════════════
 
     @staticmethod
-    def _get_analysis_system_prompt() -> str:
-        return """You are an expert software debugging engineer. Your task is to analyse an error report and determine the **exact** root cause — not symptoms.
-
-RULES:
-1. Read the error message, AST context, code, and replication data carefully.
-2. Pinpoint the EXACT line(s) and variable(s) causing the issue.
-3. Classify the category precisely (one of: null_reference, type_error, attribute_error, key_error, index_error, import_error, syntax_error, logic_error, validation_error, concurrency_error, network_error, permission_error, configuration_error, dependency_error, other).
-4. Severity must be one of: critical, high, medium, low.
-5. Confidence is 0.0-1.0 reflecting how certain you are.
-6. affected_components must list specific functions/classes/modules.
-
-Respond ONLY with valid JSON (no markdown, no explanation outside the JSON):
-{
-  "root_cause": "<precise 1-3 sentence explanation referencing exact variable/function/line>",
-  "error_category": "<category>",
-  "severity": "<severity>",
-  "affected_components": ["module.Class.method", "..."],
-  "confidence": 0.85,
-  "additional_context": "<any extra insight>"
-}"""
-
-    @staticmethod
-    def _get_fix_system_prompt() -> str:
-        return """You are an expert software engineer. Your task is to propose **exact, copy-paste-ready** code fixes.
-
-RULES:
-1. Each proposal must contain the EXACT original code AND the EXACT replacement code.
-2. The replacement must be syntactically valid and semantically correct.
-3. Keep fixes minimal — change only what is necessary.
-4. Explain WHY the fix works in 1-2 sentences.
-5. Rate risk_level as "low" (safe refactor), "medium" (behaviour change), or "high" (structural change).
-6. List concrete side_effects (empty list if none).
-7. Confidence 0.0-1.0 reflects certainty the fix resolves the issue.
-
-Respond ONLY with valid JSON (no markdown):
-{
-  "proposals": [
-    {
-      "target_file": "path/to/file.py",
-      "line_number": 42,
-      "original_code": "exact original code to replace (multi-line ok)",
-      "suggested_code": "exact replacement code (multi-line ok)",
-      "explanation": "Why this fixes the issue",
-      "risk_level": "low|medium|high",
-      "confidence": 0.9,
-      "side_effects": ["list of side effects or empty"]
-    }
-  ]
-}"""
+    def _get_system_prompt() -> str:
+        return (
+            "You are an expert software debugging engineer.\n"
+            "You have access to 3 repository tools — use them if the provided context is insufficient:\n"
+            "  search_code(query, max_results) — grep for text across the repo\n"
+            "  dir_tree(directory, depth)       — show directory structure (max 3 levels)\n"
+            "  read_file(file_path, start_line, end_line) — read file contents\n\n"
+            "PHASE 1 — When asked to ANALYSE an error:\n"
+            "  Pinpoint the EXACT root cause (line, variable, function).\n"
+            "  Respond ONLY with JSON:\n"
+            "  {\"root_cause\":\"...\", \"error_category\":\"<null_reference|type_error|attribute_error|"
+            "key_error|index_error|import_error|syntax_error|logic_error|validation_error|"
+            "concurrency_error|network_error|permission_error|configuration_error|dependency_error|other>\","
+            " \"severity\":\"<critical|high|medium|low>\", \"affected_components\":[\"mod.Class.func\"],"
+            " \"confidence\":0.85, \"additional_context\":\"...\"}\n\n"
+            "PHASE 2 — When asked to GENERATE FIX PROPOSALS:\n"
+            "  Create exact, copy-paste-ready code fixes.\n"
+            "  ONLY fix executable code — NEVER modify comments or docstrings.\n"
+            "  Respond ONLY with JSON:\n"
+            "  {\"proposals\":[{\"target_file\":\"path\", \"line_number\":42,"
+            " \"original_code\":\"exact buggy code\", \"suggested_code\":\"exact fix\","
+            " \"explanation\":\"why\", \"risk_level\":\"low|medium|high\","
+            " \"confidence\":0.9, \"side_effects\":[]}]}"
+        )
 
     @staticmethod
     def _get_review_system_prompt() -> str:
-        return """You are an expert code reviewer focusing on correctness, security, and best practices.
-
-RULES:
-1. Reference exact file paths and line numbers.
-2. severity: one of "critical", "warning", "suggestion", "info".
-3. comment_type: one of "bug", "security", "performance", "style", "documentation", "best_practice".
-4. overall_assessment: one of "approve", "request_changes", "comment".
-5. Provide a concrete suggested_fix when possible.
-6. highlights: list genuinely good things about the code.
-
-Respond ONLY with valid JSON:
-{
-  "overall_assessment": "approve|request_changes|comment",
-  "summary": "Brief summary",
-  "comments": [
-    {
-      "file_path": "path/to/file",
-      "line_number": 42,
-      "severity": "critical|warning|suggestion|info",
-      "comment_type": "bug|security|performance|style|documentation|best_practice",
-      "message": "Detailed comment",
-      "suggested_fix": "optional code suggestion"
-    }
-  ],
-  "highlights": ["good thing 1", "good thing 2"]
-}"""
+        return (
+            "You are an expert code reviewer. Focus on correctness, security, best practices.\n"
+            "Respond ONLY with JSON:\n"
+            "{\"overall_assessment\":\"approve|request_changes|comment\","
+            " \"summary\":\"...\","
+            " \"comments\":[{\"file_path\":\"...\", \"line_number\":42,"
+            " \"severity\":\"critical|warning|suggestion|info\","
+            " \"comment_type\":\"bug|security|performance|style|documentation|best_practice\","
+            " \"message\":\"...\", \"suggested_fix\":\"...\"}],"
+            " \"highlights\":[\"good thing\"]}"
+        )
 
     # ══════════════════════════════════════════════════════════
     #  Prompt Builders
@@ -229,103 +227,82 @@ Respond ONLY with valid JSON:
         replication_summary: Optional[ErrorReplicationSummary],
     ) -> str:
         parts = [
-            "## Error Analysis Request\n",
-            "### Error Details",
-            f"- **Type**: {error.error_type}",
-            f"- **Category**: {error.error_category}",
-            f"- **Message**: {error.message}",
-            f"- **File**: {error.source_file}",
-            f"- **Line**: {error.line_number}",
-            f"- **Function**: {error.function_name or 'Unknown'}",
-            f"- **Language**: {error.language}",
-            f"- **Severity**: {error.severity}",
+            "## Analyse This Error\n",
+            f"**Type**: {error.error_type}",
+            f"**Message**: {error.message}",
+            f"**File**: {error.source_file}:{error.line_number}",
+            f"**Language**: {error.language}",
         ]
+        if error.function_name:
+            parts.append(f"**Function**: {error.function_name}")
 
         if error.stack_trace:
             parts += ["", "### Stack Trace", "```", error.stack_trace[:3000], "```"]
 
         if error.api_endpoint:
-            payload_str = json.dumps(error.payload, default=str)[:800] if error.payload else "None"
-            parts += [
-                "", "### API Context",
-                f"- **Endpoint**: {error.http_method} {error.api_endpoint}",
-                f"- **Payload**: {payload_str}",
-            ]
+            parts.append(f"**Endpoint**: {error.http_method} {error.api_endpoint}")
 
-        if source_code:
-            parts += ["", "### Source Code (around error location)", "```", source_code[:5000], "```"]
-
-        # AST context — can be a pre-built string (from build_ai_context) or an ASTContext model
+        # AST-traced context (rich function bodies from call chain)
         if ast_context:
-            parts.append("\n### AST Context")
-            if isinstance(ast_context, str):
-                parts.append(ast_context[:6000])
-            elif hasattr(ast_context, 'error_node'):
-                if ast_context.error_node:
-                    n = ast_context.error_node
-                    parts.append(f"- **Error Node**: `{n.node_type}` → `{n.name}` (L{n.start_line}-{n.end_line})")
-                    if n.code_snippet:
-                        parts += ["```", n.code_snippet[:500], "```"]
-                for pn in reversed(getattr(ast_context, 'parent_nodes', [])):
-                    nt = pn.node_type.lower()
-                    if any(kw in nt for kw in ("function", "method", "def")):
-                        parts.append(f"- **Enclosing Function**: `{pn.name}` (L{pn.start_line})")
-                        break
-                for pn in reversed(getattr(ast_context, 'parent_nodes', [])):
-                    if "class" in pn.node_type.lower():
-                        parts.append(f"- **Enclosing Class**: `{pn.name}` (L{pn.start_line})")
-                        break
-                imports = getattr(ast_context, 'file_imports', [])
-                if imports:
-                    parts.append(f"- **Imports**: {', '.join(imports[:20])}")
+            ctx_str = ast_context if isinstance(ast_context, str) else ""
+            if not ctx_str and hasattr(ast_context, 'error_node') and ast_context.error_node:
+                n = ast_context.error_node
+                ctx_str = f"Error Node: {n.node_type} → {n.name} (L{n.start_line}-{n.end_line})"
+            if ctx_str:
+                parts += ["", "### AST-Traced Context", ctx_str[:6000]]
+
+        if source_code and not ast_context:
+            parts += ["", "### Source Code", "```", source_code[:4000], "```"]
 
         if replication_summary:
             parts += [
-                "", "### Error Replication Results",
-                f"- **Reproducible**: {replication_summary.is_reproducible}",
-                f"- **Reproduction Rate**: {replication_summary.reproduction_rate:.0%}",
-                f"- **Total Attempts**: {len(replication_summary.results)}",
+                "", "### Replication",
+                f"Reproducible: {replication_summary.is_reproducible}"
+                f" ({replication_summary.reproduction_rate:.0%})",
             ]
-            if replication_summary.error_patterns:
-                parts.append("- **Patterns**:")
-                for pattern in replication_summary.error_patterns[:8]:
-                    parts.append(f"  - {pattern}")
 
-        parts.append("\nAnalyse this error and respond with JSON only.")
+        parts.append("\nAnalyse this error. Use tools if you need more context. JSON only.")
         return "\n".join(parts)
+
+    @staticmethod
+    def _build_fix_followup(error: DetectedError) -> str:
+        """Short follow-up used when the analysis conversation already has context."""
+        return (
+            "Now generate exact fix proposals for the error above.\n"
+            f"Target file: {error.source_file}:{error.line_number}\n"
+            "Use tools to read the exact code around the error line if needed.\n"
+            "IMPORTANT: original_code must be the actual code from the file, "
+            "not comments. suggested_code must be the corrected replacement.\n"
+            "Respond with JSON only."
+        )
 
     def _build_fix_prompt(
         self,
         error: DetectedError,
         analysis: RootCauseAnalysis,
         source_code: str,
+        ast_context=None,
     ) -> str:
-        return f"""## Fix Proposal Request
-
-### Error
-- **Type**: {error.error_type}
-- **Message**: {error.message}
-- **File**: {error.source_file}:{error.line_number}
-- **Language**: {error.language}
-
-### Root Cause (from prior analysis)
-{analysis.root_cause}
-
-### Error Category: {analysis.error_category}
-### Severity: {analysis.severity}
-### Affected Components: {', '.join(analysis.affected_components) if analysis.affected_components else 'Unknown'}
-
-### Source Code
-```
-{source_code[:6000]}
-```
-
-Generate EXACT fix proposals. Each proposal must have the original code snippet and the corrected replacement. Focus on:
-1. The minimal change that fixes the root cause
-2. Defensive guards if the issue is a missing null/undefined check
-3. Correct types/imports if the issue is a type or import error
-
-Respond with JSON only."""
+        """Full fix prompt for standalone calls (no prior conversation)."""
+        parts = [
+            "## Generate Fix Proposals\n",
+            f"**Error**: {error.error_type} — {error.message}",
+            f"**File**: {error.source_file}:{error.line_number}",
+            f"**Root Cause**: {analysis.root_cause}",
+            f"**Category**: {analysis.error_category}",
+        ]
+        if error.stack_trace:
+            parts += ["", "### Stack Trace", "```", error.stack_trace[:2000], "```"]
+        if ast_context:
+            ctx_str = ast_context if isinstance(ast_context, str) else str(ast_context)
+            parts += ["", "### AST Context", ctx_str[:6000]]
+        if source_code:
+            parts += ["", "### Source Code", "```", source_code[:4000], "```"]
+        parts.append(
+            "\nGenerate EXACT fix proposals. original_code = actual buggy line(s), "
+            "suggested_code = corrected replacement. JSON only."
+        )
+        return "\n".join(parts)
 
     def _build_review_prompt(
         self,
@@ -340,37 +317,93 @@ Respond with JSON only."""
 
         diff_excerpt = pr_diff.get("diff", "")[:10000]
 
-        return f"""## Pull Request Code Review
-
-### PR Information
-- **Title**: {pr_diff.get('title', pr_info.title)}
-- **Author**: {pr_diff.get('author', pr_info.author)}
-- **Base Branch**: {pr_info.target_branch}
-- **Head Branch**: {pr_info.source_branch}
-- **PR #**: {pr_info.pr_number}
-
-### Description
-{(pr_diff.get('description') or pr_info.description or 'No description')[:1500]}
-
-### Files Changed ({pr_diff.get('changed_files', len(files_summary))} files)
-{chr(10).join(files_summary)}
-
-### Diff
-```diff
-{diff_excerpt}
-```
-
-Review this pull request for bugs, security issues, performance problems, and style.
-Respond with JSON only."""
+        return (
+            f"## PR Review: {pr_diff.get('title', pr_info.title)}\n"
+            f"Author: {pr_diff.get('author', pr_info.author)}\n"
+            f"Base: {pr_info.target_branch} ← {pr_info.source_branch}\n\n"
+            f"### Files Changed\n{chr(10).join(files_summary)}\n\n"
+            f"### Diff\n```diff\n{diff_excerpt}\n```\n\n"
+            "Review for bugs, security, performance. JSON only."
+        )
 
     # ══════════════════════════════════════════════════════════
-    #  AI API Call (with exponential backoff)
+    #  AI API — tool-calling loop (with chat history)
     # ══════════════════════════════════════════════════════════
 
-    async def _call_ai(self, prompt: str, system_prompt: str = "") -> str:
+    async def _call_ai_with_tools(
+        self,
+        messages: List[Dict],
+        repo_path: str = "",
+        max_rounds: int = 5,
+    ) -> str:
+        """
+        Call the AI with tool-calling support.
+
+        The AI may request tool calls (search_code, dir_tree, read_file).
+        Each tool result is appended to *messages* (the chat history) and
+        another round is sent — up to *max_rounds* iterations.
+
+        Returns the final text content from the AI.
+        """
+        from services.repo_tools import get_repo_index, execute_tool, TOOL_DEFINITIONS
+
+        repo_index = get_repo_index(repo_path) if repo_path else None
+        tools = TOOL_DEFINITIONS if repo_index else None
+
+        for round_num in range(max_rounds + 1):
+            response_msg = await self._raw_api_call(messages, tools=tools)
+
+            tool_calls = response_msg.get("tool_calls") or []
+            content = response_msg.get("content") or ""
+
+            if not tool_calls or not repo_index or round_num >= max_rounds:
+                # Final answer — append and return
+                if content:
+                    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                messages.append({"role": "assistant", "content": content})
+                return content
+
+            # Append the assistant's tool-calling message (preserves tool_calls field)
+            messages.append(response_msg)
+
+            # Execute each requested tool
+            for tc in tool_calls:
+                func_name = tc["function"]["name"]
+                try:
+                    func_args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    func_args = {}
+
+                result = execute_tool(repo_index, func_name, func_args)
+                # Cap tool output to control token usage
+                result = result[:4000]
+
+                logger.info(
+                    f"Tool [{round_num+1}] {func_name}"
+                    f"({', '.join(f'{k}={v!r}' for k, v in func_args.items())}) "
+                    f"→ {len(result)} chars"
+                )
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+        return "{}"
+
+    # ──────────────────────────────────────────────────────────
+    #  Raw API call (single request, supports tools)
+    # ──────────────────────────────────────────────────────────
+
+    async def _raw_api_call(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """Make one API call and return the response message dict."""
         is_azure = self.config.provider == "azure"
 
-        # Build URL and headers based on provider
         if is_azure:
             url = (
                 f"{self.config.active_base_url}"
@@ -387,19 +420,16 @@ Respond with JSON only."""
                 "Content-Type": "application/json",
             }
 
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
+        payload: Dict[str, Any] = {
             "messages": messages,
             "temperature": 0.2,
             "max_tokens": self.config.max_tokens,
         }
-        # Azure doesn't need model in body (it's in the URL), others do
         if not is_azure:
             payload["model"] = self.config.active_model
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
         delay = self.base_delay
 
@@ -414,10 +444,7 @@ Respond with JSON only."""
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
-                            content = data["choices"][0]["message"]["content"]
-                            # Strip reasoning tags
-                            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-                            return content.strip()
+                            return data["choices"][0]["message"]
 
                         elif response.status == 429:
                             retry_after = response.headers.get("Retry-After")
@@ -441,7 +468,21 @@ Respond with JSON only."""
                 delay = min(delay * 2, 30)
 
         logger.error("All AI API retries exhausted")
-        return "{}"
+        return {"content": "{}"}
+
+    # ──────────────────────────────────────────────────────────
+    #  Legacy simple call (for code review — no tools needed)
+    # ──────────────────────────────────────────────────────────
+
+    async def _call_ai_simple(self, prompt: str, system_prompt: str = "") -> str:
+        """Single request-response call without tools (used for PR reviews)."""
+        messages: List[Dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        msg = await self._raw_api_call(messages)
+        content = msg.get("content", "")
+        return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
     # ══════════════════════════════════════════════════════════
     #  Response Parsers
@@ -479,7 +520,6 @@ Respond with JSON only."""
             ))
 
         if not proposals and data:
-            # AI might have returned a single proposal not wrapped in array
             if "suggested_code" in data or "original_code" in data:
                 proposals.append(FixProposal(
                     target_file=data.get("target_file", str(error.source_file or "unknown")),

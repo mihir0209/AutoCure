@@ -103,7 +103,7 @@ class LogAnalyzer:
         http_method, api_endpoint = self._extract_api_info(log)
         
         # Categorize error
-        error_type, error_category = self._categorize_error(log.message, language)
+        error_type, error_category = self._categorize_error(log.message, language, log.stack_trace)
         
         # Check for autocure-try flag
         is_autocure_try = self._check_autocure_flag(log)
@@ -136,13 +136,13 @@ class LogAnalyzer:
         """Detect the programming language from error message or stack trace."""
         text = f"{message} {stack_trace or ''}"
         
+        # Python indicators (checked first — TypeError:/etc also appear in Python tracebacks)
+        if any(x in text for x in ["Traceback", ".py:", "File \""]):
+            return "python"
+        
         # JavaScript indicators
         if any(x in text for x in ["TypeError:", "ReferenceError:", ".js:", "node_modules"]):
             return "javascript"
-        
-        # Python indicators
-        if any(x in text for x in ["Traceback", ".py:", "File \"", "line "]):
-            return "python"
         
         # Java indicators
         if any(x in text for x in [".java:", "at com.", "at org.", "Exception:", "NullPointerException"]):
@@ -215,19 +215,28 @@ class LogAnalyzer:
         
         return None, None
     
-    def _categorize_error(self, message: str, language: str) -> Tuple[str, str]:
+    def _categorize_error(self, message: str, language: str, stack_trace: Optional[str] = None) -> Tuple[str, str]:
         """Categorize the error type and category."""
         
         message_lower = message.lower()
         
-        # Extract error type from message
+        # Extract error type from message first, then fall back to stack_trace
         error_type = "UnknownError"
-        for lang_patterns in self.ERROR_PATTERNS.values():
-            for pattern in lang_patterns:
-                match = re.search(pattern, message)
-                if match:
-                    error_type = match.group(1) if match.lastindex else "Error"
+        for text in [message, stack_trace or ""]:
+            if error_type != "UnknownError":
+                break
+            for lang_patterns in self.ERROR_PATTERNS.values():
+                if error_type != "UnknownError":
                     break
+                for pattern in lang_patterns:
+                    match = re.search(pattern, text)
+                    if match:
+                        error_type = match.group(1) if match.lastindex else "Error"
+                        break
+
+        # Also check stack_trace for category keywords
+        if stack_trace:
+            message_lower = (message + " " + stack_trace).lower()
         
         # Determine category
         if any(x in message_lower for x in ["undefined", "null", "none", "nil"]):

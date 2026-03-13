@@ -60,6 +60,12 @@ class ASTTraceContext:
     source_code: str = ""
     error_context_code: str = ""  # Code around error line
     requirements: Optional[ProjectRequirements] = None
+    # Rich context built from AST tracing (stored for report display)
+    ai_context: str = ""
+    # Call chain extracted from stack trace: [(file, line, func), ...]
+    call_chain: List[Tuple[str, int, str]] = field(default_factory=list)
+    # Full function bodies collected for AI
+    traced_functions: Dict[str, str] = field(default_factory=dict)  # "file:func" -> body
 
 
 class ASTTraceService:
@@ -94,7 +100,7 @@ class ASTTraceService:
         error_file: str,
         error_line: int,
         repo_path: str,
-        source_code: Optional[str] = None
+        source_code: Optional[str] = None,
     ) -> ASTTraceContext:
         """
         Build complete AST trace for an error.
@@ -157,7 +163,8 @@ class ASTTraceService:
             context.references = self._resolve_references(
                 context.references, repo_path
             )
-            
+        
+        if context.source_code:
             # Parse referenced files (limited depth)
             for ref in context.references[:5]:  # Limit to 5 references
                 if ref.resolved_path and ref.resolved_path not in context.referenced_files:
@@ -188,7 +195,7 @@ class ASTTraceService:
             result.append(f"{marker}{i:4d} | {line}")
         
         return '\n'.join(result)
-    
+
     def _find_error_path(self, root: ASTNode, error_line: int) -> List[ASTNode]:
         """Find the path from root to the error line."""
         path = []
@@ -532,52 +539,293 @@ class ASTTraceService:
                 reqs.dependencies[package] = version
         return reqs
     
-    def build_ai_context(self, trace: ASTTraceContext) -> str:
+    def build_ai_context(self, trace: ASTTraceContext, repo_path: str = "") -> str:
         """
-        Build a rich context string for AI analysis.
-        
-        This creates a structured message that includes:
-        - Error location and context code
-        - AST path to error
-        - Cross-file references
-        - Project dependencies
+        Build a rich context string for AI analysis using AST tracing.
+
+        Strategy (bottom-up from error):
+        1. Parse the stack-trace / call chain to identify multi-file frames.
+        2. For the bottom 3 frames (closest to error): include **full function bodies**.
+        3. For frames above that: include only the call-site lines + surrounding context.
+        4. Prepend import lines of every involved file.
+        5. Store the result on ``trace.ai_context`` so the report can display it.
         """
-        sections = []
-        
-        # Error location
+        sections: list[str] = []
+
+        # ── 1. Error location headline ──
         sections.append(f"## Error Location\n")
-        sections.append(f"File: `{trace.error_file}`\n")
-        sections.append(f"Line: {trace.error_line}\n")
-        
-        # Context code with error line marked
-        if trace.error_context_code:
-            sections.append(f"\n## Code Context\n")
-            sections.append(f"```\n{trace.error_context_code}\n```\n")
-        
-        # AST path
+        sections.append(f"File: `{trace.error_file}` | Line: {trace.error_line}\n")
+
+        # ── 2. Parse call chain from stack trace (if available) ──
+        call_chain = trace.call_chain  # filled by main.py _build_call_chain
+
+        # ── 3. Collect full function bodies for the bottom N frames ──
+        FULL_BODY_DEPTH = 3
+        traced_functions: dict[str, str] = {}  # "file:func_name" -> body text
+
+        if call_chain:
+            sections.append("\n## Call Chain (from stack trace, innermost first)\n")
+            for idx, (cc_file, cc_line, cc_func) in enumerate(call_chain):
+                tag = "→ " if idx == 0 else "  "
+                sections.append(f"{tag}`{cc_file}:{cc_line}` in `{cc_func or '?'}`\n")
+
+            # Resolve function bodies for each frame
+            for idx, (cc_file, cc_line, cc_func) in enumerate(call_chain):
+                body = self._extract_function_body_at_line(
+                    cc_file, cc_line, trace, repo_path=repo_path
+                )
+                if body is None:
+                    continue
+                func_key = f"{cc_file}:{cc_func or f'L{cc_line}'}"
+                traced_functions[func_key] = body
+
+                if idx < FULL_BODY_DEPTH:
+                    sections.append(f"\n### [{idx+1}] Full function — `{func_key}`\n")
+                    sections.append(f"```\n{body}\n```\n")
+                else:
+                    # Just the call-site context (±3 lines)
+                    snippet = self._extract_context_lines_from_body(
+                        body, cc_line, context_lines=3
+                    )
+                    if snippet:
+                        sections.append(f"\n### [{idx+1}] Call-site — `{func_key}`\n")
+                        sections.append(f"```\n{snippet}\n```\n")
+        else:
+            # No call chain — fall back to error_path from AST
+            body = self._extract_function_body_at_line(
+                trace.error_file, trace.error_line, trace, repo_path=repo_path
+            )
+            if body:
+                func_label = trace.error_file
+                if trace.error_path:
+                    for node in reversed(trace.error_path):
+                        if "function" in node.node_type or "def" in node.node_type:
+                            func_label = f"{trace.error_file}:{node.name}"
+                            break
+                traced_functions[func_label] = body
+                sections.append(f"\n### Error function — `{func_label}`\n")
+                sections.append(f"```\n{body}\n```\n")
+            elif trace.error_context_code:
+                sections.append(f"\n### Code Context (±10 lines around error)\n")
+                sections.append(f"```\n{trace.error_context_code}\n```\n")
+
+        # ── 4. Import lines for involved files ──
+        involved_files: set[str] = set()
+        if call_chain:
+            involved_files = {cc[0] for cc in call_chain}
+        if trace.error_file:
+            involved_files.add(trace.error_file)
+
+        import_sections: list[str] = []
+        for ifile in sorted(involved_files):
+            imports = self._extract_import_lines(ifile, trace)
+            if imports:
+                import_sections.append(f"`{ifile}` imports:\n```\n{imports}\n```\n")
+        if import_sections:
+            sections.append("\n## Import Context\n")
+            sections.extend(import_sections)
+
+        # ── 5. AST path to error ──
         if trace.error_path:
             sections.append(f"\n## AST Path to Error\n")
             for i, node in enumerate(trace.error_path):
                 indent = "  " * i
-                sections.append(f"{indent}└─ {node.node_type}: {node.name} "
-                              f"(lines {node.start_line}-{node.end_line})\n")
-        
-        # Cross-file references
+                sections.append(f"{indent}└─ {node.node_type}: `{node.name}` "
+                              f"(L{node.start_line}-{node.end_line})\n")
+
+        # ── 6. Cross-file references ──
         if trace.references:
             sections.append(f"\n## Cross-File References\n")
-            for ref in trace.references[:10]:  # Limit
+            for ref in trace.references[:10]:
                 resolved = "✓" if ref.resolved_path else "✗"
-                sections.append(f"- [{resolved}] Line {ref.line_number}: "
+                sections.append(f"- [{resolved}] L{ref.line_number}: "
                               f"{ref.ref_type} `{ref.symbol_name}` from `{ref.to_file}`\n")
-        
-        # Dependencies
+
+        # ── 7. Dependencies ──
         if trace.requirements:
-            sections.append(f"\n## Project Dependencies ({trace.requirements.language})\n")
-            sections.append(f"Manifest: `{trace.requirements.manifest_file}`\n")
-            for pkg, ver in list(trace.requirements.dependencies.items())[:20]:
+            sections.append(f"\n## Dependencies ({trace.requirements.language})\n")
+            for pkg, ver in list(trace.requirements.dependencies.items())[:15]:
                 sections.append(f"- {pkg}: {ver}\n")
-        
-        return ''.join(sections)
+
+        context_str = ''.join(sections)
+        trace.ai_context = context_str
+        trace.traced_functions = traced_functions
+        return context_str
+
+    # ------------------------------------------------------------------
+    # Helpers for rich context building
+    # ------------------------------------------------------------------
+
+    def _extract_function_body_at_line(
+        self, rel_file: str, line_no: int, trace: ASTTraceContext,
+        repo_path: str = "",
+    ) -> Optional[str]:
+        """Extract the full body of the function surrounding *line_no* in *rel_file*.
+
+        Uses the AST tree if available (accurate line ranges), otherwise
+        does an indentation-based extraction from source text.
+        """
+        # Determine which AST / source to use
+        source = None
+        ast_root = None
+
+        # If it's the error file, use what we already have
+        if rel_file == trace.error_file:
+            source = trace.source_code
+            ast_root = trace.main_ast
+        else:
+            # Check referenced files
+            for ref_path, ref_ast in trace.referenced_files.items():
+                # rel_file could be "utils/validator.py" while ref_path is absolute
+                if ref_path.replace("\\", "/").endswith(rel_file.replace("\\", "/")):
+                    ast_root = ref_ast
+                    try:
+                        with open(ref_path, "r", encoding="utf-8") as fh:
+                            source = fh.read()
+                    except Exception:
+                        pass
+                    break
+
+            # Fallback: read directly from repo if not in referenced_files
+            if source is None and repo_path:
+                disk_path = os.path.join(repo_path, rel_file)
+                if os.path.isfile(disk_path):
+                    try:
+                        with open(disk_path, "r", encoding="utf-8") as fh:
+                            source = fh.read()
+                        # Also parse the AST for this file so we get accurate end lines
+                        lang = self.ast_service.detect_language(rel_file)
+                        if lang:
+                            ast_root = self.ast_service.parse_code(source, lang, rel_file)
+                            # Cache in referenced_files for future use
+                            if ast_root:
+                                trace.referenced_files[disk_path] = ast_root
+                    except Exception:
+                        pass
+
+        if not source:
+            return None
+
+        lines = source.split("\n")
+
+        # Try AST-based extraction first
+        if ast_root:
+            enclosing = self._find_enclosing_function(ast_root, line_no)
+            if enclosing and enclosing.start_line > 0 and enclosing.end_line > 0:
+                start = enclosing.start_line - 1
+                end = min(enclosing.end_line, len(lines))
+                body_lines = []
+                for idx in range(start, end):
+                    ln = idx + 1
+                    marker = ">>> " if ln == line_no else "    "
+                    body_lines.append(f"{marker}{ln:4d} | {lines[idx]}")
+                return "\n".join(body_lines)
+
+        # Fallback: indentation-based function detection (Python)
+        return self._extract_function_body_by_indent(lines, line_no)
+
+    @staticmethod
+    def _find_enclosing_function(root: ASTNode, line_no: int) -> Optional[ASTNode]:
+        """Walk the AST to find the tightest function/method node enclosing *line_no*."""
+        best: Optional[ASTNode] = None
+
+        def walk(node: ASTNode):
+            nonlocal best
+            if node.start_line <= line_no <= node.end_line:
+                nt = node.node_type.lower()
+                if any(kw in nt for kw in ("function", "def", "method", "lambda")):
+                    if best is None or (node.end_line - node.start_line) < (best.end_line - best.start_line):
+                        best = node
+                for child in node.children:
+                    walk(child)
+
+        walk(root)
+        return best
+
+    @staticmethod
+    def _extract_function_body_by_indent(lines: list[str], target_line: int) -> Optional[str]:
+        """For Python code without tree-sitter: find function by walking backwards to 'def'."""
+        if target_line < 1 or target_line > len(lines):
+            return None
+        # Walk backwards from target_line to find nearest `def`
+        func_start = None
+        func_indent = None
+        for i in range(target_line - 1, -1, -1):
+            stripped = lines[i].strip()
+            if re.match(r"(?:async\s+)?def\s+\w+\s*\(", stripped):
+                func_start = i
+                func_indent = len(lines[i]) - len(lines[i].lstrip())
+                break
+            if re.match(r"class\s+\w+", stripped):
+                # Went past a class boundary without finding def — stop
+                break
+
+        if func_start is None:
+            return None
+
+        # Walk forward to find function end
+        func_end = func_start + 1
+        for i in range(func_start + 1, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            cur_indent = len(lines[i]) - len(lines[i].lstrip())
+            if cur_indent <= func_indent:
+                break
+            func_end = i + 1
+
+        body_lines = []
+        for idx in range(func_start, func_end):
+            ln = idx + 1
+            marker = ">>> " if ln == target_line else "    "
+            body_lines.append(f"{marker}{ln:4d} | {lines[idx]}")
+        return "\n".join(body_lines)
+
+    @staticmethod
+    def _extract_context_lines_from_body(
+        body: str, target_line: int, context_lines: int = 3
+    ) -> Optional[str]:
+        """From a function body string, extract only ±N lines around *target_line*."""
+        result = []
+        for raw_line in body.split("\n"):
+            # Parse the line number from our format: "    NNNN | code"
+            m = re.match(r"^(?:>>> )?\s*(\d+)\s*\|", raw_line)
+            if m:
+                ln = int(m.group(1))
+                if abs(ln - target_line) <= context_lines:
+                    result.append(raw_line)
+        return "\n".join(result) if result else None
+
+    def _extract_import_lines(
+        self, rel_file: str, trace: ASTTraceContext
+    ) -> str:
+        """Return only the import / from-import lines of a file."""
+        source = None
+        if rel_file == trace.error_file:
+            source = trace.source_code
+        else:
+            for ref_path in trace.referenced_files:
+                if ref_path.replace("\\", "/").endswith(rel_file.replace("\\", "/")):
+                    try:
+                        with open(ref_path, "r", encoding="utf-8") as fh:
+                            source = fh.read()
+                    except Exception:
+                        pass
+                    break
+
+        if not source:
+            return ""
+
+        import_lines = []
+        for line in source.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                import_lines.append(stripped)
+            elif stripped.startswith("const ") and "require(" in stripped:
+                import_lines.append(stripped)
+            elif stripped.startswith("import ") or "} from " in stripped:
+                import_lines.append(stripped)
+        return "\n".join(import_lines)
 
 
 # ==========================================

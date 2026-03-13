@@ -31,7 +31,7 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config, get_config
-from utils.logger import setup_colored_logger
+from utils.logger import setup_colored_logger, get_ws_log_buffer
 from utils.models import (
     LogEntry, DetectedError, WebSocketMessage, WebSocketConnection,
     UserRegistration, RepositoryInfo, PRInfo, ErrorSeverity,
@@ -41,6 +41,7 @@ from services import (
     get_github_service, get_error_replicator,
 )
 from database.report_store import get_report_store, REPORTS_DIR
+from database.token_store import get_token_store
 from auth import get_auth_manager
 # Import AST trace and confidence validation services
 try:
@@ -179,6 +180,9 @@ manager = ConnectionManager()
 # User registrations: user_id -> UserRegistration
 user_registrations: Dict[str, UserRegistration] = {}
 
+# Ownership mapping: service user_id -> auth username of creator
+_registration_owners: Dict[str, str] = {}
+
 # Repository info: user_id -> RepositoryInfo
 user_repos: Dict[str, RepositoryInfo] = {}
 
@@ -187,7 +191,19 @@ _REGISTRATIONS_FILE = Path(__file__).parent.parent / "data" / "registrations.jso
 
 
 def _save_registrations():
-    """Persist user registrations to JSON file."""
+    """Persist user registrations to SQLite token store (and JSON backup)."""
+    token_store = get_token_store()
+    for uid, reg in user_registrations.items():
+        token_store.save_registration(
+            user_id=reg.user_id,
+            email=reg.email,
+            repo_url=reg.repo_url,
+            repo_token=reg.repo_token,
+            base_branch=reg.base_branch,
+            notification_email=reg.notification_email,
+            owner=_registration_owners.get(uid, ''),
+        )
+    # Also write JSON backup (without tokens for safety)
     _REGISTRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     for uid, reg in user_registrations.items():
@@ -195,7 +211,7 @@ def _save_registrations():
             "user_id": reg.user_id,
             "email": reg.email,
             "repo_url": reg.repo_url,
-            "repo_token": reg.repo_token,
+            "repo_token": "",
             "base_branch": reg.base_branch,
             "notification_email": reg.notification_email,
         }
@@ -203,14 +219,40 @@ def _save_registrations():
 
 
 def _load_registrations():
-    """Load persisted user registrations from JSON file."""
+    """Load persisted user registrations from SQLite token store (fallback to JSON)."""
+    token_store = get_token_store()
+    db_regs = token_store.get_all_registrations()
+
+    if db_regs:
+        # Load from DB (primary source)
+        for uid, info in db_regs.items():
+            _registration_owners[uid] = info.pop("owner", "")
+            user_registrations[uid] = UserRegistration(**info)
+        logger.info(f"Loaded {len(db_regs)} registrations from token store")
+        return
+
+    # Fallback: migrate from JSON file
     if not _REGISTRATIONS_FILE.exists():
         return
     try:
         data = json.loads(_REGISTRATIONS_FILE.read_text())
         for uid, info in data.items():
+            _registration_owners[uid] = ""  # No owner info in legacy JSON
             user_registrations[uid] = UserRegistration(**info)
-        logger.info(f"Loaded {len(data)} persisted registrations")
+            # Migrate to DB
+            token_store.save_registration(
+                user_id=info.get("user_id", uid),
+                email=info.get("email", ""),
+                repo_url=info.get("repo_url", ""),
+                repo_token=info.get("repo_token", ""),
+                base_branch=info.get("base_branch", "main"),
+                notification_email=info.get("notification_email"),
+            )
+        logger.info(f"Migrated {len(data)} registrations from JSON to token store")
+        # Rewrite JSON without tokens
+        for uid in data:
+            data[uid]["repo_token"] = ""
+        _REGISTRATIONS_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
         logger.warning(f"Failed to load registrations: {e}")
 
@@ -218,6 +260,136 @@ def _load_registrations():
 # ============================================================================
 # Error Analysis Pipeline
 # ============================================================================
+
+def _normalize_source_file(source_file: str, repo_path: str) -> str:
+    """Convert an absolute source_file path to a repo-relative path.
+    
+    Stack traces contain absolute paths from wherever the service runs
+    (e.g. D:/temp/project/app.py) which differ from the cloned repo path
+    (e.g. D:/SelfHealer/repos/user/repo/app.py).  We match by trying
+    increasingly shorter path suffixes against actual files in the repo.
+    """
+    import os as _os
+    src = source_file.replace("\\", "/")
+    repo = repo_path.replace("\\", "/").rstrip("/") + "/"
+
+    # Already relative?
+    if not _os.path.isabs(src):
+        return source_file
+
+    # If path is already inside the repo clone
+    if src.startswith(repo):
+        return src[len(repo):]
+
+    # Try matching path suffixes against files in the repo
+    parts = src.split("/")
+    for i in range(len(parts)):
+        candidate = "/".join(parts[i:])
+        if _os.path.isabs(candidate):
+            continue        # skip — would defeat os.path.join on Windows
+        full = _os.path.join(repo_path, candidate)
+        if _os.path.isfile(full):
+            return candidate
+
+    # Last resort: just return the basename
+    return _os.path.basename(source_file)
+
+
+def _normalize_line_number(
+    reported_line: int,
+    source_file: str,
+    repo_path: str,
+    stack_trace: str | None,
+) -> int:
+    """Map a line number from the running instance to the correct repo line.
+
+    The running instance may have extra lines (e.g. autocure imports) that
+    don't exist in the repo checkout.  We solve this by:
+      1. Extracting the actual source line from the stack trace.
+      2. Finding that exact line in the repo file.
+    Falls back to the original line number if we can't determine a better one.
+    """
+    import os as _os, re as _re
+    if not stack_trace or not source_file or reported_line <= 0:
+        return reported_line
+
+    full_path = _os.path.join(repo_path, source_file)
+    if not _os.path.isfile(full_path):
+        return reported_line
+
+    # Extract the source code line printed in the Python traceback.
+    # Python tracebacks look like:
+    #   File "...", line 103, in test_type_error
+    #       result = "hello" + 42
+    # We look for lines that follow the File ".../source_file", line N pattern.
+    basename = _os.path.basename(source_file)
+    code_lines_from_tb: list[str] = []
+    tb_lines = stack_trace.splitlines()
+    for i, tl in enumerate(tb_lines):
+        if _re.search(rf'File\s+"[^"]*{_re.escape(basename)}"\s*,\s*line\s+{reported_line}', tl):
+            # The next line(s) in the traceback are the actual source code
+            for j in range(i + 1, min(i + 3, len(tb_lines))):
+                candidate = tb_lines[j].strip()
+                if candidate and not candidate.startswith("File ") and not candidate.startswith("Traceback"):
+                    code_lines_from_tb.append(candidate)
+                    break
+            break
+
+    if not code_lines_from_tb:
+        return reported_line
+
+    # Read the repo file and search for the extracted code line
+    try:
+        with open(full_path, "r", encoding="utf-8") as fh:
+            repo_lines = fh.readlines()
+    except Exception:
+        return reported_line
+
+    target = code_lines_from_tb[0]
+    # Try exact match first, then stripped match
+    for line_no, repo_line in enumerate(repo_lines, 1):
+        if repo_line.strip() == target:
+            if line_no != reported_line:
+                logger.info(f"Line number remapped: {reported_line} → {line_no} "
+                           f"(matched: {target!r})")
+            return line_no
+
+    return reported_line
+
+
+def _build_call_chain(
+    stack_trace: str,
+    repo_path: str,
+) -> list[tuple[str, int, str]]:
+    """Parse a Python stack trace into a call chain: [(rel_file, line, func), ...].
+
+    Returns frames in innermost-first order (the crash site is at index 0).
+    Only frames that resolve to files inside *repo_path* are included.
+    """
+    import os as _os, re as _re
+    frames: list[tuple[str, int, str]] = []
+    if not stack_trace:
+        return frames
+
+    for m in _re.finditer(
+        r'File\s+"([^"]+)"\s*,\s*line\s+(\d+)(?:\s*,\s*in\s+(\S+))?',
+        stack_trace,
+    ):
+        abs_file, line_str, func_name = m.group(1), m.group(2), m.group(3) or ""
+        abs_file = abs_file.replace("\\", "/")
+        line_no = int(line_str)
+
+        # Try to make it repo-relative using _normalize_source_file
+        rel = _normalize_source_file(abs_file, repo_path)
+        # Verify it actually exists in the repo
+        candidate = _os.path.join(repo_path, rel)
+        if _os.path.isfile(candidate):
+            frames.append((rel, line_no, func_name))
+
+    # Stack traces list outermost first; reverse for innermost first
+    frames.reverse()
+    return frames
+
 
 async def analyze_error(user_id: str, log_entry: LogEntry):
     """
@@ -238,7 +410,28 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         log_analyzer = get_log_analyzer()
         ai_analyzer = get_ai_analyzer()
         email_service = get_email_service()
-        
+        github_service = get_github_service()
+
+        # 0. Pull the latest repo code before analysis
+        repo_info = user_repos.get(user_id)
+        if repo_info and repo_info.local_path:
+            registration = user_registrations.get(user_id)
+            token = ""
+            if registration:
+                token = registration.access_token or registration.repo_token or ""
+            logger.info(f"Pulling latest code for {user_id} before analysis...")
+            pull_ok = await github_service.pull_repository(user_id, token=token)
+            if pull_ok:
+                logger.info(f"✓ Repo pull succeeded for {user_id}")
+                # Invalidate search index so tools see fresh code
+                try:
+                    from services.repo_tools import invalidate_repo_index
+                    invalidate_repo_index(str(repo_info.local_path))
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"Repo pull failed for {user_id} — analysing with existing code")
+
         # 1. Parse the error
         detected_error = log_analyzer.analyze_log(log_entry)
         
@@ -259,6 +452,28 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         
         logger.info(f"Detected error: {detected_error.error_type} - {detected_error.message[:50]}")
 
+        # Normalize source_file to repo-relative path
+        # Stack traces contain absolute paths from the running instance which differ
+        # from the cloned repo path. Convert by matching path suffixes.
+        repo_info = user_repos.get(user_id)
+        if repo_info and repo_info.local_path and detected_error.source_file:
+            detected_error.source_file = _normalize_source_file(
+                detected_error.source_file, str(repo_info.local_path)
+            )
+            logger.info(f"Normalised source file: {detected_error.source_file}")
+
+            # Normalize line number — the running instance may have extra lines
+            # (e.g. autocure imports) that don't exist in the repo.
+            detected_error.line_number = _normalize_line_number(
+                reported_line=detected_error.line_number or 0,
+                source_file=detected_error.source_file,
+                repo_path=str(repo_info.local_path),
+                stack_trace=detected_error.stack_trace,
+            )
+
+        # Compute repo_path early — used by AST trace AND AI tool-calling
+        repo_path = str(repo_info.local_path) if repo_info and repo_info.local_path else ""
+
         # Broadcast to dashboard watchers
         asyncio.create_task(manager.broadcast_dashboard({
             "type": "error",
@@ -268,21 +483,30 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         
         # 2. Build AST trace for error context (if possible)
         ast_trace = None
-        repo_info = user_repos.get(user_id)
         
         if get_ast_trace_service and detected_error.source_file and detected_error.source_file != "unknown":
             try:
                 ast_trace_service = get_ast_trace_service()
-                repo_path = str(repo_info.local_path) if repo_info and repo_info.local_path else ""
                 
                 ast_trace = ast_trace_service.trace_error(
                     error_file=detected_error.source_file,
                     error_line=detected_error.line_number or 1,
                     repo_path=repo_path,
-                    source_code=None  # Will read from file
+                    source_code=None,  # Will read from file
                 )
                 logger.info(f"AST trace built: {len(ast_trace.error_path)} nodes in path, "
                            f"{len(ast_trace.references)} references")
+
+                # Populate call chain from stack trace so rich context can use it
+                if detected_error.stack_trace and repo_info and repo_info.local_path:
+                    ast_trace.call_chain = _build_call_chain(
+                        detected_error.stack_trace,
+                        str(repo_info.local_path),
+                    )
+                    if ast_trace.call_chain:
+                        logger.info(f"Call chain ({len(ast_trace.call_chain)} frames): "
+                                   f"{' → '.join(f'{f}:{l}' for f, l, _ in ast_trace.call_chain[:5])}")
+
             except Exception as e:
                 logger.warning(f"AST trace failed (continuing without it): {e}")
                 ast_trace = None
@@ -297,15 +521,23 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         if ast_trace and ast_trace.main_ast and ast_trace_service:
             # Build AI context from AST trace
             try:
-                ast_context = ast_trace_service.build_ai_context(ast_trace)
+                ast_context = ast_trace_service.build_ai_context(
+                    ast_trace,
+                    repo_path=str(repo_info.local_path) if repo_info and repo_info.local_path else "",
+                )
             except Exception as e:
                 logger.warning(f"Failed to build AI context from AST trace: {e}")
         
+        # Chat history — shared between analysis and fix generation (saves tokens)
+        conversation = []
+
         analysis = await ai_analyzer.analyze_error(
             error=detected_error,
             ast_context=ast_context,
             source_code=ast_trace.error_context_code if ast_trace else None,
             user_id=user_id,
+            repo_path=repo_path,
+            conversation=conversation,
         )
         
         logger.info(f"AI Analysis complete - Initial Confidence: {analysis.confidence:.0%}")
@@ -348,7 +580,10 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
                 error=detected_error,
                 analysis=analysis,
                 source_code=ast_trace.error_context_code if ast_trace else "",
+                ast_context=ast_context,
                 user_id=user_id,
+                repo_path=repo_path,
+                conversation=conversation,
             )
             
             if fix_proposals:
@@ -369,7 +604,121 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         if registration and hasattr(registration, 'notification_email') and registration.notification_email:
             to_email = registration.notification_email
         
-        # 7. Send email notification with AST trace and validation results
+        # Compute confidence early (needed for auto-apply and email)
+        confidence_score = validation_result.confidence_score if validation_result else (analysis.confidence * 100)
+        confidence_met = validation_result.confidence_met if validation_result else (confidence_score >= 75)
+
+        # 7. Auto-apply fix proposals and push corrected branch (BEFORE email so branch info is included)
+        branch_info = {"branch_name": "", "branch_url": "", "compare_url": "", "fix_status": "pending"}
+
+        if fix_proposals and confidence_met:
+            repo_info = user_repos.get(user_id)
+            token = ""
+            if registration:
+                token = registration.access_token or registration.repo_token or ""
+            _placeholders = {"your_github_token_here", "your_token_here", "changeme", ""}
+            has_token = token and token.strip().lower() not in _placeholders
+            has_repo = repo_info and repo_info.local_path
+
+            if has_token and has_repo and registration:
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                branch_name = f"autocure/fix-{ts}"
+                base_branch = registration.base_branch or "main"
+                commit_msg = (
+                    f"AutoCure: Fix {detected_error.error_type}\n\n"
+                    f"Root cause: {analysis.root_cause[:200]}\n"
+                    f"Confidence: {confidence_score:.0f}%\n"
+                    f"Automatically generated by the Self-Healing System."
+                )
+
+                logger.info(f"Auto-applying {len(fix_proposals)} fix(es) → branch {branch_name}")
+                asyncio.create_task(manager.broadcast_dashboard({
+                    "type": "fix",
+                    "message": f"[{user_id}] Auto-applying fixes → {branch_name}",
+                    "user_id": user_id,
+                }))
+
+                try:
+                    # Create branch
+                    branch_ok = await github_service.create_branch(user_id, branch_name, base_branch)
+                    if not branch_ok:
+                        raise RuntimeError(f"Failed to create branch {branch_name}")
+
+                    applied = 0
+                    failed_files = []
+                    for prop in fix_proposals:
+                        if prop.target_file and prop.suggested_code:
+                            try:
+                                ok = await github_service.apply_fix_to_file(
+                                    user_id, prop.target_file,
+                                    prop.original_code, prop.suggested_code,
+                                )
+                                if ok:
+                                    applied += 1
+                                    logger.info(f"Fix applied: {prop.target_file}")
+                                else:
+                                    failed_files.append(prop.target_file)
+                                    logger.warning(f"Fix not applied: {prop.target_file}")
+                            except Exception as file_err:
+                                failed_files.append(prop.target_file)
+                                logger.warning(f"Fix error for {prop.target_file}: {file_err}")
+
+                    if applied == 0:
+                        raise RuntimeError(f"No fixes could be applied (failed: {', '.join(failed_files)})")
+
+                    if failed_files:
+                        logger.warning(f"Partial fix: {applied} applied, {len(failed_files)} failed ({', '.join(failed_files)})")
+
+                    commit_sha = await github_service.commit_and_push(
+                        user_id, branch_name, commit_msg, token
+                    )
+                    # Switch back to base
+                    await github_service.switch_branch(user_id, base_branch)
+
+                    if not commit_sha:
+                        raise RuntimeError("Push failed — no commit SHA returned")
+
+                    host, owner, repo_name = github_service._parse_repo_url(registration.repo_url)
+                    branch_info = {
+                        "branch_name": branch_name,
+                        "branch_url": f"https://github.com/{owner}/{repo_name}/tree/{branch_name}",
+                        "compare_url": f"https://github.com/{owner}/{repo_name}/compare/{base_branch}...{branch_name}",
+                        "fix_status": "pushed",
+                        "commit_sha": commit_sha,
+                        "files_modified": applied,
+                    }
+                    logger.info(f"✓ Fix branch pushed: {branch_info['branch_url']}")
+                    asyncio.create_task(manager.broadcast_dashboard({
+                        "type": "fix",
+                        "message": f"[{user_id}] Fix pushed → {branch_name} ({applied} file(s))",
+                        "user_id": user_id,
+                        "branch_url": branch_info["branch_url"],
+                        "compare_url": branch_info["compare_url"],
+                    }))
+
+                except Exception as auto_err:
+                    logger.error(f"Auto-apply failed: {auto_err}")
+                    import traceback as _tb
+                    _tb.print_exc()
+                    branch_info["fix_status"] = "failed"
+                    branch_info["error"] = str(auto_err)
+                    # Try switching back to base branch
+                    try:
+                        base = (registration.base_branch or "main") if registration else "main"
+                        await github_service.switch_branch(user_id, base)
+                    except Exception:
+                        pass
+            else:
+                if not has_token:
+                    logger.info(f"No PAT token for {user_id} — skipping auto-push")
+                    branch_info["fix_status"] = "no_token"
+                if not has_repo:
+                    logger.info(f"No cloned repo for {user_id} — skipping auto-push")
+                    branch_info["fix_status"] = "no_repo"
+        elif not confidence_met:
+            branch_info["fix_status"] = "low_confidence"
+
+        # 8. Send email notification with AST trace, validation results, and branch info
         #    Also saves HTML report to disk + SQLite index
         email_result = await email_service.send_analysis_email(
             to_email=to_email,
@@ -378,6 +727,7 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
             ast_trace=ast_trace,
             validation_result=validation_result,
             user_id=user_id,
+            branch_info=branch_info,
         )
         report_id = email_result.get("report_id", "")
         report_url = email_result.get("report_url", "")
@@ -387,29 +737,56 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
             logger.info(f"Email sent to {to_email}")
         else:
             logger.info(f"Report saved (email {'disabled' if not config.email.enable_notifications else 'skipped'})")
-        
-        # 8. Notify via WebSocket
-        confidence_score = validation_result.confidence_score if validation_result else (analysis.confidence * 100)
-        confidence_met = validation_result.confidence_met if validation_result else (confidence_score >= 75)
-        
+
+        # Store branch info in report DB
+        if report_id and (branch_info.get("branch_url") or branch_info.get("fix_status") != "pending"):
+            try:
+                from database.report_store import get_report_store
+                store = get_report_store()
+                store.update_branch_info(
+                    report_id=report_id,
+                    branch_name=branch_info.get("branch_name", ""),
+                    branch_url=branch_info.get("branch_url", ""),
+                    compare_url=branch_info.get("compare_url", ""),
+                    fix_status=branch_info.get("fix_status", "pending"),
+                )
+            except Exception as db_err:
+                logger.warning(f"Failed to store branch info in report: {db_err}")
+
+        # 9. Notify via WebSocket
+        ws_payload = {
+            "error_type": detected_error.error_type,
+            "root_cause": analysis.root_cause,
+            "confidence": confidence_score,
+            "confidence_met": confidence_met,
+            "ast_trace_available": ast_trace is not None,
+            "validation_iterations": len(validation_result.iterations) if validation_result else 0,
+            "fix_proposals_count": len(fix_proposals),
+            "fix_summary": fix_proposals[0].explanation[:100] if fix_proposals else "No fix proposal generated",
+            "email_sent": email_sent,
+            "report_id": report_id,
+            "report_url": report_url,
+        }
         await manager.send_message(user_id, WebSocketMessage(
             type="analysis_complete",
             user_id=user_id,
-            payload={
-                "error_type": detected_error.error_type,
-                "root_cause": analysis.root_cause,
-                "confidence": confidence_score,
-                "confidence_met": confidence_met,
-                "ast_trace_available": ast_trace is not None,
-                "validation_iterations": len(validation_result.iterations) if validation_result else 0,
-                "fix_proposals_count": len(fix_proposals),
-                "fix_summary": fix_proposals[0].explanation[:100] if fix_proposals else "No fix proposal generated",
-                "email_sent": email_sent,
-                "report_id": report_id,
-                "report_url": report_url,
-            },
+            payload=ws_payload,
         ))
-        
+
+        # If fix was pushed, also send fix_pushed WS notification
+        if branch_info.get("fix_status") == "pushed":
+            await manager.send_message(user_id, WebSocketMessage(
+                type="fix_pushed",
+                user_id=user_id,
+                payload={
+                    "branch_name": branch_info.get("branch_name", ""),
+                    "commit_sha": branch_info.get("commit_sha", ""),
+                    "branch_url": branch_info.get("branch_url", ""),
+                    "compare_url": branch_info.get("compare_url", ""),
+                    "files_modified": branch_info.get("files_modified", 0),
+                },
+            ))
+
         logger.info(f"Analysis complete for user {user_id}")
         
     except Exception as e:
@@ -472,10 +849,56 @@ async def lifespan(app: FastAPI):
             logger.debug("Periodic log cache flush completed")
 
     flush_task = asyncio.create_task(_flush_loop())
+
+    # Periodic git pull for all registered repos (keeps local repos up-to-date)
+    pull_interval = config.github.pull_interval_minutes * 60  # Convert to seconds
+
+    async def _periodic_pull_loop():
+        while True:
+            await asyncio.sleep(pull_interval)
+            github_service = get_github_service()
+            for uid in list(user_registrations.keys()):
+                repo_info = user_repos.get(uid)
+                if repo_info and repo_info.local_path:
+                    try:
+                        success = await github_service.pull_repository(uid)
+                        if success:
+                            logger.info(f"Cron pull: {uid} updated")
+                        else:
+                            logger.warning(f"Cron pull: {uid} failed")
+                    except Exception as e:
+                        logger.warning(f"Cron pull error for {uid}: {e}")
+            logger.info(f"Periodic pull completed for {len(user_repos)} repo(s)")
+
+    pull_task = asyncio.create_task(_periodic_pull_loop())
+    logger.info(f"  Periodic pull: every {config.github.pull_interval_minutes} min")
+
+    # Real-time server log broadcasting to dashboard (drains logger buffer every 1s)
+    _ws_buf, _ws_lock = get_ws_log_buffer()
+
+    async def _log_broadcast_loop():
+        while True:
+            await asyncio.sleep(1)
+            entries = []
+            with _ws_lock:
+                while _ws_buf:
+                    entries.append(_ws_buf.popleft())
+            for entry in entries:
+                try:
+                    await manager.broadcast_dashboard({
+                        "type": "server_log",
+                        **entry,
+                    })
+                except Exception:
+                    pass
+
+    log_broadcast_task = asyncio.create_task(_log_broadcast_loop())
     
     yield
 
     flush_task.cancel()
+    pull_task.cancel()
+    log_broadcast_task.cancel()
     
     # Cleanup
     logger.info("═" * 60)
@@ -551,6 +974,35 @@ async def page_logout(request: Request):
     return resp
 
 
+@app.get("/signup", include_in_schema=False)
+async def page_signup(request: Request):
+    if _get_user(request):
+        return RedirectResponse("/")
+    return _tpl.TemplateResponse("signup.html", {"request": request})
+
+
+@app.post("/signup", include_in_schema=False)
+async def page_signup_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    username = username.strip()
+    if not username or not password:
+        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username and password are required"})
+    if len(username) < 3:
+        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username must be at least 3 characters"})
+    if len(password) < 4:
+        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Password must be at least 4 characters"})
+    if _auth.user_exists(username):
+        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username already taken"})
+    try:
+        _auth.create_user(username, password, role="viewer")
+    except Exception:
+        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Could not create account"})
+    user = _auth.verify_user(username, password)
+    token = _auth.create_session(user)
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie("session_token", token, httponly=True, samesite="lax", max_age=86400 * 7)
+    return resp
+
+
 @app.get("/", include_in_schema=False)
 async def page_dashboard(request: Request):
     user = _get_user(request)
@@ -588,6 +1040,8 @@ async def page_integration(request: Request):
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
+    if user.role != "admin":
+        return RedirectResponse("/")
     scheme = request.url.scheme
     ws_scheme = "wss" if scheme == "https" else "ws"
     server_url = f"{scheme}://{request.url.netloc}"
@@ -725,7 +1179,7 @@ async def websocket_dashboard(websocket: WebSocket):
 # ============================================================================
 
 @app.post("/api/v1/register")
-async def register_user(registration: UserRegistration, background_tasks: BackgroundTasks):
+async def register_user(registration: UserRegistration, request: Request, background_tasks: BackgroundTasks):
     """
     Register a new user with their repository access.
     
@@ -749,6 +1203,11 @@ async def register_user(registration: UserRegistration, background_tasks: Backgr
     if user_id in user_registrations:
         raise HTTPException(status_code=409, detail="User already registered")
     
+    # Track which authenticated user created this registration
+    caller = _get_user(request)
+    owner = caller.username if caller else ""
+    _registration_owners[user_id] = owner
+
     user_registrations[user_id] = registration
     _save_registrations()  # Persist to disk
     
@@ -821,6 +1280,11 @@ async def unregister_user(user_id: str):
     
     del user_registrations[user_id]
     _save_registrations()  # Persist to disk
+    # Also remove from token store
+    try:
+        get_token_store().delete_registration(user_id)
+    except Exception:
+        pass
 
     if user_id in user_repos:
         del user_repos[user_id]
@@ -973,10 +1437,17 @@ async def get_repo_file_ast(user_id: str, request: Request):
 
 
 @app.get("/api/v1/repos/registered")
-async def list_registered_repos():
-    """List all registered users and their repos for the dashboard."""
+async def list_registered_repos(request: Request):
+    """List registered repos. Admins see all; viewers see only their own."""
+    caller = _get_user(request)
     repos = []
+    logger.debug(f"list_registered_repos: {len(user_registrations)} registrations, caller={caller.username if caller else 'anon'}")
     for uid, reg in user_registrations.items():
+        # Viewers only see registrations they own or that match their username
+        if caller and caller.role != "admin":
+            owner = _registration_owners.get(uid, '')
+            if owner and owner != caller.username and uid != caller.username:
+                continue
         repo_info = user_repos.get(uid)
         repos.append({
             "user_id": uid,
@@ -1096,6 +1567,295 @@ async def trigger_analysis(user_id: str, background_tasks: BackgroundTasks):
         "status": "queued",
         "message": f"Analysis started for {min(len(errors), 5)} error(s)",
         "error_count": len(errors),
+    }
+
+
+# ============================================================================
+# REST API Endpoints - Apply Fix Proposals
+# ============================================================================
+
+@app.post("/api/v1/repo/{user_id}/apply-fix")
+async def apply_fix_proposal(user_id: str, request: Request, background_tasks: BackgroundTasks):
+    """
+    Apply a fix proposal to the user's repository:
+    1. Create a new branch (autocure/fix-<timestamp>)
+    2. Apply the code edits to the target files
+    3. Commit and push the branch to GitHub
+    4. Return the branch name and push URL
+
+    Request body: {
+        "fixes": [
+            {
+                "target_file": "src/server.js",
+                "original_code": "old code...",
+                "suggested_code": "new code...",
+                "explanation": "Fix description"
+            }
+        ],
+        "branch_name": "optional-custom-branch-name",
+        "commit_message": "optional custom commit message"
+    }
+    """
+    if user_id not in user_registrations:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    registration = user_registrations[user_id]
+    repo_info = user_repos.get(user_id)
+    if not repo_info:
+        raise HTTPException(status_code=404, detail="Repository not cloned yet. Sync the repo first.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    fixes = body.get("fixes", [])
+    if not fixes:
+        raise HTTPException(status_code=400, detail="No fixes provided. Expected 'fixes' array.")
+
+    token = registration.access_token or registration.repo_token or ""
+    _placeholders = {"your_github_token_here", "your_token_here", "changeme", ""}
+    if not token or token.strip().lower() in _placeholders:
+        raise HTTPException(status_code=400, detail="No valid GitHub token for this user. Cannot push changes.")
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    branch_name = body.get("branch_name", "") or f"autocure/fix-{ts}"
+    commit_message = body.get("commit_message", "") or f"AutoCure: Apply {len(fixes)} fix(es)\n\nAutomatically generated by the Self-Healing System."
+
+    github_service = get_github_service()
+
+    async def _apply_and_push():
+        try:
+            base_branch = registration.base_branch or "main"
+
+            # 1. Create fix branch
+            success = await github_service.create_branch(user_id, branch_name, base_branch)
+            if not success:
+                logger.error(f"Failed to create branch {branch_name} for {user_id}")
+                await manager.broadcast_dashboard({
+                    "type": "fix",
+                    "message": f"[{user_id}] Fix branch creation failed: {branch_name}",
+                    "user_id": user_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                return
+
+            # 2. Apply each fix
+            applied = 0
+            for fix in fixes:
+                target_file = fix.get("target_file", "")
+                original_code = fix.get("original_code", "")
+                suggested_code = fix.get("suggested_code", "")
+                if not target_file or not suggested_code:
+                    continue
+
+                ok = await github_service.apply_fix_to_file(
+                    user_id, target_file, original_code, suggested_code
+                )
+                if ok:
+                    applied += 1
+                    logger.info(f"Fix applied: {target_file}")
+                else:
+                    logger.warning(f"Fix not applied: {target_file} (original code not found)")
+
+            if applied == 0:
+                logger.warning(f"No fixes were applied for {user_id}")
+                # Switch back to base branch
+                await github_service.switch_branch(user_id, base_branch)
+                await manager.broadcast_dashboard({
+                    "type": "fix",
+                    "message": f"[{user_id}] No fixes could be applied (code not found in files)",
+                    "user_id": user_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                return
+
+            # 3. Commit and push
+            commit_sha = await github_service.commit_and_push(
+                user_id, branch_name, commit_message, token
+            )
+
+            # 4. Switch back to base branch
+            await github_service.switch_branch(user_id, base_branch)
+
+            if commit_sha:
+                # Build the branch URL
+                host, owner, repo_name = github_service._parse_repo_url(registration.repo_url)
+                branch_url = f"https://github.com/{owner}/{repo_name}/tree/{branch_name}"
+                compare_url = f"https://github.com/{owner}/{repo_name}/compare/{base_branch}...{branch_name}"
+
+                logger.info(f"✓ Fix branch pushed: {branch_url}")
+                await manager.broadcast_dashboard({
+                    "type": "fix",
+                    "message": f"[{user_id}] Fix pushed: {branch_name} ({applied} file(s) modified)",
+                    "user_id": user_id,
+                    "branch_url": branch_url,
+                    "compare_url": compare_url,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+
+                # Send email notification about the fix branch
+                cfg = get_config()
+                to_email = registration.notification_email or registration.email or cfg.email.admin_email
+                if cfg.email.enable_notifications and to_email:
+                    email_service = get_email_service()
+                    try:
+                        await email_service.send_generic_email(
+                            to_email=to_email,
+                            subject=f"AutoCure Fix Applied: {branch_name}",
+                            html_body=f"""
+                            <h2>AutoCure Fix Applied</h2>
+                            <p>A fix has been automatically applied and pushed to your repository.</p>
+                            <ul>
+                                <li><strong>Branch:</strong> {branch_name}</li>
+                                <li><strong>Commit:</strong> {commit_sha[:8]}</li>
+                                <li><strong>Files Modified:</strong> {applied}</li>
+                            </ul>
+                            <p><a href="{compare_url}">Review changes and create PR</a></p>
+                            <p><a href="{branch_url}">View branch</a></p>
+                            """,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to send fix notification email: {e}")
+            else:
+                logger.error(f"Push failed for {user_id} branch {branch_name}")
+                await manager.broadcast_dashboard({
+                    "type": "fix",
+                    "message": f"[{user_id}] Fix commit/push failed for {branch_name}",
+                    "user_id": user_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+        except Exception as e:
+            logger.error(f"Apply-fix pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Ensure we switch back to base branch
+            try:
+                await github_service.switch_branch(user_id, registration.base_branch or "main")
+            except Exception:
+                pass
+
+    background_tasks.add_task(_apply_and_push)
+    return {
+        "status": "queued",
+        "message": f"Applying {len(fixes)} fix(es) to branch '{branch_name}'",
+        "branch_name": branch_name,
+        "fixes_count": len(fixes),
+    }
+
+
+@app.get("/api/v1/repo/{user_id}/branches")
+async def list_repo_branches(user_id: str):
+    """List remote branches for a user's repository."""
+    if user_id not in user_registrations:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    registration = user_registrations[user_id]
+    token = registration.access_token or registration.repo_token or ""
+    if not token:
+        raise HTTPException(status_code=400, detail="No GitHub token available")
+
+    github_service = get_github_service()
+    branches = await github_service.list_remote_branches(user_id, token)
+    return {"user_id": user_id, "branches": branches}
+
+
+@app.post("/api/v1/review/{user_id}/branch")
+async def review_branch(user_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Trigger a code review for a specific branch (compared against base branch)."""
+    if user_id not in user_registrations:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    branch = body.get("branch", "")
+    if not branch:
+        raise HTTPException(status_code=400, detail="'branch' is required")
+
+    registration = user_registrations[user_id]
+    base_branch = body.get("base_branch", "") or registration.base_branch or "main"
+    token = registration.access_token or registration.repo_token or ""
+    if not token:
+        raise HTTPException(status_code=400, detail="No GitHub token available")
+
+    github_service = get_github_service()
+    ai_analyzer = get_ai_analyzer()
+    email_service = get_email_service()
+
+    host, owner, repo_name = github_service._parse_repo_url(registration.repo_url)
+
+    async def _review_branch():
+        try:
+            # Get branch diff
+            diff = await github_service.get_branch_diff(owner, repo_name, branch, base_branch, token)
+            if not diff:
+                logger.warning(f"No diff for branch {branch} vs {base_branch}")
+                return
+
+            pr_info = PRInfo(
+                pr_id=f"branch-{branch}",
+                pr_number=0,
+                title=f"Branch Review: {branch}",
+                description=f"Auto-review of branch '{branch}' against '{base_branch}'",
+                source_branch=branch,
+                target_branch=base_branch,
+                author=diff.get("author", ""),
+                repo_url=registration.repo_url,
+            )
+
+            review_result = await ai_analyzer.review_pull_request(diff, pr_info, user_id=user_id)
+            logger.info(f"Branch {branch} reviewed: score={review_result.overall_score}")
+
+            # Save report
+            report_html = email_service._build_review_email(review_result)
+            store = get_report_store()
+            import uuid as _uuid
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            rpt_filename = f"review_{ts}_branch_{branch}_{_uuid.uuid4().hex[:6]}.html"
+            rpt_path = REPORTS_DIR / rpt_filename
+            rpt_path.write_text(report_html, encoding="utf-8")
+            report_id = store.insert(
+                file_path=str(rpt_path),
+                file_name=rpt_filename,
+                report_type="review",
+                user_id=user_id,
+                error_type=f"Branch Review: {branch}",
+                severity=review_result.overall_assessment or "comment",
+                confidence=review_result.overall_score / 10.0 if review_result.overall_score else 0.0,
+                root_cause=review_result.summary[:500] if review_result.summary else "",
+                source_file=f"{owner}/{repo_name}",
+                line_number=0,
+                proposals_count=len(review_result.comments),
+            )
+
+            # Send email
+            cfg = get_config()
+            to_email = registration.notification_email or registration.email or cfg.email.admin_email
+            if cfg.email.enable_notifications and to_email:
+                await email_service.send_code_review_email(to_email=to_email, review=review_result)
+
+            # Notify dashboard
+            await manager.broadcast_dashboard({
+                "type": "review_complete",
+                "message": f"[{user_id}] Branch review: {branch} (score: {review_result.overall_score})",
+                "user_id": user_id,
+                "report_id": report_id,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        except Exception as e:
+            logger.error(f"Branch review failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    background_tasks.add_task(_review_branch)
+    return {
+        "status": "queued",
+        "message": f"Code review started for branch '{branch}' vs '{base_branch}'",
+        "branch": branch,
+        "base_branch": base_branch,
     }
 
 
@@ -1595,9 +2355,12 @@ async def get_supported_languages():
 
 
 @app.get("/api/v1/users")
-async def list_dashboard_users():
-    """List all dashboard users (auth DB)."""
+async def list_dashboard_users(request: Request):
+    """List dashboard users. Admins see all; viewers see only themselves."""
+    caller = _get_user(request)
     users = _auth.list_users()
+    if caller and caller.role != "admin":
+        users = [u for u in users if u.username == caller.username]
     return {
         "users": [
             {"id": u.id, "username": u.username, "role": u.role, "created_at": u.created_at}
@@ -1607,8 +2370,12 @@ async def list_dashboard_users():
 
 
 @app.get("/api/v1/connections")
-async def get_connections():
-    """Get all active WebSocket connections."""
+async def get_connections(request: Request):
+    """Get active WebSocket connections (scoped by role)."""
+    caller = _get_user(request)
+    conns = manager.active_connections.values()
+    if caller and caller.role != "admin":
+        conns = [c for c in conns if c.user_id == caller.username]
     return {
         "connections": [
             {
@@ -1618,25 +2385,43 @@ async def get_connections():
                 "logs_received": conn.logs_received,
                 "errors_detected": conn.errors_detected,
             }
-            for conn in manager.active_connections.values()
+            for conn in conns
         ]
     }
 
 
 @app.get("/api/v1/dashboard/summary")
-async def dashboard_summary():
-    """Get a summary of the system state for the dashboard."""
-    total_logs = sum(len(logs) for logs in manager.log_buffers.values())
+async def dashboard_summary(request: Request):
+    """Get a summary of the system state for the dashboard (scoped by role)."""
+    caller = _get_user(request)
+    is_admin = not caller or caller.role == "admin"
+
+    if is_admin:
+        visible_uids = set(user_registrations.keys())
+    else:
+        visible_uids = set()
+        for uid, reg in user_registrations.items():
+            owner = _registration_owners.get(uid, '')
+            if (owner and owner == caller.username) or uid == caller.username:
+                visible_uids.add(uid)
+
+    total_logs = sum(len(logs) for uid, logs in manager.log_buffers.items() if is_admin or uid in visible_uids)
     total_errors = sum(
         sum(1 for log in logs if log.level.upper() in ("ERROR", "FATAL", "CRITICAL"))
-        for logs in manager.log_buffers.values()
+        for uid, logs in manager.log_buffers.items() if is_admin or uid in visible_uids
     )
+    active_conns = len(manager.active_connections) if is_admin else sum(
+        1 for uid in manager.active_connections if uid in visible_uids
+    )
+    reg_count = len(user_registrations) if is_admin else len(visible_uids)
+    repos_synced = len(user_repos) if is_admin else sum(1 for uid in user_repos if uid in visible_uids)
+
     store = get_report_store()
     report_stats = store.stats()
     return {
-        "active_connections": len(manager.active_connections),
-        "registered_users": len(user_registrations),
-        "repositories_synced": len(user_repos),
+        "active_connections": active_conns,
+        "registered_users": reg_count,
+        "repositories_synced": repos_synced,
         "total_logs": total_logs,
         "total_errors": total_errors,
         "total_reports": report_stats.get("total", 0),
@@ -1682,6 +2467,10 @@ async def list_reports(
                 "proposals_count": r.proposals_count,
                 "created_at": r.created_at,
                 "view_url": f"/api/v1/reports/{r.report_id}/view",
+                "branch_name": getattr(r, 'branch_name', ''),
+                "branch_url": getattr(r, 'branch_url', ''),
+                "compare_url": getattr(r, 'compare_url', ''),
+                "fix_status": getattr(r, 'fix_status', 'pending'),
             }
             for r in reports
         ],
@@ -1705,6 +2494,13 @@ async def get_report_meta(report_id: str):
     rec = store.get(report_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Report not found")
+    # Parse proposals_json back to a list
+    proposals = []
+    if rec.proposals_json:
+        try:
+            proposals = json.loads(rec.proposals_json)
+        except json.JSONDecodeError:
+            proposals = []
     return {
         "report_id": rec.report_id,
         "user_id": rec.user_id,
@@ -1717,9 +2513,26 @@ async def get_report_meta(report_id: str):
         "file_name": rec.file_name,
         "report_type": rec.report_type,
         "proposals_count": rec.proposals_count,
+        "proposals": proposals,
         "created_at": rec.created_at,
         "view_url": f"/api/v1/reports/{rec.report_id}/view",
     }
+
+
+@app.get("/api/v1/reports/{report_id}/proposals")
+async def get_report_proposals(report_id: str):
+    """Get fix proposals for a specific report (for the Apply Fix UI)."""
+    store = get_report_store()
+    rec = store.get(report_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Report not found")
+    proposals = []
+    if rec.proposals_json:
+        try:
+            proposals = json.loads(rec.proposals_json)
+        except json.JSONDecodeError:
+            proposals = []
+    return {"report_id": report_id, "user_id": rec.user_id, "proposals": proposals}
 
 
 @app.get("/api/v1/reports/{report_id}/view")
@@ -1772,7 +2585,8 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 def main():
     """Entry point for the server."""
-    print(r"""
+    try:
+        print(r"""
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
     ║           ░█▀█░█░█░▀█▀░█▀█░░░░░█▀▀░█░█░█▀▄░█▀▀                ║    
@@ -1782,7 +2596,9 @@ def main():
     ║           AI-Driven AUTO-CURE Software System                 ║
     ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
-    """)
+        """)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print("\n    === AUTO-CURE  Self-Healing Software System ===\n")
     
     config = get_config()
     

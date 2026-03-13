@@ -584,7 +584,7 @@ class ReportGenerator:
         error_type = error.error_type if error else "Unknown"
         error_msg = _esc((error.message if error else "")[:500])
         source_file = str(error.source_file) if error else "unknown"
-        line_number = error.line_number if error else 0
+        line_number = (error.line_number or 0) if error else 0
         severity = (analysis.severity if analysis else "medium").lower()
         severity_color = _SEVERITY_COLORS.get(severity, "#6c757d")
         confidence = analysis.confidence if analysis else 0.5
@@ -798,6 +798,21 @@ class ReportGenerator:
                 f'<div style="margin-top:6px;">{"".join(ref_tree_parts)}</div></details>'
             )
 
+        # 6. AI Context — what was actually sent to the AI for analysis/fix
+        if getattr(trace, 'ai_context', None):
+            # Convert markdown-ish context to HTML-safe pre block
+            ctx_html = _esc(trace.ai_context)
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;color:var(--fg);margin-bottom:6px;">'
+                '<i class="ph ph-brain" style="font-size:13px;"></i> Context Sent to AI</summary>'
+                '<div style="background:rgba(88,166,255,.06);border:1px solid var(--border);'
+                'border-radius:6px;padding:14px;margin-top:6px;max-height:600px;overflow:auto;">'
+                f'<pre style="white-space:pre-wrap;word-wrap:break-word;font-size:12px;'
+                f'line-height:1.5;color:var(--fg);margin:0;">{ctx_html}</pre>'
+                '</div></details>'
+            )
+
         if not parts:
             return ""
 
@@ -980,6 +995,7 @@ class EmailService:
         ast_trace: Optional['ASTTraceContext'] = None,
         validation_result: Optional['ValidationResult'] = None,
         user_id: str = "",
+        branch_info: Optional[dict] = None,
     ) -> dict:
         """
         Send an error-analysis email with embedded AST parser trace.
@@ -1030,7 +1046,7 @@ class EmailService:
             if confidence_met:
                 email_html = self._build_high_confidence_email(
                     analysis, proposals, ast_trace, validation_result,
-                    report_path, report_url,
+                    report_path, report_url, branch_info=branch_info,
                 )
             else:
                 email_html = self._build_low_confidence_email(
@@ -1095,6 +1111,12 @@ class EmailService:
         path.write_text(html_content, encoding="utf-8")
 
         error = _get_error(analysis) if analysis else None
+        # Serialize fix proposals so the UI can retrieve and apply them
+        proposals_json = ""
+        if proposals:
+            proposals_json = json_mod.dumps(
+                [p.model_dump() for p in proposals], default=str
+            )
         store = get_report_store()
         report_id = store.insert(
             file_path=str(path),
@@ -1106,8 +1128,9 @@ class EmailService:
             confidence=(analysis.confidence if analysis else 0.0),
             root_cause=(analysis.root_cause if analysis else "")[:500],
             source_file=str(error.source_file) if error else "",
-            line_number=error.line_number if error else 0,
+            line_number=(error.line_number or 0) if error else 0,
             proposals_count=len(proposals) if proposals else 0,
+            proposals_json=proposals_json,
         )
         logger.info(f"Report saved -> {path} (id={report_id})")
         return str(path), report_id
@@ -1124,12 +1147,13 @@ class EmailService:
         validation_result,
         report_path: str,
         report_url: str = "",
+        branch_info: Optional[dict] = None,
     ) -> str:
         error = _get_error(analysis)
         error_type = _esc(error.error_type if error else "Unknown")
         error_msg = _esc((error.message if error else "")[:500])
         source_file = _esc(str(error.source_file) if error else "unknown")
-        line_number = error.line_number if error else 0
+        line_number = (error.line_number or 0) if error else 0
         severity = (analysis.severity if analysis else "medium").lower()
         sv_color = _SEVERITY_COLORS.get(severity, "#6c757d")
         root_cause = _esc(analysis.root_cause if analysis else "Unknown")
@@ -1186,6 +1210,8 @@ class EmailService:
       <p style="color:#57606a;font-size:12px;margin-top:6px;">The full report contains interactive AST visualization, detailed proposals, and more.</p>
     </div>
 
+    {self._email_branch_section(branch_info)}
+
     <!-- Root Cause -->
     <div class="sec">
       <h2 class="sec-title">&#128269; Root Cause Analysis</h2>
@@ -1233,7 +1259,7 @@ class EmailService:
         error_type = _esc(error.error_type if error else "Unknown")
         error_msg = _esc((error.message if error else "")[:500])
         source_file = _esc(str(error.source_file) if error else "unknown")
-        line_number = error.line_number if error else 0
+        line_number = (error.line_number or 0) if error else 0
         severity = (analysis.severity if analysis else "medium").lower()
         sv_color = _SEVERITY_COLORS.get(severity, "#6c757d")
         category = _esc(analysis.error_category if analysis else "unknown")
@@ -1538,6 +1564,20 @@ class EmailService:
                 f'<div style="margin-top:6px;">{"".join(rf_parts)}</div></details>'
             )
 
+        # 6. AI Context — what was actually sent to the AI
+        if getattr(trace, 'ai_context', None):
+            ctx_html = _esc(trace.ai_context)
+            parts.append(
+                '<details style="border-left:none;padding-left:0;">'
+                '<summary style="font-size:14px;font-weight:600;">'
+                '&#129504; Context Sent to AI</summary>'
+                '<div style="background:#f0f6ff;border:1px solid #d0d7de;'
+                'border-radius:6px;padding:14px;margin-top:6px;max-height:600px;overflow:auto;">'
+                f'<pre style="white-space:pre-wrap;word-wrap:break-word;font-size:12px;'
+                f'line-height:1.5;color:#24292f;margin:0;">{ctx_html}</pre>'
+                '</div></details>'
+            )
+
         if not parts:
             return ""
 
@@ -1655,9 +1695,51 @@ class EmailService:
             f'<ul style="padding-left:20px;font-size:13px;">{items}</ul></div>'
         )
 
+    def _email_branch_section(self, branch_info: Optional[dict]) -> str:
+        """Branch push status section for the email, shown just below 'View Report' button."""
+        if not branch_info:
+            return ""
+        status = branch_info.get("fix_status", "pending")
+        branch_name = _esc(branch_info.get("branch_name", ""))
+        compare_url = branch_info.get("compare_url", "")
+        files_mod = branch_info.get("files_modified", 0)
+
+        if status == "pushed" and compare_url:
+            return (
+                '<div style="background:#dafbe1;border:1px solid #aceebb;border-radius:8px;'
+                'padding:16px;margin:0 0 18px;text-align:center;">'
+                '<p style="margin:0 0 4px;font-size:15px;font-weight:700;color:#1a7f37;">'
+                '&#9989; Fix Branch Pushed Successfully</p>'
+                f'<p style="margin:0 0 10px;color:#1a7f37;font-size:13px;">'
+                f'Branch: <code style="background:#aceebb;padding:2px 6px;border-radius:3px;">{branch_name}</code>'
+                f' &bull; {files_mod} file(s) modified</p>'
+                f'<a href="{compare_url}" style="display:inline-block;padding:10px 24px;'
+                'background:#1a7f37;color:#fff;border-radius:6px;text-decoration:none;'
+                'font-weight:600;font-size:14px;">&#128279; View Changes on GitHub</a>'
+                '</div>'
+            )
+        elif status == "failed":
+            err_msg = _esc(branch_info.get("error", "Unknown error"))
+            return (
+                '<div style="background:#ffebe9;border:1px solid #ffcecb;border-radius:8px;'
+                'padding:14px;margin:0 0 18px;text-align:center;">'
+                '<p style="margin:0 0 4px;font-size:14px;font-weight:600;color:#cf222e;">'
+                '&#10060; Auto-Fix Push Failed</p>'
+                f'<p style="margin:0;color:#cf222e;font-size:12px;">{err_msg}</p>'
+                '</div>'
+            )
+        # no_token, low_confidence, pending — don't show anything
+        return ""
+
     # ══════════════════════════════════════════════════════════
     #  SMTP sender
     # ══════════════════════════════════════════════════════════
+
+    async def send_generic_email(self, to_email: str, subject: str, html_body: str) -> bool:
+        """Send a generic HTML email (for fix notifications, etc.)."""
+        if not self.config.enable_notifications:
+            return False
+        return await self._send_email(to=to_email, subject=subject, html_content=html_body)
 
     async def _send_email(self, to: str, subject: str, html_content: str) -> bool:
         """Build MIME message and send via SMTP (TLS)."""

@@ -344,21 +344,26 @@ async function registerService(e) {
 
 async function loadRegistered() {
   try {
-    var data = await api('/api/v1/connections');
+    var data = await api('/api/v1/repos/registered');
     var list = document.getElementById('registeredList');
-    var conns = data.connections || [];
-    if (conns.length === 0) {
-      list.innerHTML = '<div class="empty-state"><i class="ph ph-users"></i><p>No services connected yet.</p></div>';
+    var repos = data.repos || [];
+    if (repos.length === 0) {
+      list.innerHTML = '<div class="empty-state"><i class="ph ph-users"></i><p>No services registered yet.</p></div>';
     } else {
-      list.innerHTML = conns.map(function(c) {
+      list.innerHTML = repos.map(function(r) {
+        var statusClass = r.status === 'ready' ? 'online' : 'offline';
+        var statusLabel = r.status === 'ready' ? 'Ready' : 'Cloning…';
         return '<div style="display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid var(--border);">' +
-          '<span class="status-dot online"></span>' +
-          '<span class="mono text-sm" style="flex:1">' + escapeHtml(c.user_id) + '</span>' +
-          '<span class="text-xs text-muted">' + timeAgo(c.connected_at) + '</span>' +
+          '<span class="status-dot ' + statusClass + '"></span>' +
+          '<div style="flex:1;min-width:0;">' +
+            '<span class="mono text-sm" style="display:block;">' + escapeHtml(r.user_id) + '</span>' +
+            '<span class="text-xs text-muted" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(r.repo_url || '') + '</span>' +
+          '</div>' +
+          '<span class="badge badge-' + (r.status === 'ready' ? 'success' : 'warning') + '" style="font-size:11px;">' + statusLabel + '</span>' +
         '</div>';
       }).join('');
     }
-  } catch(e) { /* ignore */ }
+  } catch(e) { console.error('Failed to load registered repos:', e); }
 }
 
 loadRegistered();

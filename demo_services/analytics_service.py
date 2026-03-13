@@ -45,7 +45,7 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 # from autocure_client import AutoCureHandler
 #
 # AUTOCURE_WS = os.getenv("AUTOCURE_WS",
-#                          "ws://localhost:8000/ws/logs/analytics-svc")
+#                          "ws://localhost:9292/ws/logs/analytics-svc")
 # _autocure = AutoCureHandler(ws_url=AUTOCURE_WS, level=logging.DEBUG)
 # _autocure.setFormatter(logging.Formatter("%(name)s - %(message)s"))
 # logger.addHandler(_autocure)
