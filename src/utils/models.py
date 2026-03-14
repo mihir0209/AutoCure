@@ -320,6 +320,7 @@ class CodeReviewResult(BaseModel):
     ast_diffs: List[Dict[str, Any]] = Field(default_factory=list)
     reference_traces: List[Dict[str, Any]] = Field(default_factory=list)
     manual_flags: List[Dict[str, Any]] = Field(default_factory=list)
+    github_comment_url: str = ""
     reviewed_at: datetime = Field(default_factory=datetime.now)
 
 

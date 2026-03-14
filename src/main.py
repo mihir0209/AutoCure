@@ -13,6 +13,7 @@ import asyncio
 import sys
 import hmac
 import hashlib
+import os
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
@@ -688,6 +689,31 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
                         "files_modified": applied,
                     }
                     logger.info(f"✓ Fix branch pushed: {branch_info['branch_url']}")
+                    try:
+                        fix_comment = (
+                            "## AutoCure Fix Branch Pushed\n"
+                            f"- Error: **{detected_error.error_type}**\n"
+                            f"- Confidence: **{confidence_score:.1f}%**\n"
+                            f"- Branch: `{branch_name}`\n"
+                            f"- Compare: {branch_info['compare_url']}\n\n"
+                            "```mermaid\n"
+                            "flowchart TD\n"
+                            "  A[Error Detected] --> B[AST Trace]\n"
+                            "  B --> C[AI Fix Proposal]\n"
+                            "  C --> D[Auto Apply]\n"
+                            "  D --> E[Commit + Push]\n"
+                            f"  E --> F[{branch_name}]\n"
+                            "```\n"
+                        )
+                        await github_service.post_commit_comment(
+                            owner=owner,
+                            repo_name=repo_name,
+                            commit_sha=commit_sha,
+                            token=token,
+                            body=fix_comment,
+                        )
+                    except Exception as cmt_err:
+                        logger.warning(f"Could not post fix commit comment: {cmt_err}")
                     asyncio.create_task(manager.broadcast_dashboard({
                         "type": "fix",
                         "message": f"[{user_id}] Fix pushed → {branch_name} ({applied} file(s))",
@@ -1929,6 +1955,27 @@ async def review_pull_request(user_id: str, pr_info: PRInfo, background_tasks: B
                 head_ref=pr_info.source_branch,
             )
             logger.info(f"PR #{pr_info.pr_number} reviewed: score={review_result.overall_score}")
+            try:
+                host, owner, repo_name = github_service._parse_repo_url(registration.repo_url)
+                marker = _review_comment_marker("pr", str(pr_info.pr_number))
+                comment_md = _build_github_review_markdown(
+                    review_result,
+                    scope="PR",
+                    scope_value=f"#{pr_info.pr_number}",
+                    marker=marker,
+                )
+                comment_result = await github_service.post_pr_comment(
+                    owner=owner,
+                    repo_name=repo_name,
+                    pr_number=pr_info.pr_number,
+                    token=token,
+                    body=comment_md,
+                    dedupe_marker=marker,
+                )
+                if comment_result.get("ok") and comment_result.get("url"):
+                    review_result.github_comment_url = comment_result["url"]
+            except Exception as cmt_err:
+                logger.warning(f"Failed to post PR comment: {cmt_err}")
 
             # Send review email
             cfg = get_config()
@@ -1996,6 +2043,68 @@ def _find_user_by_repo_url(repo_url: str) -> Optional[str]:
         if reg.repo_token or reg.access_token:
             return uid
     return matches[0]  # fallback to first match
+
+
+def _build_review_mermaid(review) -> str:
+    """Build a compact mermaid flowchart for GitHub markdown comments."""
+    ast_count = len(getattr(review, "ast_diffs", []) or [])
+    refs = len(getattr(review, "reference_traces", []) or [])
+    flags = len(getattr(review, "manual_flags", []) or [])
+    comments = len(getattr(review, "comments", []) or [])
+    verdict = (getattr(review, "overall_assessment", "comment") or "comment").upper()
+    return (
+        "```mermaid\n"
+        "flowchart TD\n"
+        "  A[Diff / Commit] --> B[AST Compare]\n"
+        f"  B --> C[Files: {ast_count}]\n"
+        f"  C --> D[Reference Traces: {refs}]\n"
+        f"  D --> E[Manual Flags: {flags}]\n"
+        f"  E --> F[AI Comments: {comments}]\n"
+        f"  F --> G[Verdict: {verdict}]\n"
+        "```\n"
+    )
+
+
+def _review_comment_marker(scope: str, scope_value: str) -> str:
+    safe_scope = (scope or "").strip().lower().replace(" ", "_")
+    safe_value = (scope_value or "").strip().replace("\n", " ").replace("\r", " ")
+    return f"<!-- autocure-review:{safe_scope}:{safe_value} -->"
+
+
+def _build_github_review_markdown(
+    review,
+    scope: str,
+    scope_value: str,
+    report_url: str = "",
+    marker: str = "",
+) -> str:
+    lines = [
+        "## AutoCure Code Review",
+        f"- Scope: **{scope}** `{scope_value}`",
+        f"- Assessment: **{review.overall_assessment}**",
+        f"- Score: **{review.overall_score:.1f}**",
+        f"- Summary: {review.summary}",
+    ]
+    if review.ast_insights:
+        lines.append(f"- AST insight: {review.ast_insights}")
+    lines.append("")
+    lines.append("### AST Review Diagram")
+    lines.append(_build_review_mermaid(review))
+    if review.reference_traces:
+        lines.append("### Top Reference Traces")
+        for r in review.reference_traces[:8]:
+            lines.append(f"- `{r.get('symbol', '?')}`: {r.get('total_references', 0)} references")
+    if review.manual_flags:
+        lines.append("### Manual Flags")
+        for f in review.manual_flags[:8]:
+            lines.append(f"- `{f.get('file_path', '?')}` :: `{f.get('symbol', '?')}` — {f.get('reason', '')}")
+    if report_url:
+        lines.append("")
+        lines.append(f"Full report: {report_url}")
+    if marker:
+        lines.append("")
+        lines.append(marker)
+    return "\n".join(lines)
 
 
 @app.post("/api/v1/webhook/github")
@@ -2122,7 +2231,29 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     logger.info(f"Webhook: commit {commit_sha[:8]} reviewed, score={review_result.overall_score}, "
                                 f"comments={len(review_result.comments)}, assessment={review_result.overall_assessment}")
 
-                    # 5. Save review report to report store
+                    # 5. Post or reuse commit review comment (dedupe by marker)
+                    try:
+                        marker = _review_comment_marker("commit", commit_sha)
+                        commit_comment = _build_github_review_markdown(
+                            review_result,
+                            scope="Commit",
+                            scope_value=commit_sha[:8],
+                            marker=marker,
+                        )
+                        comment_result = await github_service.post_commit_comment(
+                            owner=owner,
+                            repo_name=repo_name,
+                            commit_sha=commit_sha,
+                            token=token,
+                            body=commit_comment,
+                            dedupe_marker=marker,
+                        )
+                        if comment_result.get("ok") and comment_result.get("url"):
+                            review_result.github_comment_url = comment_result["url"]
+                    except Exception as cmt_err:
+                        logger.warning(f"Webhook: failed to post commit comment: {cmt_err}")
+
+                    # 6. Save review report to report store
                     report_html = email_service._build_review_email(review_result)
                     store = get_report_store()
                     import uuid as _uuid
@@ -2145,7 +2276,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
                     logger.info(f"Webhook: review report saved -> {rpt_filename} (id={report_id})")
 
-                    # 6. Send review email
+                    # 7. Send review email
                     cfg = get_config()
                     to_email = registration.notification_email or registration.email or cfg.email.admin_email
                     if cfg.email.enable_notifications and to_email:
@@ -2155,7 +2286,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                         )
                         logger.info(f"Webhook: commit review email sent to {to_email}")
 
-                    # 7. Notify via WebSocket
+                    # 8. Notify via WebSocket
                     await manager.broadcast_dashboard({
                         "type": "review_complete",
                         "message": f"[{target_user}] Commit review: {commit_msg[:80]} (score: {review_result.overall_score})",

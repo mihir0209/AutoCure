@@ -811,6 +811,106 @@ class GitHubService:
             logger.error(f"Error getting branch diff: {e}")
             return None
 
+    async def post_pr_comment(
+        self,
+        owner: str,
+        repo_name: str,
+        pr_number: int,
+        token: str,
+        body: str,
+        dedupe_marker: str = "",
+    ) -> Dict[str, Any]:
+        """Post a markdown comment on a PR (issue comment endpoint)."""
+        if not token:
+            return {"ok": False, "url": "", "duplicate": False}
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        }
+        payload = {"body": body}
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{pr_number}/comments"
+        try:
+            async with aiohttp.ClientSession() as session:
+                if dedupe_marker:
+                    async with session.get(url, headers=headers) as existing_response:
+                        if existing_response.status == 200:
+                            comments = await existing_response.json()
+                            for comment in comments:
+                                existing_body = comment.get("body", "")
+                                if dedupe_marker in existing_body:
+                                    existing_url = comment.get("html_url", "")
+                                    logger.info(
+                                        f"↷ Skipping duplicate PR comment on #{pr_number}"
+                                    )
+                                    return {
+                                        "ok": True,
+                                        "url": existing_url,
+                                        "duplicate": True,
+                                    }
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        comment_url = data.get("html_url", "")
+                        logger.info(f"✓ Posted PR comment on #{pr_number}")
+                        return {"ok": True, "url": comment_url, "duplicate": False}
+                    txt = await response.text()
+                    logger.error(f"Failed to post PR comment ({response.status}): {txt[:300]}")
+                    return {"ok": False, "url": "", "duplicate": False}
+        except Exception as e:
+            logger.error(f"Error posting PR comment: {e}")
+            return {"ok": False, "url": "", "duplicate": False}
+
+    async def post_commit_comment(
+        self,
+        owner: str,
+        repo_name: str,
+        commit_sha: str,
+        token: str,
+        body: str,
+        dedupe_marker: str = "",
+    ) -> Dict[str, Any]:
+        """Post a markdown comment on a commit."""
+        if not token:
+            return {"ok": False, "url": "", "duplicate": False}
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        }
+        payload = {"body": body}
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/commits/{commit_sha}/comments"
+        try:
+            async with aiohttp.ClientSession() as session:
+                if dedupe_marker:
+                    async with session.get(url, headers=headers) as existing_response:
+                        if existing_response.status == 200:
+                            comments = await existing_response.json()
+                            for comment in comments:
+                                existing_body = comment.get("body", "")
+                                if dedupe_marker in existing_body:
+                                    existing_url = comment.get("html_url", "")
+                                    logger.info(
+                                        f"↷ Skipping duplicate commit comment on {commit_sha[:8]}"
+                                    )
+                                    return {
+                                        "ok": True,
+                                        "url": existing_url,
+                                        "duplicate": True,
+                                    }
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        comment_url = data.get("html_url", "")
+                        logger.info(f"✓ Posted commit comment on {commit_sha[:8]}")
+                        return {"ok": True, "url": comment_url, "duplicate": False}
+                    txt = await response.text()
+                    logger.error(f"Failed to post commit comment ({response.status}): {txt[:300]}")
+                    return {"ok": False, "url": "", "duplicate": False}
+        except Exception as e:
+            logger.error(f"Error posting commit comment: {e}")
+            return {"ok": False, "url": "", "duplicate": False}
+
     async def list_files(
         self, user_id: str, directory: str = "", extensions: Optional[List[str]] = None
     ) -> List[str]:

@@ -1447,6 +1447,18 @@ class EmailService:
                 + "".join(flags) + "</ul></div>"
             )
 
+        github_comment_html = ""
+        if review.github_comment_url:
+            github_comment_html = (
+                '<div class="sec">'
+                '<h2 class="sec-title">&#128279; GitHub Review Comment</h2>'
+                '<p style="margin:0 0 10px;color:#57606a;">Open the exact posted review comment on GitHub.</p>'
+                f'<a href="{_esc(review.github_comment_url)}" '
+                'style="display:inline-block;background:#0969da;color:#ffffff;text-decoration:none;'
+                'padding:10px 14px;border-radius:6px;font-weight:600;">Open GitHub Comment</a>'
+                '</div>'
+            )
+
         return f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>{_EMAIL_CSS}</style></head><body>
@@ -1487,6 +1499,7 @@ class EmailService:
     {ast_diffs_html}
     {ref_trace_html}
     {manual_flags_html}
+    {github_comment_html}
     {highlights_html}
 
     <div style="margin-top:24px;padding-top:16px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;text-align:center;">
