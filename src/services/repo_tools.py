@@ -276,19 +276,34 @@ class RepoIndex:
         self._ensure_indexed()
 
         # Normalise path separators
-        file_path = file_path.replace("\\", "/")
-        content = self._files.get(file_path)
+        file_path = file_path.replace("\\", "/").strip()
+        if not file_path:
+            return "Error: file_path is required"
+
+        # Safety: absolute paths and drive-letter paths are never allowed.
+        if os.path.isabs(file_path) or re.match(r"^[A-Za-z]:/", file_path):
+            return f"Error: absolute paths are not allowed: {file_path}"
+
+        repo_root = Path(self.repo_path).resolve()
+        candidate = (repo_root / file_path).resolve()
+        try:
+            candidate.relative_to(repo_root)
+        except ValueError:
+            return f"Error: file '{file_path}' is outside the repository."
+
+        rel_path = os.path.relpath(str(candidate), self.repo_path).replace("\\", "/")
+        content = self._files.get(rel_path)
 
         if content is None:
-            abs_path = os.path.join(self.repo_path, file_path)
+            abs_path = str(candidate)
             if os.path.isfile(abs_path):
                 try:
                     with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
                         content = f.read()
                 except OSError:
-                    return f"Error: could not read {file_path}"
+                    return f"Error: could not read {rel_path}"
             else:
-                return f"Error: file not found: {file_path}"
+                return f"Error: file not found: {rel_path}"
 
         lines = content.splitlines()
         total = len(lines)

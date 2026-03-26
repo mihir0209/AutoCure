@@ -20,6 +20,7 @@ from typing import Dict, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 import json
+import re
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Query, Request, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -263,6 +264,53 @@ def _load_registrations():
 # Error Analysis Pipeline
 # ============================================================================
 
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_absolute_path_any_os(path: str) -> bool:
+    """Return True for absolute paths on Unix and Windows formats."""
+    if not path:
+        return False
+    p = path.replace("\\", "/")
+    return p.startswith("/") or p.startswith("//") or bool(_WINDOWS_DRIVE_RE.match(path))
+
+
+def _is_repo_relative_file(source_file: str, repo_path: str) -> bool:
+    """Check whether source_file points to a real file inside repo_path."""
+    if not source_file or source_file == "unknown" or _is_absolute_path_any_os(source_file):
+        return False
+
+    try:
+        repo_root = Path(repo_path).resolve()
+        candidate = (repo_root / source_file).resolve()
+        candidate.relative_to(repo_root)
+        return candidate.is_file()
+    except Exception:
+        return False
+
+
+def _is_non_actionable_log(log_entry: LogEntry) -> bool:
+    """Filter noisy framework/static asset errors that should not trigger analysis."""
+    msg = (log_entry.message or "").lower()
+    endpoint = (log_entry.api_endpoint or "").lower()
+    source_file = (log_entry.source_file or "").lower()
+    stack = (log_entry.stack_trace or "").lower()
+
+    if "favicon.ico" in msg or endpoint.endswith("/favicon.ico") or "favicon.ico" in stack:
+        return True
+    if "robots.txt" in msg or endpoint.endswith("/robots.txt"):
+        return True
+
+    # Framework-level 404s are usually routing noise, not actionable repo bugs.
+    if "404 not found" in msg and (
+        "werkzeug/routing/map.py" in source_file
+        or "werkzeug/routing/map.py" in stack
+        or endpoint.endswith(".ico")
+    ):
+        return True
+
+    return False
+
 def _normalize_source_file(source_file: str, repo_path: str) -> str:
     """Convert an absolute source_file path to a repo-relative path.
     
@@ -276,7 +324,7 @@ def _normalize_source_file(source_file: str, repo_path: str) -> str:
     repo = repo_path.replace("\\", "/").rstrip("/") + "/"
 
     # Already relative?
-    if not _os.path.isabs(src):
+    if not _is_absolute_path_any_os(src):
         return source_file
 
     # If path is already inside the repo clone
@@ -287,14 +335,14 @@ def _normalize_source_file(source_file: str, repo_path: str) -> str:
     parts = src.split("/")
     for i in range(len(parts)):
         candidate = "/".join(parts[i:])
-        if _os.path.isabs(candidate):
+        if _is_absolute_path_any_os(candidate):
             continue        # skip — would defeat os.path.join on Windows
         full = _os.path.join(repo_path, candidate)
         if _os.path.isfile(full):
             return candidate
 
-    # Last resort: just return the basename
-    return _os.path.basename(source_file)
+    # Unmappable absolute paths are outside the repo and should not be analysed.
+    return "unknown"
 
 
 def _normalize_line_number(
@@ -466,15 +514,33 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
 
             # Normalize line number — the running instance may have extra lines
             # (e.g. autocure imports) that don't exist in the repo.
-            detected_error.line_number = _normalize_line_number(
-                reported_line=detected_error.line_number or 0,
-                source_file=detected_error.source_file,
-                repo_path=str(repo_info.local_path),
-                stack_trace=detected_error.stack_trace,
-            )
+            if detected_error.source_file != "unknown":
+                detected_error.line_number = _normalize_line_number(
+                    reported_line=detected_error.line_number or 0,
+                    source_file=detected_error.source_file,
+                    repo_path=str(repo_info.local_path),
+                    stack_trace=detected_error.stack_trace,
+                )
 
         # Compute repo_path early — used by AST trace AND AI tool-calling
         repo_path = str(repo_info.local_path) if repo_info and repo_info.local_path else ""
+
+        # If the source file cannot be mapped to the cloned repo, skip auto-fixing.
+        if repo_path and not _is_repo_relative_file(detected_error.source_file or "", repo_path):
+            logger.info(
+                "Skipping analysis for non-repo source file: "
+                f"{detected_error.source_file or 'unknown'}"
+            )
+            await manager.send_message(user_id, WebSocketMessage(
+                type="error_ignored",
+                user_id=user_id,
+                payload={
+                    "reason": "non_repo_source",
+                    "source_file": detected_error.source_file or "unknown",
+                    "message": "Error source is outside tracked repository; analysis skipped.",
+                },
+            ))
+            return
 
         # Broadcast to dashboard watchers
         asyncio.create_task(manager.broadcast_dashboard({
@@ -990,9 +1056,11 @@ def _render_template(name: str, context: dict, status_code: int = 200):
     """
     request = context.get("request")
     try:
-        return _tpl.TemplateResponse(request, name, context=context, status_code=status_code)
+        if isinstance(request, Request):
+            return _tpl.TemplateResponse(request, name, context=context, status_code=status_code)
     except TypeError:
-        return _tpl.TemplateResponse(name, context, status_code=status_code)
+        pass
+    return _tpl.TemplateResponse(name, context, status_code=status_code)  # type: ignore[call-arg]
 
 
 def _get_user(request: Request):
@@ -1058,6 +1126,8 @@ async def page_signup_submit(request: Request, username: str = Form(...), passwo
     except Exception:
         return _render_template("signup.html", {"request": request, "error": "Could not create account"})
     user = _auth.verify_user(username, password)
+    if not user:
+        return _render_template("signup.html", {"request": request, "error": "Account created but login failed"})
     token = _auth.create_session(user)
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie("session_token", token, httponly=True, samesite="lax", max_age=86400 * 7)
@@ -1177,6 +1247,12 @@ async def websocket_logs(websocket: WebSocket, user_id: str):
                 
                 # Check if this is an error
                 if log_entry.level.upper() in ["ERROR", "FATAL", "CRITICAL"]:
+                    if _is_non_actionable_log(log_entry):
+                        logger.info(
+                            f"Ignoring non-actionable error from user {user_id}: "
+                            f"{log_entry.message[:100]}"
+                        )
+                        continue
                     logger.warning(f"Error detected from user {user_id}: {log_entry.message[:100]}")
                     
                     # Trigger error analysis (in background)
@@ -2641,10 +2717,11 @@ async def dashboard_summary(request: Request):
     if is_admin:
         visible_uids = set(user_registrations.keys())
     else:
+        caller_username = caller.username if caller else ""
         visible_uids = set()
         for uid, reg in user_registrations.items():
             owner = _registration_owners.get(uid, '')
-            if (owner and owner == caller.username) or uid == caller.username:
+            if (owner and owner == caller_username) or uid == caller_username:
                 visible_uids.add(uid)
 
     total_logs = sum(len(logs) for uid, logs in manager.log_buffers.items() if is_admin or uid in visible_uids)

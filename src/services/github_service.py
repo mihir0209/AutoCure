@@ -50,6 +50,29 @@ class GitHubService:
         
         # Track cloned repos
         self.repos: Dict[str, RepositoryInfo] = {}
+        self._safe_directories_configured: set[str] = set()
+
+    def _ensure_safe_directory(self, cwd: str):
+        """Mark repository path as git safe.directory for container bind mounts."""
+        norm = os.path.normpath(cwd)
+        real = os.path.realpath(norm)
+        if norm in self._safe_directories_configured or real in self._safe_directories_configured:
+            return
+
+        try:
+            import subprocess as _sp
+            for path in {norm, real}:
+                proc = _sp.run(
+                    ["git", "config", "--global", "--add", "safe.directory", path],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if proc.returncode != 0 and "already exists" not in (proc.stderr or "").lower():
+                    logger.warning(f"Could not mark safe.directory for {path}: {proc.stderr.strip()}")
+                self._safe_directories_configured.add(path)
+        except Exception as e:
+            logger.warning(f"Failed to configure safe.directory for {cwd}: {e}")
         
     def _get_repo_path(self, user_id: str, repo_name: str) -> Path:
         """Get the local path for a user's repository."""
@@ -101,6 +124,7 @@ class GitHubService:
         # Check if already cloned
         if local_path.exists() and not force:
             logger.info(f"Repository already exists: {local_path}")
+            self._ensure_safe_directory(str(local_path))
             repo_info = await self.get_repo_info(user.user_id, local_path)
             if repo_info:
                 self.repos[user.user_id] = repo_info
@@ -149,6 +173,7 @@ class GitHubService:
                 return None
             
             logger.info(f"✓ Repository cloned successfully: {local_path}")
+            self._ensure_safe_directory(str(local_path))
             
             # Get repo info
             repo_info = await self.get_repo_info(user.user_id, local_path)
@@ -178,6 +203,7 @@ class GitHubService:
         try:
             import subprocess as _sp
             cwd = str(repo_info.local_path)
+            self._ensure_safe_directory(cwd)
 
             # ── Ensure clean working tree before pulling ──
             # Fix-branch operations may leave uncommitted changes that block rebase.
@@ -261,6 +287,7 @@ class GitHubService:
     def _strip_token_from_remote(self, cwd: str):
         """Remove token from the git remote URL for security."""
         import subprocess as _sp
+        self._ensure_safe_directory(cwd)
         remote_proc = _sp.run(
             ["git", "remote", "get-url", "origin"],
             cwd=cwd, capture_output=True, text=True, timeout=15,
@@ -282,6 +309,7 @@ class GitHubService:
         
         try:
             import subprocess as _sp
+            self._ensure_safe_directory(str(local_path))
             # Get current branch
             branch_proc = _sp.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -309,6 +337,7 @@ class GitHubService:
         """Get the latest commit hash (sync for Windows compatibility)."""
         try:
             import subprocess as _sp
+            self._ensure_safe_directory(str(local_path))
             proc = _sp.run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=str(local_path),
@@ -510,6 +539,7 @@ class GitHubService:
         try:
             import subprocess as _sp
             cwd = str(repo_info.local_path)
+            self._ensure_safe_directory(cwd)
 
             # Fetch latest from remote
             _sp.run(["git", "fetch", "origin"], cwd=cwd, capture_output=True, text=True, timeout=60)
@@ -632,6 +662,7 @@ class GitHubService:
         try:
             import subprocess as _sp
             cwd = str(repo_info.local_path)
+            self._ensure_safe_directory(cwd)
 
             # Stage only tracked/modified files (avoid picking up untracked utility files)
             proc = _sp.run(["git", "add", "-u"], cwd=cwd, capture_output=True, text=True, timeout=30)
@@ -707,6 +738,7 @@ class GitHubService:
         try:
             import subprocess as _sp
             cwd = str(repo_info.local_path)
+            self._ensure_safe_directory(cwd)
             # Discard any leftover changes before switching
             _sp.run(["git", "reset", "--hard", "HEAD"],
                     cwd=cwd, capture_output=True, text=True, timeout=15)
@@ -735,6 +767,7 @@ class GitHubService:
         # Try to get owner/repo from remote URL
         try:
             import subprocess as _sp
+            self._ensure_safe_directory(str(repo_info.local_path))
             remote_proc = _sp.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=str(repo_info.local_path),

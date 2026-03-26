@@ -3,6 +3,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def wait_for(host: str, port: int, name: str, timeout_seconds: int) -> None:
@@ -23,9 +24,46 @@ def wait_for(host: str, port: int, name: str, timeout_seconds: int) -> None:
             time.sleep(1)
 
 
+def _configure_git_safe_directories() -> None:
+    """Allow git operations on bind-mounted repositories inside the container."""
+    try:
+        # In containers, wildcard safe.directory is the most reliable setting for
+        # host-mounted repos that may have differing ownership metadata.
+        proc = subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", "*"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            print("[entrypoint] Git safe.directory configured: *")
+            return
+
+        # Fallback for environments where wildcard is unavailable.
+        repos_root = Path(os.getenv("REPOS_ROOT", "/app/repos"))
+        candidates = [repos_root]
+        if repos_root.exists():
+            for p in repos_root.glob("*/*"):
+                if p.is_dir():
+                    candidates.append(p)
+
+        for path in candidates:
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        print(f"[entrypoint] Git safe.directory fallback applied to {len(candidates)} paths")
+    except Exception as e:
+        print(f"[entrypoint] WARNING: failed to configure git safe.directory: {e}")
+
+
 def main() -> int:
     print("[entrypoint] Starting AutoCure container...")
     print(f"[entrypoint] Python: {sys.version.split()[0]}")
+
+    _configure_git_safe_directories()
 
     timeout = int(os.getenv("WAIT_FOR_SERVICES_TIMEOUT", "60"))
     wait_for(os.getenv("DB_HOST", "postgres"), int(os.getenv("DB_PORT", "5432")), "PostgreSQL", timeout)
