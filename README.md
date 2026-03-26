@@ -11,8 +11,8 @@
 > - 🌳 **Visualizes ASTs** in a browser-based React UI with drag/zoom, code-to-tree navigation, and cross-file reference resolution
 
 > **What AutoCure Does NOT Do**
-> - Does NOT automatically commit or push fixes (human review required)
-> - Does NOT modify your codebase directly
+> - Does NOT automatically commit or push fixes to the production branch (human review required)
+> - Does NOT modify your codebase directly (a new branch is created for the fix)
 > - Does NOT replace developer judgment — it provides recommendations
 
 ---
@@ -129,7 +129,7 @@ That's it! Your AutoCure server is now running. See [Complete Usage Guide](#comp
 | Layer | Technology |
 |-------|-----------|
 | **Server** | FastAPI, Uvicorn, Jinja2 templates |
-| **AI** | Microsoft AutoGen 0.7+, llama-3.3-70b (Groq / Cerebras) |
+| **AI** | Microsoft AutoGen 0.7+, llama-3.3-70b (Groq / Cerebras), other BYOK providers to be introduced. |
 | **AST Parsing** | tree-sitter 0.21+, tree-sitter-languages (26 languages) |
 | **Frontend** | React 19, Vite 7, Tailwind CSS, Phosphor Icons |
 | **Database** | PostgreSQL 14+ (reports, users), Redis 7+ (sessions, cache) |
@@ -171,20 +171,14 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Set up PostgreSQL
+### 3. Set up PostgreSQL / SQLite directly into codebase (default if not created)
 
 ```bash
 createdb selfhealer
 psql selfhealer < src/database/schema.sql
 ```
 
-### 4. Start Redis
-
-```bash
-redis-server
-```
-
-### 5. Configure environment
+### 4. Configure environment
 
 ```bash
 cp .env.example .env
@@ -192,11 +186,6 @@ cp .env.example .env
 
 Edit `.env` with your values (see [Configuration](#configuration)).
 
-### 6. (Optional) Install demo service
-
-```bash
-cd demo_service && npm install && cd ..
-```
 
 ---
 
@@ -262,10 +251,11 @@ Once running, open:
 
 | URL | Description |
 |-----|-------------|
-| `http://localhost:8000/` | Dashboard (login required) |
-| `http://localhost:8000/login` | Authentication page |
-| `http://localhost:8000/visualizer` | AST Visualizer (React SPA) |
-| `http://localhost:8000/health` | Health check (JSON) |
+| `http://localhost:9292/` | Dashboard (login required) |
+| `http://localhost:9292/login` | Authentication page |
+| `http://localhost:9292/visualizer` | AST Visualizer (React SPA) |
+| `http://localhost:9292/health` | Health check (JSON) |
+| `http://localhost:9292/languages` | Languages Supported (JSON) |
 
 ---
 
@@ -306,7 +296,7 @@ Add the lightweight WebSocket client to your application. It captures console ou
 ### Python
 
 ```python
-# ~50 lines — see src/websocket_client/python_client.py
+# see src/websocket_client/python_client.py
 import asyncio, websockets, json, sys, traceback
 
 async def stream_logs(server_url, user_id):
@@ -587,7 +577,7 @@ await handler.connect();
 
 ### Example Integration (Full App)
 
-File: `demo_services/autocure_client.py` (~80 lines)
+File: `demo_services/autocure_client.py`
 
 Complete example of integrating AutoCure into a production application:
 
@@ -816,18 +806,7 @@ Click any report in the **Reports** tab:
 - **Side Effects** — Potential impacts of the fix
 - **Source Code** — Original code side-by-side with fix
 
-### 5. Apply the Fix
-
-Some fixes can be auto-applied via the dashboard:
-
-1. In the report, click **Create Pull Request**
-2. AutoCure creates a feature branch (`fix/error-type-nnn`)
-3. Commits the fix and pushes to GitHub
-4. Opens a pull request for your review
-
-(Note: This requires GitHub token in `.env`.)
-
-### 6. Email Notifications
+### 5. Email Notifications
 
 Configure SMTP in `.env` for email reports:
 
@@ -1084,27 +1063,6 @@ node server.js
      - Confidence score > 75%
      - Fix proposal shows proper validation check
      - AST visualization highlights the error line
-
-#### Automated Test Script
-
-```bash
-# Terminal 3: Run automated test
-python tests/e2e_test.py --server http://localhost:9292 --demo-port 4000
-```
-
-Expected output:
-```
-✓ User registration successful
-✓ Repository registered
-✓ Error triggered (division by zero)
-✓ Log received on dashboard (5 sec)
-✓ Analysis started
-✓ Fix proposal generated (120 sec)
-✓ Confidence score: 87.5%
-✓ Email report sent
-✓ GitHub branch created: fix/zero-division-001
-✓ All tests PASSED ✓
-```
 
 ### What the Test Validates
 
