@@ -14,6 +14,7 @@ import sys
 import hmac
 import hashlib
 import os
+import importlib.metadata as importlib_metadata
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
@@ -853,6 +854,17 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Server: {config.server.host}:{config.server.port}")
     logger.info(f"  WebSocket Path: {config.server.websocket_path}")
     logger.info(f"  AI Provider: {config.ai.provider}")
+    logger.info(f"  Python: {sys.executable}")
+    try:
+        ts_ver = importlib_metadata.version("tree-sitter")
+    except importlib_metadata.PackageNotFoundError:
+        ts_ver = "not installed"
+    try:
+        tsl_ver = importlib_metadata.version("tree-sitter-languages")
+    except importlib_metadata.PackageNotFoundError:
+        tsl_ver = "not installed"
+    logger.info(f"  tree-sitter: {ts_ver}")
+    logger.info(f"  tree-sitter-languages: {tsl_ver}")
     
     # Ensure directories exist
     config.logs_path.mkdir(parents=True, exist_ok=True)
@@ -970,6 +982,19 @@ _tpl = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 _auth = get_auth_manager()
 
 
+def _render_template(name: str, context: dict, status_code: int = 200):
+    """Render Jinja templates across Starlette versions.
+
+    Newer Starlette expects TemplateResponse(request, name, context=...),
+    while older versions accept TemplateResponse(name, context, ...).
+    """
+    request = context.get("request")
+    try:
+        return _tpl.TemplateResponse(request, name, context=context, status_code=status_code)
+    except TypeError:
+        return _tpl.TemplateResponse(name, context, status_code=status_code)
+
+
 def _get_user(request: Request):
     """Return the authenticated User or None."""
     token = request.cookies.get("session_token")
@@ -986,14 +1011,14 @@ def _get_user(request: Request):
 async def page_login(request: Request):
     if _get_user(request):
         return RedirectResponse("/")
-    return _tpl.TemplateResponse("login.html", {"request": request})
+    return _render_template("login.html", {"request": request})
 
 
 @app.post("/login", include_in_schema=False)
 async def page_login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
     user = _auth.verify_user(username, password)
     if not user:
-        return _tpl.TemplateResponse("login.html", {"request": request, "error": "Invalid username or password"})
+        return _render_template("login.html", {"request": request, "error": "Invalid username or password"})
     token = _auth.create_session(user)
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie("session_token", token, httponly=True, samesite="lax", max_age=86400 * 7)
@@ -1014,24 +1039,24 @@ async def page_logout(request: Request):
 async def page_signup(request: Request):
     if _get_user(request):
         return RedirectResponse("/")
-    return _tpl.TemplateResponse("signup.html", {"request": request})
+    return _render_template("signup.html", {"request": request})
 
 
 @app.post("/signup", include_in_schema=False)
 async def page_signup_submit(request: Request, username: str = Form(...), password: str = Form(...)):
     username = username.strip()
     if not username or not password:
-        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username and password are required"})
+        return _render_template("signup.html", {"request": request, "error": "Username and password are required"})
     if len(username) < 3:
-        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username must be at least 3 characters"})
+        return _render_template("signup.html", {"request": request, "error": "Username must be at least 3 characters"})
     if len(password) < 4:
-        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Password must be at least 4 characters"})
+        return _render_template("signup.html", {"request": request, "error": "Password must be at least 4 characters"})
     if _auth.user_exists(username):
-        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Username already taken"})
+        return _render_template("signup.html", {"request": request, "error": "Username already taken"})
     try:
         _auth.create_user(username, password, role="viewer")
     except Exception:
-        return _tpl.TemplateResponse("signup.html", {"request": request, "error": "Could not create account"})
+        return _render_template("signup.html", {"request": request, "error": "Could not create account"})
     user = _auth.verify_user(username, password)
     token = _auth.create_session(user)
     resp = RedirectResponse("/", status_code=302)
@@ -1044,7 +1069,7 @@ async def page_dashboard(request: Request):
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
-    return _tpl.TemplateResponse("dashboard.html", {"request": request, "user": user, "page": "dashboard"})
+    return _render_template("dashboard.html", {"request": request, "user": user, "page": "dashboard"})
 
 
 @app.get("/connections", include_in_schema=False)
@@ -1052,7 +1077,7 @@ async def page_connections(request: Request):
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
-    return _tpl.TemplateResponse("connections.html", {"request": request, "user": user, "page": "connections"})
+    return _render_template("connections.html", {"request": request, "user": user, "page": "connections"})
 
 
 @app.get("/logs", include_in_schema=False)
@@ -1060,7 +1085,7 @@ async def page_logs(request: Request):
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
-    return _tpl.TemplateResponse("logs.html", {"request": request, "user": user, "page": "logs"})
+    return _render_template("logs.html", {"request": request, "user": user, "page": "logs"})
 
 
 @app.get("/reports", include_in_schema=False)
@@ -1068,7 +1093,7 @@ async def page_reports(request: Request):
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
-    return _tpl.TemplateResponse("reports.html", {"request": request, "user": user, "page": "reports"})
+    return _render_template("reports.html", {"request": request, "user": user, "page": "reports"})
 
 
 @app.get("/integration", include_in_schema=False)
@@ -1082,7 +1107,7 @@ async def page_integration(request: Request):
     ws_scheme = "wss" if scheme == "https" else "ws"
     server_url = f"{scheme}://{request.url.netloc}"
     ws_url = f"{ws_scheme}://{request.url.netloc}"
-    return _tpl.TemplateResponse("integration.html", {
+    return _render_template("integration.html", {
         "request": request, "user": user, "page": "integration",
         "server_url": server_url, "ws_url": ws_url,
     })
@@ -1102,7 +1127,7 @@ async def page_visualizer(request: Request):
             return FileResponse(str(idx), media_type="text/html")
     # Fallback to template-based visualizer
     visualizer_url = "http://localhost:5173"
-    return _tpl.TemplateResponse("visualizer.html", {
+    return _render_template("visualizer.html", {
         "request": request, "user": user, "page": "visualizer",
         "visualizer_url": visualizer_url,
     })
@@ -2422,13 +2447,45 @@ async def upload_single_file(file: UploadFile = File(...)):
 async def parse_code_visualizer(body: dict):
     """Parse a code snippet for AST visualization (matches Node.js format)."""
     from services.ast_visualizer import get_ast_visualizer
-    
-    code = body.get("code", "")
-    error_line = body.get("errorLine")
-    filename = body.get("filename", "code.js")
-    
-    if not code:
-        raise HTTPException(status_code=400, detail="Code is required")
+
+    code = (
+        body.get("code")
+        or body.get("content")
+        or body.get("source")
+        or body.get("snippet")
+        or body.get("text")
+        or ""
+    )
+    if not isinstance(code, str):
+        code = str(code)
+
+    raw_error_line = body.get("errorLine", body.get("error_line"))
+    try:
+        error_line = int(raw_error_line) if raw_error_line is not None else None
+    except (TypeError, ValueError):
+        error_line = None
+
+    filename = body.get("filename")
+    if not filename:
+        lang = str(body.get("language", "")).lower().strip()
+        lang_ext = {
+            "javascript": "js",
+            "typescript": "ts",
+            "tsx": "tsx",
+            "python": "py",
+            "json": "json",
+            "java": "java",
+            "go": "go",
+            "rust": "rs",
+        }
+        filename = f"code.{lang_ext.get(lang, 'js')}"
+
+    if not code.strip():
+        logger.warning(f"/parse/code rejected empty payload, keys={list(body.keys())}")
+        raise HTTPException(
+            status_code=400,
+            detail="Code is required (accepted fields: code, content, source, snippet, text)",
+        )
     
     try:
         visualizer = get_ast_visualizer()
@@ -2441,6 +2498,7 @@ async def parse_code_visualizer(body: dict):
     except HTTPException:
         raise
     except Exception as e:
+        logger.warning(f"/parse/code failed for filename={filename}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 

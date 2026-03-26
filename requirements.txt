@@ -39,8 +39,8 @@ rich>=13.7.0
 typing-extensions>=4.9.0
 
 # AST parsing - tree-sitter with language grammars
-tree-sitter>=0.21.0
-tree-sitter-languages>=1.10.0  # Pre-built grammars for 30+ languages
+tree-sitter==0.21.3  # pinned for tree-sitter-languages compatibility across platforms
+tree-sitter-languages==1.10.2  # pinned to avoid resolver drift on Linux/CI
 # Individual language packages (optional, tree-sitter-languages covers most)
 tree-sitter-python>=0.21.0
 tree-sitter-javascript>=0.21.0
