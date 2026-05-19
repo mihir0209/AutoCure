@@ -93,7 +93,7 @@ async function loadStats() {
   try {
     var s = await api('/api/v1/reports/stats');
     document.getElementById('rptTotal').textContent = s.total || 0;
-    document.getElementById('rptConfidence').textContent = (s.avg_confidence || 0).toFixed(0) + '%';
+    document.getElementById('rptConfidence').textContent = Math.min(s.avg_confidence || 0, 100).toFixed(0) + '%';
     document.getElementById('rptErrors').textContent = s.unique_error_types || 0;
     document.getElementById('rptFixes').textContent = s.total_proposals || 0;
   } catch(e) { /* ignore */ }
@@ -123,7 +123,8 @@ async function loadReports() {
       tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state"><i class="ph ph-file-text"></i><p>No reports found.</p></div></td></tr>';
     } else {
       tbody.innerHTML = reports.map(function(r) {
-        var confCls = r.confidence >= 0.75 ? 'badge-success' : (r.confidence >= 0.5 ? 'badge-warning' : 'badge-danger');
+        var confPct = Math.min(r.confidence * 100, 100);
+        var confCls = confPct >= 75 ? 'badge-success' : (confPct >= 50 ? 'badge-warning' : 'badge-danger');
         var fixStatus = r.fix_status || 'pending';
         var statusHtml = STATUS_BADGE[fixStatus] || STATUS_BADGE.pending;
         var changesBtn = '';
@@ -137,7 +138,7 @@ async function loadReports() {
           '<td><span class="badge ' + (SEV_BADGE[r.severity]||'badge-info') + '">' + escapeHtml(r.severity) + '</span></td>' +
           '<td class="mono text-sm">' + escapeHtml(r.error_type) + '</td>' +
           '<td class="text-sm text-muted truncate" style="max-width:200px">' + (r.source_file ? escapeHtml(r.source_file)+':'+r.line_number : '&mdash;') + '</td>' +
-          '<td><span class="badge ' + confCls + '">' + (r.confidence*100).toFixed(0) + '%</span></td>' +
+          '<td><span class="badge ' + confCls + '">' + confPct.toFixed(0) + '%</span></td>' +
           '<td>' + r.proposals_count + ' ' + statusHtml + '</td>' +
           '<td class="text-sm text-muted">' + timeAgo(r.created_at) + '</td>' +
           '<td style="text-align:right">' +

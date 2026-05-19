@@ -7,7 +7,7 @@
 <div class="stats-grid mb-6">
   <div class="stat-card">
     <div class="stat-icon blue"><i class="ph ph-plugs-connected"></i></div>
-    <div><div class="stat-value" id="statConnections">--</div><div class="stat-label">Active Connections</div></div>
+    <div><div class="stat-value" id="statConnections">--</div><div class="stat-label">Registered Services</div></div>
   </div>
   <div class="stat-card">
     <div class="stat-icon green"><i class="ph ph-users"></i></div>
@@ -183,7 +183,7 @@ var USER_NAME = '{{ user.username }}';
 async function loadDashboard() {
   try {
     var data = await api('/api/v1/dashboard/summary');
-    document.getElementById('statConnections').textContent = data.active_connections;
+    document.getElementById('statConnections').textContent = data.registered_services;
     document.getElementById('statUsers').textContent = data.registered_users;
     document.getElementById('statErrors').textContent = data.total_errors;
     document.getElementById('statReports').textContent = data.total_reports || 0;
@@ -229,13 +229,9 @@ function clearActivity() {
 dashboardWS.onMessage(function(data) {
   addActivity(data);
   if (data.type === 'connection') {
-    var el = document.getElementById('statConnections');
-    el.textContent = parseInt(el.textContent || '0') + 1;
     showToast('Service connected: ' + (data.user_id || ''), 'success');
   }
   if (data.type === 'disconnection') {
-    var el = document.getElementById('statConnections');
-    el.textContent = Math.max(0, parseInt(el.textContent || '1') - 1);
     showToast('Service disconnected: ' + (data.user_id || ''), 'warning');
   }
   if (data.type === 'error') {

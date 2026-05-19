@@ -126,6 +126,9 @@ class ReportStore:
         finally:
             conn.close()
 
+        # Normalize legacy confidence values (>1.0) to 0-1 scale
+        self.normalize_existing_confidence()
+
     # ── CRUD ──
 
     def insert(
@@ -289,6 +292,52 @@ class ReportStore:
         # Delete record
         return self.delete(report_id)
 
+    @staticmethod
+    def _norm_conf(confidence: float) -> float:
+        """Normalize confidence to 0.0–1.0 scale. Values >1.0 are capped."""
+        if confidence <= 1.0:
+            return max(0.0, confidence)
+        if confidence <= 10.0:
+            return confidence / 10.0
+        if confidence <= 100.0:
+            return confidence / 100.0
+        return 1.0
+
+    def normalize_existing_confidence(self) -> int:
+        """One-time migration: cap all confidence values >1.0 to 1.0. Returns rows updated."""
+        conn = self._get_conn()
+        try:
+            cur = conn.execute("UPDATE reports SET confidence = 1.0 WHERE confidence > 1.0")
+            conn.commit()
+            logger.info(f"Normalized {cur.rowcount} report confidence values")
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def get_latest_for_user(self, user_id: str) -> Optional[ReportRecord]:
+        """Fetch the most recent report for a given user."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM reports WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            return ReportRecord(**dict(row)) if row else None
+        finally:
+            conn.close()
+
+    def count_for_user(self, user_id: str) -> int:
+        """Count reports for a given user."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM reports WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row["c"] if row else 0
+        finally:
+            conn.close()
+
     def stats(self) -> Dict[str, Any]:
         """Quick statistics for the dashboard."""
         conn = self._get_conn()
@@ -327,7 +376,7 @@ class ReportStore:
                 "total_reports": total,
                 "by_type": by_type,
                 "by_severity": by_severity,
-                "avg_confidence": avg_conf * 100,   # 0-100 scale
+                "avg_confidence": min(avg_conf * 100, 100),
                 "unique_error_types": unique_errors,
                 "total_proposals": total_proposals,
                 "latest_report_at": latest["created_at"] if latest else None,
@@ -343,9 +392,14 @@ class ReportStore:
 _store: Optional[ReportStore] = None
 
 
-def get_report_store() -> ReportStore:
-    """Get or create the report-store singleton."""
+def get_report_store():
+    """Get or create the report-store singleton (PG or SQLite)."""
     global _store
     if _store is None:
-        _store = ReportStore()
+        cfg = get_config()
+        if cfg.database.type == "postgres":
+            from database.pg_report_store import PgReportStore
+            _store = PgReportStore()
+        else:
+            _store = ReportStore()
     return _store

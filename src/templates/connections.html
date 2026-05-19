@@ -1,37 +1,42 @@
 {% extends "base.html" %}
-{% block title %}Connections{% endblock %}
-{% block page_title %}<i class="ph ph-plugs-connected"></i> Connections{% endblock %}
+{% block title %}Service Connections{% endblock %}
+{% block page_title %}<i class="ph ph-plugs-connected"></i> Service Connections{% endblock %}
 
 {% block content %}
 <div class="mb-6" style="display:flex;gap:16px;align-items:center;">
   <div class="stat-card" style="flex:1;">
-    <div class="stat-icon green"><i class="ph ph-plugs-connected"></i></div>
-    <div><div class="stat-value" id="connCount">--</div><div class="stat-label">Active Connections</div></div>
+    <div class="stat-icon blue"><i class="ph ph-plugs-connected"></i></div>
+    <div><div class="stat-value" id="totalCount">--</div><div class="stat-label">Registered Services</div></div>
   </div>
   <div class="stat-card" style="flex:1;">
-    <div class="stat-icon blue"><i class="ph ph-users"></i></div>
-    <div><div class="stat-value" id="regCount">--</div><div class="stat-label">Registered Users</div></div>
+    <div class="stat-icon green"><i class="ph ph-plug"></i></div>
+    <div><div class="stat-value" id="connCount">--</div><div class="stat-label">Connected</div></div>
+  </div>
+  <div class="stat-card" style="flex:1;">
+    <div class="stat-icon yellow"><i class="ph ph-plugs"></i></div>
+    <div><div class="stat-value" id="idleCount">--</div><div class="stat-label">Idle</div></div>
   </div>
   <button class="btn" onclick="loadConnections()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
 </div>
 
 <div class="card">
-  <div class="card-header"><h2><i class="ph ph-list"></i> Connected Services</h2></div>
+  <div class="card-header"><h2><i class="ph ph-list"></i> Connection History</h2></div>
   <div class="card-body" style="padding:0;">
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Status</th>
-            <th>User ID</th>
-            <th>Connected At</th>
-            <th>Last Heartbeat</th>
-            <th>Logs Received</th>
-            <th>Errors Detected</th>
+            <th>Service</th>
+            <th>Last Connection</th>
+            <th>Last Event</th>
+            <th>Outcome</th>
+            <th>Reports</th>
+            <th style="text-align:right">Actions</th>
           </tr>
         </thead>
         <tbody id="connTableBody">
-          <tr><td colspan="6"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No active connections. Services will appear here when they connect via WebSocket.</p></div></td></tr>
+          <tr><td colspan="7"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No services registered yet. Register a service to see connection history.</p></div></td></tr>
         </tbody>
       </table>
     </div>
@@ -41,43 +46,82 @@
 
 {% block scripts %}
 <script>
+var SEVERITY_BADGES = {
+  critical: '<span class="badge badge-danger">Critical</span>',
+  high:     '<span class="badge badge-danger">High</span>',
+  medium:   '<span class="badge badge-warning">Medium</span>',
+  low:      '<span class="badge badge-info">Low</span>',
+};
+
+function confidenceBadge(score) {
+  if (score == null) return '';
+  var pct = Math.min(Math.round(score * 100), 100);
+  var cls = pct >= 80 ? 'badge-success' : pct >= 50 ? 'badge-warning' : 'badge-danger';
+  return '<span class="badge ' + cls + '">' + pct + '% confidence</span>';
+}
+
+function outcomeCell(svc) {
+  if (!svc.report_id) return '<span class="text-muted text-sm">No report yet</span>';
+  return '<a href="' + svc.report_url + '" target="_blank" style="text-decoration:none;">' +
+    confidenceBadge(svc.confidence) +
+  '</a>';
+}
+
 async function loadConnections() {
   try {
     var data = await api('/api/v1/connections');
-    var conns = data.connections || [];
-    document.getElementById('connCount').textContent = conns.length;
+    var services = data.services || [];
 
-    var summary = await api('/api/v1/dashboard/summary');
-    document.getElementById('regCount').textContent = summary.registered_users || 0;
+    document.getElementById('totalCount').textContent = services.length;
+    document.getElementById('connCount').textContent = data.connected || 0;
+    document.getElementById('idleCount').textContent = data.idle || 0;
 
     var tbody = document.getElementById('connTableBody');
-    if (conns.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No active connections.</p></div></td></tr>';
+    if (services.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state"><i class="ph ph-plugs-connected"></i><p>No services registered yet.</p></div></td></tr>';
       return;
     }
-    tbody.innerHTML = conns.map(function(c) {
+    tbody.innerHTML = services.map(function(svc) {
+      var statusDot = svc.status === 'connected'
+        ? '<span class="status-dot online"></span>'
+        : '<span class="status-dot offline"></span>';
+
+      var lastConn = svc.last_connected_at
+        ? timeAgo(svc.last_connected_at)
+        : '<span class="text-muted">Never</span>';
+
+      var lastEvent = svc.last_event
+        ? '<span class="text-sm">' + escapeHtml(svc.last_event) + '</span>'
+        : '<span class="text-muted text-sm">&mdash;</span>';
+
+      var sevBadge = SEVERITY_BADGES[svc.severity] || '';
+
       return '<tr>' +
-        '<td><span class="status-dot online"></span></td>' +
-        '<td class="mono">' + escapeHtml(c.user_id) + '</td>' +
-        '<td class="text-sm text-muted">' + formatDate(c.connected_at) + '</td>' +
-        '<td class="text-sm text-muted">' + timeAgo(c.last_heartbeat) + '</td>' +
-        '<td>' + c.logs_received + '</td>' +
-        '<td>' + c.errors_detected + '</td>' +
+        '<td>' + statusDot + '</td>' +
+        '<td class="mono">' + escapeHtml(svc.user_id) + '</td>' +
+        '<td class="text-sm">' + lastConn + '</td>' +
+        '<td>' + lastEvent + ' ' + sevBadge + '</td>' +
+        '<td>' + outcomeCell(svc) + '</td>' +
+        '<td>' + svc.total_reports + '</td>' +
+        '<td style="text-align:right">' +
+          (svc.report_id
+            ? '<a href="' + svc.report_url + '" target="_blank" class="btn btn-sm btn-primary"><i class="ph ph-eye"></i> View Report</a>'
+            : '') +
+        '</td>' +
       '</tr>';
     }).join('');
   } catch(e) {
-    showToast('Failed to load connections', 'error');
+    showToast('Failed to load connections: ' + e.message, 'error');
   }
 }
 
 dashboardWS.onMessage(function(data) {
   if (data.type === 'connection' || data.type === 'disconnection') {
     loadConnections();
-    showToast(data.message || data.type, data.type === 'connection' ? 'success' : 'warning');
   }
 });
 
 loadConnections();
-setInterval(loadConnections, 10000);
+setInterval(loadConnections, 15000);
 </script>
 {% endblock %}
