@@ -159,5 +159,10 @@ _mgr: Optional[AuthManager] = None
 def get_auth_manager() -> AuthManager:
     global _mgr
     if _mgr is None:
-        _mgr = AuthManager()
+        cfg = get_config()
+        if cfg.database.type == "postgres":
+            from database.pg_auth import PgAuthManager
+            _mgr = PgAuthManager()
+        else:
+            _mgr = AuthManager()
     return _mgr

@@ -45,6 +45,7 @@ services:
       SERVER_PORT: 9292
       DB_HOST: postgres
       DB_PORT: 5432
+      DB_TYPE: postgres
       REDIS_HOST: redis
       REDIS_PORT: 6379
       WAIT_FOR_SERVICES_TIMEOUT: 120

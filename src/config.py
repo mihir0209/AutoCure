@@ -62,6 +62,7 @@ class AIConfig(BaseModel):
 
 class DatabaseConfig(BaseModel):
     """PostgreSQL Database Configuration"""
+    type: str = "postgres"  # "postgres" or "sqlite"
     host: str = "localhost"
     port: int = 5432
     user: str = "postgres"
@@ -165,6 +166,7 @@ def load_config() -> SystemConfig:
     )
     
     database_config = DatabaseConfig(
+        type=os.getenv("DB_TYPE", "postgres").lower(),
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", "5432")),
         user=os.getenv("DB_USER", "postgres"),

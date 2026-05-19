@@ -361,3 +361,56 @@ CREATE TRIGGER check_repo_limit_trigger
 -- Example: Create admin user (uncomment and modify as needed)
 -- INSERT INTO users (email, password_hash, name, tier, max_repos, max_storage_per_repo_mb)
 -- VALUES ('admin@selfhealer.com', crypt('admin_password', gen_salt('bf')), 'Admin', 'pro', 999999, 10240);
+
+-- ============================================================================
+-- MIRRORED TABLES (used by DB_TYPE=postgres stores, matching SQLite schemas)
+-- ============================================================================
+
+-- Auth users (mirrors auth.db/users)
+CREATE TABLE IF NOT EXISTS auth_users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'admin',
+    created_at TEXT NOT NULL
+);
+
+-- Token registrations (mirrors tokens.db/registrations)
+CREATE TABLE IF NOT EXISTS token_registrations (
+    user_id TEXT PRIMARY KEY,
+    email TEXT DEFAULT '',
+    repo_url TEXT DEFAULT '',
+    repo_token TEXT DEFAULT '',
+    base_branch TEXT DEFAULT 'main',
+    notification_email TEXT DEFAULT NULL,
+    owner TEXT DEFAULT '',
+    created_at TEXT DEFAULT now()::text
+);
+
+-- Reports (mirrors reports.db/reports)
+CREATE TABLE IF NOT EXISTS store_reports (
+    report_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT '',
+    error_type TEXT NOT NULL DEFAULT 'Unknown',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    confidence REAL NOT NULL DEFAULT 0.0,
+    root_cause TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    line_number INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    report_type TEXT NOT NULL DEFAULT 'analysis',
+    proposals_count INTEGER NOT NULL DEFAULT 0,
+    proposals_json TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    branch_name TEXT NOT NULL DEFAULT '',
+    branch_url TEXT NOT NULL DEFAULT '',
+    compare_url TEXT NOT NULL DEFAULT '',
+    fix_status TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_reports_user ON store_reports(user_id);
+CREATE INDEX IF NOT EXISTS idx_store_reports_type ON store_reports(report_type);
+CREATE INDEX IF NOT EXISTS idx_store_reports_created ON store_reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_store_reports_error_type ON store_reports(error_type);

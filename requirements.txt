@@ -17,6 +17,7 @@ httpx>=0.27.0
 
 # Database
 asyncpg>=0.29.0  # PostgreSQL async driver
+psycopg2-binary>=2.9.9  # PostgreSQL sync driver (for stores)
 redis>=5.0.0      # Redis with async support
 
 # Password hashing

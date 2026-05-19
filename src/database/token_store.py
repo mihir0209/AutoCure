@@ -154,8 +154,13 @@ class TokenStore:
 _token_store: Optional[TokenStore] = None
 
 
-def get_token_store() -> TokenStore:
+def get_token_store():
     global _token_store
     if _token_store is None:
-        _token_store = TokenStore()
+        cfg = get_config()
+        if cfg.database.type == "postgres":
+            from database.pg_token_store import PgTokenStore
+            _token_store = PgTokenStore()
+        else:
+            _token_store = TokenStore()
     return _token_store
