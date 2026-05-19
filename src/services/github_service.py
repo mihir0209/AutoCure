@@ -990,7 +990,8 @@ def get_github_service(repos_base_path: Optional[Path] = None) -> GitHubService:
     global _github_service
     if _github_service is None:
         if repos_base_path is None:
-            # Use absolute path relative to project root (parent of src/)
             repos_base_path = Path(__file__).parent.parent.parent / "repos"
-        _github_service = GitHubService(repos_base_path)
+        from config import get_config
+        default_token = get_config().github.default_token
+        _github_service = GitHubService(repos_base_path, default_token=default_token)
     return _github_service

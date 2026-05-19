@@ -189,75 +189,31 @@ _registration_owners: Dict[str, str] = {}
 # Repository info: user_id -> RepositoryInfo
 user_repos: Dict[str, RepositoryInfo] = {}
 
-# Persistent registration storage
-_REGISTRATIONS_FILE = Path(__file__).parent.parent / "data" / "registrations.json"
+# Persistent registration storage via token_store (DB-backed)
 
 
-def _save_registrations():
-    """Persist user registrations to SQLite token store (and JSON backup)."""
-    token_store = get_token_store()
-    for uid, reg in user_registrations.items():
-        token_store.save_registration(
-            user_id=reg.user_id,
-            email=reg.email,
-            repo_url=reg.repo_url,
-            repo_token=reg.repo_token,
-            base_branch=reg.base_branch,
-            notification_email=reg.notification_email,
-            owner=_registration_owners.get(uid, ''),
-        )
-    # Also write JSON backup (without tokens for safety)
-    _REGISTRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    for uid, reg in user_registrations.items():
-        data[uid] = {
-            "user_id": reg.user_id,
-            "email": reg.email,
-            "repo_url": reg.repo_url,
-            "repo_token": "",
-            "base_branch": reg.base_branch,
-            "notification_email": reg.notification_email,
-        }
-    _REGISTRATIONS_FILE.write_text(json.dumps(data, indent=2))
+def _save_registration(reg: UserRegistration, owner: str = ""):
+    """Persist a single user registration to the token store."""
+    get_token_store().save_registration(
+        user_id=reg.user_id,
+        email=reg.email,
+        repo_url=reg.repo_url,
+        repo_token=reg.repo_token,
+        base_branch=reg.base_branch,
+        notification_email=reg.notification_email,
+        owner=owner,
+    )
 
 
 def _load_registrations():
-    """Load persisted user registrations from SQLite token store (fallback to JSON)."""
+    """Load persisted user registrations from token store."""
     token_store = get_token_store()
     db_regs = token_store.get_all_registrations()
 
-    if db_regs:
-        # Load from DB (primary source)
-        for uid, info in db_regs.items():
-            _registration_owners[uid] = info.pop("owner", "")
-            user_registrations[uid] = UserRegistration(**info)
-        logger.info(f"Loaded {len(db_regs)} registrations from token store")
-        return
-
-    # Fallback: migrate from JSON file
-    if not _REGISTRATIONS_FILE.exists():
-        return
-    try:
-        data = json.loads(_REGISTRATIONS_FILE.read_text())
-        for uid, info in data.items():
-            _registration_owners[uid] = ""  # No owner info in legacy JSON
-            user_registrations[uid] = UserRegistration(**info)
-            # Migrate to DB
-            token_store.save_registration(
-                user_id=info.get("user_id", uid),
-                email=info.get("email", ""),
-                repo_url=info.get("repo_url", ""),
-                repo_token=info.get("repo_token", ""),
-                base_branch=info.get("base_branch", "main"),
-                notification_email=info.get("notification_email"),
-            )
-        logger.info(f"Migrated {len(data)} registrations from JSON to token store")
-        # Rewrite JSON without tokens
-        for uid in data:
-            data[uid]["repo_token"] = ""
-        _REGISTRATIONS_FILE.write_text(json.dumps(data, indent=2))
-    except Exception as e:
-        logger.warning(f"Failed to load registrations: {e}")
+    for uid, info in db_regs.items():
+        _registration_owners[uid] = info.pop("owner", "")
+        user_registrations[uid] = UserRegistration(**info)
+    logger.info(f"Loaded {len(db_regs)} registrations from token store")
 
 
 # ============================================================================
@@ -920,6 +876,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Server: {config.server.host}:{config.server.port}")
     logger.info(f"  WebSocket Path: {config.server.websocket_path}")
     logger.info(f"  AI Provider: {config.ai.provider}")
+    logger.info(f"  Database: {config.database.type} ({config.database.host}:{config.database.port}/{config.database.database})")
     logger.info(f"  Python: {sys.executable}")
     try:
         ts_ver = importlib_metadata.version("tree-sitter")
@@ -940,7 +897,7 @@ async def lifespan(app: FastAPI):
     
     # Initialize SQLite report store
     _store = get_report_store()
-    logger.info(f"  Report store: {_store.db_path} ({_store.count()} reports)")
+    logger.info(f"  Report store: {config.database.type} ({_store.count()} reports)")
 
     # Load persisted registrations and re-attach repos
     _load_registrations()
@@ -1346,7 +1303,7 @@ async def register_user(registration: UserRegistration, request: Request, backgr
     _registration_owners[user_id] = owner
 
     user_registrations[user_id] = registration
-    _save_registrations()  # Persist to disk
+    _save_registration(registration, owner=owner)
     
     # Create a viewer account in auth DB so the user appears in the logs filter
     try:
@@ -1416,8 +1373,7 @@ async def unregister_user(user_id: str):
         raise HTTPException(status_code=404, detail="User not found")
     
     del user_registrations[user_id]
-    _save_registrations()  # Persist to disk
-    # Also remove from token store
+    # Remove from token store
     try:
         get_token_store().delete_registration(user_id)
     except Exception:
@@ -1978,7 +1934,7 @@ async def review_branch(user_id: str, request: Request, background_tasks: Backgr
                 user_id=user_id,
                 error_type=f"Branch Review: {branch}",
                 severity=review_result.overall_assessment or "comment",
-                confidence=review_result.overall_score / 10.0 if review_result.overall_score else 0.0,
+                confidence=min(review_result.overall_score / 100.0, 1.0) if review_result.overall_score else 0.0,
                 root_cause=review_result.summary[:500] if review_result.summary else "",
                 source_file=f"{owner}/{repo_name}",
                 line_number=0,
@@ -2369,7 +2325,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                         user_id=target_user,
                         error_type=f"Code Review: {commit_msg[:60]}",
                         severity=review_result.overall_assessment or "comment",
-                        confidence=review_result.overall_score / 10.0 if review_result.overall_score else 0.0,
+                        confidence=min(review_result.overall_score / 100.0, 1.0) if review_result.overall_score else 0.0,
                         root_cause=review_result.summary[:500] if review_result.summary else "",
                         source_file=f"{owner}/{repo_name}",
                         line_number=0,
@@ -2689,22 +2645,50 @@ async def list_dashboard_users(request: Request):
 
 @app.get("/api/v1/connections")
 async def get_connections(request: Request):
-    """Get active WebSocket connections (scoped by role)."""
+    """Get connection history for all registered services (scoped by role)."""
     caller = _get_user(request)
-    conns = manager.active_connections.values()
-    if caller and caller.role != "admin":
-        conns = [c for c in conns if c.user_id == caller.username]
+    is_admin = not caller or caller.role == "admin"
+
+    visible_uids = set(user_registrations.keys())
+    if not is_admin:
+        caller_username = caller.username if caller else ""
+        visible_uids = set()
+        for uid, reg in user_registrations.items():
+            owner = _registration_owners.get(uid, '')
+            if (owner and owner == caller_username) or uid == caller_username:
+                visible_uids.add(uid)
+
+    store = get_report_store()
+    services = []
+    for uid in sorted(visible_uids):
+        active_conn = manager.active_connections.get(uid)
+        latest_report = store.get_latest_for_user(uid)
+        total_reports = store.count_for_user(uid)
+
+        is_connected = active_conn is not None
+        if is_connected:
+            last_connected_at = active_conn.connected_at.isoformat()
+        elif latest_report:
+            last_connected_at = latest_report.created_at
+        else:
+            last_connected_at = None
+
+        services.append({
+            "user_id": uid,
+            "status": "connected" if is_connected else "idle",
+            "last_connected_at": last_connected_at,
+            "last_event": latest_report.error_type if latest_report else None,
+            "confidence": store._norm_conf(latest_report.confidence) if latest_report else None,
+            "report_id": latest_report.report_id if latest_report else None,
+            "report_url": f"/api/v1/reports/{latest_report.report_id}/view" if latest_report else None,
+            "severity": latest_report.severity if latest_report else None,
+            "total_reports": total_reports,
+        })
+
     return {
-        "connections": [
-            {
-                "user_id": conn.user_id,
-                "connected_at": conn.connected_at.isoformat(),
-                "last_heartbeat": conn.last_heartbeat.isoformat(),
-                "logs_received": conn.logs_received,
-                "errors_detected": conn.errors_detected,
-            }
-            for conn in conns
-        ]
+        "services": services,
+        "connected": sum(1 for s in services if s["status"] == "connected"),
+        "idle": sum(1 for s in services if s["status"] == "idle"),
     }
 
 
@@ -2738,6 +2722,7 @@ async def dashboard_summary(request: Request):
     store = get_report_store()
     report_stats = store.stats()
     return {
+        "registered_services": reg_count,
         "active_connections": active_conns,
         "registered_users": reg_count,
         "repositories_synced": repos_synced,
@@ -2778,7 +2763,7 @@ async def list_reports(
                 "user_id": r.user_id,
                 "error_type": r.error_type,
                 "severity": r.severity,
-                "confidence": r.confidence,
+                "confidence": store._norm_conf(r.confidence),
                 "root_cause": r.root_cause,
                 "source_file": r.source_file,
                 "line_number": r.line_number,
