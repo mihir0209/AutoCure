@@ -201,7 +201,10 @@ class AIAnalyzer:
             "key_error|index_error|import_error|syntax_error|logic_error|validation_error|"
             "concurrency_error|network_error|permission_error|configuration_error|dependency_error|other>\","
             " \"severity\":\"<critical|high|medium|low>\", \"affected_components\":[\"mod.Class.func\"],"
-            " \"confidence\":0.85, \"additional_context\":\"...\"}\n\n"
+            " \"confidence\":0.85, \"additional_context\":\"...\",\n"
+            "  \"error_pin\":{\"file\":\"path/to/file.py\",\"line\":42,\"reason\":\"brief why this is the real cause\"}}\n"
+            "  Include error_pin ONLY when the reported error line does NOT point to the actual root cause\n"
+            "  (e.g. segfaults, C-extension crashes, indirect/null dereferences, library internals).\n\n"
             "PHASE 2 — When asked to GENERATE FIX PROPOSALS:\n"
             "  Create exact, copy-paste-ready code fixes.\n"
             "  ONLY fix executable code — NEVER modify comments or docstrings.\n"
@@ -547,6 +550,8 @@ class AIAnalyzer:
     def _parse_analysis_response(self, response: str, error: DetectedError) -> RootCauseAnalysis:
         data = _extract_json(response)
 
+        pin = data.get("error_pin") or {}
+
         return RootCauseAnalysis(
             error=error,
             root_cause=data.get("root_cause", "Unable to determine root cause"),
@@ -556,6 +561,9 @@ class AIAnalyzer:
             confidence=float(data.get("confidence", 0.5)),
             additional_context=data.get("additional_context", ""),
             analyzed_at=datetime.utcnow(),
+            error_pin_file=pin.get("file"),
+            error_pin_line=pin.get("line"),
+            error_pin_reason=pin.get("reason"),
         )
 
     def _parse_fix_response(self, response: str, error: DetectedError) -> List[FixProposal]:

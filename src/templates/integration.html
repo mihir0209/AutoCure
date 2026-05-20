@@ -3,6 +3,70 @@
 {% block page_title %}<i class="ph ph-code-block"></i> Integration{% endblock %}
 
 {% block content %}
+<div class="grid-2 mb-6">
+  <!-- Registration Form -->
+  <div class="card">
+    <div class="card-header"><h2><i class="ph ph-user-plus"></i> Register New Service</h2></div>
+    <div class="card-body">
+      <div id="regResult"></div>
+      <form id="registerForm" onsubmit="registerService(event)">
+        <div class="form-group">
+          <label class="form-label"><i class="ph ph-identification-card"></i> User ID</label>
+          <input type="text" name="user_id" class="form-input" placeholder="my-service-01" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label"><i class="ph ph-github-logo"></i> Repository URL</label>
+          <input type="text" name="repo_url" class="form-input" placeholder="https://github.com/org/repo" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label"><i class="ph ph-key"></i> Access Token <small style="color:var(--text-muted)">(GitHub PAT)</small></label>
+          <input type="password" name="repo_token" class="form-input" placeholder="ghp_xxxxxxxxxxxx">
+        </div>
+        <div class="form-group">
+          <label class="form-label"><i class="ph ph-envelope"></i> Notification Email</label>
+          <input type="email" name="notification_email" class="form-input" placeholder="dev@example.com">
+        </div>
+        <div class="form-group">
+          <label class="form-label"><i class="ph ph-git-branch"></i> Base Branch</label>
+          <input type="text" name="base_branch" class="form-input" placeholder="main" value="main">
+        </div>
+        <button type="submit" class="btn btn-primary btn-block"><i class="ph ph-user-plus"></i> Register</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Registered Services -->
+  <div class="card">
+    <div class="card-header">
+      <h2><i class="ph ph-list-checks"></i> Registered Services</h2>
+      <button class="btn btn-sm btn-ghost" onclick="loadRegistered()"><i class="ph ph-arrows-clockwise"></i></button>
+    </div>
+    <div class="card-body" id="registeredList">
+      <div class="empty-state"><i class="ph ph-users"></i><p>No services registered yet.</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- How it works -->
+<div class="card mb-6">
+  <div class="card-header"><h2><i class="ph ph-flow-arrow"></i> How It Works</h2></div>
+  <div class="card-body">
+    <ol style="color:var(--text-secondary);font-size:14px;padding-left:20px;display:flex;flex-direction:column;gap:10px;">
+      <li><strong style="color:var(--text-primary)">Register</strong> your service using the form above (or <code>POST /api/v1/register</code>).</li>
+      <li><strong style="color:var(--text-primary)">Add the code snippet</strong> below to your application. It opens a WebSocket connection to AutoCure and streams your logs.</li>
+      <li><strong style="color:var(--text-primary)">AutoCure monitors</strong> your logs in real-time. When an error is detected, it automatically:
+        <ul style="margin-top:4px;">
+          <li>Parses the AST of your source code for root-cause analysis</li>
+          <li>Runs AI-powered analysis to identify the root cause</li>
+          <li>Validates confidence across multiple iterations</li>
+          <li>Generates precise fix proposals with exact code diffs</li>
+          <li>Saves an HTML report and optionally emails it to you</li>
+        </ul>
+      </li>
+      <li><strong style="color:var(--text-primary)">View results</strong> on the Reports page or check your email.</li>
+    </ol>
+  </div>
+</div>
 <!-- Demo Services Quick-Integration Guide -->
 <div class="card mb-6" style="border:1px solid var(--border-accent);">
   <div class="card-header"><h2><i class="ph ph-lightning"></i> Integration Guide</h2></div>
@@ -58,241 +122,6 @@
         <tr><td class="text-muted">Health Check</td><td class="mono text-sm">{{ server_url }}/health</td></tr>
       </tbody>
     </table>
-  </div>
-</div>
-
-<div class="grid-2 mb-6">
-  <!-- Registration Form -->
-  <div class="card">
-    <div class="card-header"><h2><i class="ph ph-user-plus"></i> Register New Service</h2></div>
-    <div class="card-body">
-      <div id="regResult"></div>
-      <form id="registerForm" onsubmit="registerService(event)">
-        <div class="form-group">
-          <label class="form-label"><i class="ph ph-identification-card"></i> User ID</label>
-          <input type="text" name="user_id" class="form-input" placeholder="my-service-01" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label"><i class="ph ph-github-logo"></i> Repository URL</label>
-          <input type="text" name="repo_url" class="form-input" placeholder="https://github.com/org/repo" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label"><i class="ph ph-key"></i> Access Token <small style="color:var(--text-muted)">(GitHub PAT, read-only)</small></label>
-          <input type="password" name="repo_token" class="form-input" placeholder="ghp_xxxxxxxxxxxx">
-        </div>
-        <div class="form-group">
-          <label class="form-label"><i class="ph ph-envelope"></i> Notification Email</label>
-          <input type="email" name="notification_email" class="form-input" placeholder="dev@example.com">
-        </div>
-        <div class="form-group">
-          <label class="form-label"><i class="ph ph-git-branch"></i> Base Branch</label>
-          <input type="text" name="base_branch" class="form-input" placeholder="main" value="main">
-        </div>
-        <button type="submit" class="btn btn-primary btn-block"><i class="ph ph-user-plus"></i> Register</button>
-      </form>
-    </div>
-  </div>
-
-  <!-- Registered Services -->
-  <div class="card">
-    <div class="card-header">
-      <h2><i class="ph ph-list-checks"></i> Registered Services</h2>
-      <button class="btn btn-sm btn-ghost" onclick="loadRegistered()"><i class="ph ph-arrows-clockwise"></i></button>
-    </div>
-    <div class="card-body" id="registeredList">
-      <div class="empty-state"><i class="ph ph-users"></i><p>No services registered yet.</p></div>
-    </div>
-  </div>
-</div>
-
-<!-- How it works -->
-<div class="card mb-6">
-  <div class="card-header"><h2><i class="ph ph-flow-arrow"></i> How It Works</h2></div>
-  <div class="card-body">
-    <ol style="color:var(--text-secondary);font-size:14px;padding-left:20px;display:flex;flex-direction:column;gap:10px;">
-      <li><strong style="color:var(--text-primary)">Register</strong> your service using the form above (or <code>POST /api/v1/register</code>).</li>
-      <li><strong style="color:var(--text-primary)">Add the code snippet</strong> below to your application. It opens a WebSocket connection to AutoCure and streams your logs.</li>
-      <li><strong style="color:var(--text-primary)">AutoCure monitors</strong> your logs in real-time. When an error is detected, it automatically:
-        <ul style="margin-top:4px;">
-          <li>Parses the AST of your source code for root-cause analysis</li>
-          <li>Runs AI-powered analysis to identify the root cause</li>
-          <li>Validates confidence across multiple iterations</li>
-          <li>Generates precise fix proposals with exact code diffs</li>
-          <li>Saves an HTML report and optionally emails it to you</li>
-        </ul>
-      </li>
-      <li><strong style="color:var(--text-primary)">View results</strong> on the Reports page or check your email.</li>
-    </ol>
-  </div>
-</div>
-
-<!-- Python Snippet -->
-<div class="card mb-6">
-  <div class="card-header">
-    <h2><i class="ph ph-file-py"></i> Python Integration</h2>
-    <button class="btn btn-sm" onclick="copyToClipboard(document.getElementById('pySnippet').textContent, this)"><i class="ph ph-copy"></i> Copy</button>
-  </div>
-  <div class="code-block">
-    <div class="code-header">autocure_client.py &mdash; pip install websockets</div>
-    <pre class="code-content" id="pySnippet">import asyncio, json, logging, traceback
-from datetime import datetime, timezone
-
-try:
-    import websockets
-except ImportError:
-    raise ImportError("Run: pip install websockets")
-
-# Replace with your registered user ID and server address
-AUTOCURE_URL = "{{ ws_url }}/ws/logs/YOUR_USER_ID"
-
-
-class AutoCureHandler(logging.Handler):
-    """Python logging handler that streams logs to AutoCure via WebSocket."""
-
-    def __init__(self, ws_url=AUTOCURE_URL, level=logging.WARNING):
-        super().__init__(level)
-        self.ws_url = ws_url
-        self._queue = asyncio.Queue()
-        self._task = None
-
-    def start(self):
-        """Call this after your event loop is running."""
-        self._task = asyncio.ensure_future(self._sender())
-
-    async def _sender(self):
-        """Maintain a persistent WebSocket connection and stream log entries."""
-        while True:
-            try:
-                async with websockets.connect(self.ws_url) as ws:
-                    print(f"[AutoCure] Connected to {self.ws_url}")
-                    while True:
-                        entry = await self._queue.get()
-                        await ws.send(json.dumps(entry))
-            except Exception as e:
-                print(f"[AutoCure] Connection lost ({e}), reconnecting in 5s...")
-                await asyncio.sleep(5)
-
-    def emit(self, record):
-        entry = {
-            "message": record.getMessage(),
-            "level": record.levelname,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source_file": record.pathname,
-            "line_number": record.lineno,
-            "logger_name": record.name,
-        }
-        if record.exc_info and record.exc_info[0]:
-            entry["stack_trace"] = "".join(
-                traceback.format_exception(*record.exc_info)
-            )
-        try:
-            self._queue.put_nowait(entry)
-        except Exception:
-            pass
-
-
-# ---- Usage -------------------------------------------------------
-# import asyncio, logging
-#
-# handler = AutoCureHandler("{{ ws_url }}/ws/logs/my-service")
-# logging.getLogger().addHandler(handler)
-#
-# async def main():
-#     handler.start()
-#     # ... your application code ...
-#     logging.error("Something broke!", exc_info=True)
-#
-# asyncio.run(main())</pre>
-  </div>
-</div>
-
-<!-- Node.js Snippet -->
-<div class="card mb-6">
-  <div class="card-header">
-    <h2><i class="ph ph-file-js"></i> Node.js Integration</h2>
-    <button class="btn btn-sm" onclick="copyToClipboard(document.getElementById('jsSnippet').textContent, this)"><i class="ph ph-copy"></i> Copy</button>
-  </div>
-  <div class="code-block">
-    <div class="code-header">autocure-client.js &mdash; npm install ws</div>
-    <pre class="code-content" id="jsSnippet">const WebSocket = require('ws');
-
-// Replace with your registered user ID and server address
-const AUTOCURE_URL = '{{ ws_url }}/ws/logs/YOUR_USER_ID';
-
-class AutoCureClient {
-  constructor(url) {
-    this.url = url || AUTOCURE_URL;
-    this.ws = null;
-    this.queue = [];
-    this.connect();
-  }
-
-  connect() {
-    this.ws = new WebSocket(this.url);
-    this.ws.on('open', () => {
-      console.log('[AutoCure] Connected to', this.url);
-      // Flush queued messages
-      this.queue.forEach(e => this.ws.send(JSON.stringify(e)));
-      this.queue = [];
-    });
-    this.ws.on('close', () => {
-      console.log('[AutoCure] Disconnected, reconnecting in 5s...');
-      setTimeout(() => this.connect(), 5000);
-    });
-    this.ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw);
-        if (msg.type === 'analysis_complete') {
-          console.log('[AutoCure] Analysis result:', msg.payload);
-        }
-      } catch (e) { /* ignore */ }
-    });
-    this.ws.on('error', () => {}); // suppress unhandled
-  }
-
-  send(entry) {
-    const payload = {
-      message: entry.message || '',
-      level: entry.level || 'INFO',
-      timestamp: new Date().toISOString(),
-      source_file: entry.file || '',
-      line_number: entry.line || 0,
-      stack_trace: entry.stack || '',
-      api_endpoint: entry.endpoint || '',
-      http_method: entry.method || '',
-    };
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
-    } else {
-      this.queue.push(payload);
-    }
-  }
-
-  error(message, err, extra) {
-    this.send({
-      message: message,
-      level: 'ERROR',
-      stack: err ? err.stack : '',
-      ...(extra || {}),
-    });
-  }
-}
-
-// ---- Usage -------------------------------------------------------
-// const autocure = new AutoCureClient(
-//   '{{ ws_url }}/ws/logs/my-service'
-// );
-//
-// try {
-//   riskyOperation();
-// } catch (err) {
-//   autocure.error('Something broke', err, {
-//     endpoint: '/api/users',
-//     method: 'POST',
-//   });
-// }
-
-module.exports = AutoCureClient;</pre>
   </div>
 </div>
 {% endblock %}

@@ -212,6 +212,9 @@ def _load_registrations():
 
     for uid, info in db_regs.items():
         _registration_owners[uid] = info.pop("owner", "")
+        # Normalize datetime strings that Pydantic can't parse (e.g. '+00' → '+00:00')
+        if "created_at" in info and isinstance(info["created_at"], str):
+            info["created_at"] = _fix_datetime_str(info["created_at"])
         user_registrations[uid] = UserRegistration(**info)
     logger.info(f"Loaded {len(db_regs)} registrations from token store")
 
@@ -221,6 +224,16 @@ def _load_registrations():
 # ============================================================================
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _fix_datetime_str(s: str) -> str:
+    """Fix datetime strings from DB that Pydantic can't parse."""
+    import re as _re
+    # Fix short timezone offset like '+00' → '+00:00'
+    s = _re.sub(r'([+-]\d{2})$', r'\1:00', s)
+    # Fix timezone after fractional seconds like '+00:00' without colon in tz
+    s = _re.sub(r'([+-])(\d{2})$', r'\1\2:00', s)
+    return s
 
 
 def _is_absolute_path_any_os(path: str) -> bool:
@@ -565,6 +578,27 @@ async def analyze_error(user_id: str, log_entry: LogEntry):
         )
         
         logger.info(f"AI Analysis complete - Initial Confidence: {analysis.confidence:.0%}")
+
+        # If AI pinpointed a different root-cause location, trace AST for that file too
+        if analysis.error_pin_file and analysis.error_pin_line:
+            logger.info(f"AI error_pin: {analysis.error_pin_file}:{analysis.error_pin_line} — {analysis.error_pin_reason}")
+            if (get_ast_trace_service and ast_trace
+                    and analysis.error_pin_file != detected_error.source_file):
+                try:
+                    pin_trace_svc = get_ast_trace_service()
+                    pin_trace = pin_trace_svc.trace_error(
+                        error_file=analysis.error_pin_file,
+                        error_line=analysis.error_pin_line,
+                        repo_path=repo_path,
+                    )
+                    # Attach the pin file AST alongside the main trace
+                    if pin_trace and pin_trace.main_ast:
+                        ast_trace.pin_file_ast = pin_trace
+                        ast_trace.pin_file = analysis.error_pin_file
+                        ast_trace.pin_line = analysis.error_pin_line
+                        ast_trace.pin_reason = analysis.error_pin_reason
+                except Exception as e:
+                    logger.warning(f"Pin file AST trace failed: {e}")
 
         # Broadcast analysis progress to dashboard
         asyncio.create_task(manager.broadcast_dashboard({
@@ -1141,23 +1175,72 @@ async def page_integration(request: Request):
 
 
 @app.get("/visualizer", include_in_schema=False)
-async def page_visualizer(request: Request):
-    """Serve the React-based AST Visualizer SPA."""
+async def page_visualizer(request: Request, repo: Optional[str] = Query(None)):
+    """Serve the React-based AST Visualizer SPA.
+
+    When ?repo=<user_id> is present, injects an auto-load script that
+    fetches the pre-computed visualization data and feeds it to the SPA
+    by intercepting the upload call and auto-triggering the file input.
+    """
     user = _get_user(request)
     if not user:
         return RedirectResponse("/login")
-    # Try static copy first, then original dist
+
+    # Locate the compiled React SPA's index.html
     static_index = _STATIC_DIR / "visualizer" / "index.html"
     react_index = Path(__file__).parent.parent / "Visualizer" / "AiHealingSystem" / "dist" / "index.html"
+    index_path = None
     for idx in (static_index, react_index):
         if idx.exists():
-            return FileResponse(str(idx), media_type="text/html")
-    # Fallback to template-based visualizer
-    visualizer_url = "http://localhost:5173"
-    return _render_template("visualizer.html", {
-        "request": request, "user": user, "page": "visualizer",
-        "visualizer_url": visualizer_url,
-    })
+            index_path = idx
+            break
+
+    if not index_path:
+        # Fallback to template-based visualizer
+        return _render_template("visualizer.html", {
+            "request": request, "user": user, "page": "visualizer",
+            "visualizer_url": "http://localhost:5173",
+        })
+
+    html = index_path.read_text(encoding="utf-8")
+
+    if repo:
+        # Inject auto-load script before the React bundle
+        _AUTOLOAD_SCRIPT = """<script>
+(function(){
+  var REPO_ID = '%s';
+  var _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    if (typeof url === 'string' && url.indexOf('/upload/zip') !== -1 && opts && opts.method === 'POST') {
+      return _origFetch('/api/v1/repo/' + encodeURIComponent(REPO_ID) + '/visualize')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          return new Response(JSON.stringify(data), {status:200, headers:{'Content-Type':'application/json'}});
+        });
+    }
+    return _origFetch.apply(this, arguments);
+  };
+  function tryAutoUpload() {
+    var input = document.querySelector('input[type="file"][accept=".zip"]');
+    if (!input) return false;
+    var dt = new DataTransfer();
+    dt.items.add(new File([''], 'repo.zip', {type:'application/zip'}));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    return true;
+  }
+  var _obs = new MutationObserver(function() {
+    if (tryAutoUpload()) _obs.disconnect();
+  });
+  window.addEventListener('DOMContentLoaded', function() {
+    if (!tryAutoUpload()) _obs.observe(document.body, {childList:true, subtree:true});
+    setTimeout(function(){ _obs.disconnect(); }, 15000);
+  });
+})();
+</script>""" % repo.replace("'", "\\'")
+        html = html.replace("</head>", _AUTOLOAD_SCRIPT + "\n</head>")
+
+    return HTMLResponse(content=html)
 
 
 # ============================================================================
@@ -1485,6 +1568,28 @@ async def list_repo_files(user_id: str, ext: Optional[str] = Query(None)):
         if lang:
             result.append({"path": rel, "language": lang, "size": f.stat().st_size})
     return {"user_id": user_id, "repo_root": str(sub), "files": result[:500]}
+
+
+@app.get("/api/v1/repo/{user_id}/visualize")
+async def visualize_repo(user_id: str):
+    """Process a user's repo and return full AST visualization data."""
+    if user_id not in user_registrations:
+        raise HTTPException(status_code=404, detail="User not found")
+    repo_info = user_repos.get(user_id)
+    if not repo_info:
+        raise HTTPException(status_code=404, detail="Repository not cloned yet")
+    local = Path(repo_info.local_path)
+    if not local.exists():
+        raise HTTPException(status_code=404, detail="Repository path not found on disk")
+    sub = local
+    children = [p for p in local.iterdir() if p.is_dir() and not p.name.startswith('.')]
+    if len(children) == 1 and any(children[0].iterdir()):
+        sub = children[0]
+    from services.ast_visualizer import get_ast_visualizer
+    result = get_ast_visualizer().parse_repo_directory(str(sub), sub.name)
+    if "error" in result and result["error"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.post("/api/v1/repo/{user_id}/ast")

@@ -94,7 +94,8 @@ def _get_error(analysis: Optional[RootCauseAnalysis]):
     return None
 
 
-def _ast_node_to_dict(node: ASTNode, max_depth: int = 12, depth: int = 0) -> Optional[dict]:
+def _ast_node_to_dict(node: ASTNode, max_depth: int = 12, depth: int = 0,
+                      pin_line: int = 0, error_line: int = 0) -> Optional[dict]:
     """Recursively convert ASTNode to JSON-serializable dict for the interactive visualizer."""
     if node is None or depth > max_depth:
         return None
@@ -104,10 +105,14 @@ def _ast_node_to_dict(node: ASTNode, max_depth: int = 12, depth: int = 0) -> Opt
         "loc": {"start": {"line": node.start_line, "col": node.start_col},
                 "end": {"line": node.end_line, "col": node.end_col}},
     }
+    if pin_line and node.start_line <= pin_line <= node.end_line:
+        d["isErrorPin"] = True
+    if error_line and node.start_line <= error_line <= node.end_line:
+        d["isErrorLine"] = True
     if node.code_snippet:
         d["snippet"] = node.code_snippet.split("\n")[0][:120]
     if node.children:
-        kids = [_ast_node_to_dict(c, max_depth, depth + 1) for c in node.children]
+        kids = [_ast_node_to_dict(c, max_depth, depth + 1, pin_line=pin_line, error_line=error_line) for c in node.children]
         d["children"] = [k for k in kids if k is not None]
     return d
 
@@ -154,7 +159,6 @@ _INTERACTIVE_TREE_JS = """
 
   function color(t){return colors[(t||'').toLowerCase()]||defColor;}
 
-  // Layout: compute (x,y) for each visible node
   function layout(node, id, depth){
     var n = {id:id, node:node, x:0, y:depth*PAD_Y, depth:depth, children:[]};
     if(node.children && node.children.length && expanded[id]){
@@ -204,13 +208,22 @@ _INTERACTIVE_TREE_JS = """
     var svgW = maxX + NODE_W + 40;
     var svgH = (md+1)*PAD_Y + NODE_H + 40;
 
+    // Defs for pin glow filter
     var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="'+svgW+'" height="'+svgH+'">';
+    svg+='<defs><filter id="pin-glow" x="-40%" y="-40%" width="180%" height="180%">';
+    svg+='<feGaussianBlur stdDeviation="3" result="blur"/>';
+    svg+='<feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+
     // Edges
     for(var i=0;i<edges.length;i++){
       var p=edges[i][0], c=edges[i][1];
       var px=p.x, py=p.y+NODE_H, cx=c.x, cy=c.y;
       var my=(py+cy)/2;
-      svg+='<path d="M'+px+' '+py+' C'+px+' '+my+' '+cx+' '+my+' '+cx+' '+cy+'" fill="none" stroke="#30363d" stroke-width="1.5"/>';
+      var cIsPin=!!c.node.isErrorPin, cIsErr=!!c.node.isErrorLine;
+      var ec = cIsPin ? '#f85149' : (cIsErr ? '#d29922' : '#30363d');
+      var ew = cIsPin ? '2.5' : (cIsErr ? '2' : '1.5');
+      var dash = cIsPin ? ' stroke-dasharray="4,3"' : '';
+      svg+='<path d="M'+px+' '+py+' C'+px+' '+my+' '+cx+' '+my+' '+cx+' '+cy+'" fill="none" stroke="'+ec+'" stroke-width="'+ew+'"'+dash+'/>';
     }
     // Nodes
     for(var i=0;i<nodes.length;i++){
@@ -218,12 +231,20 @@ _INTERACTIVE_TREE_JS = """
       var c=color(nd.type);
       var hasKids = nd.children && nd.children.length>0;
       var isExp = expanded[n.id];
+      var isPin = !!nd.isErrorPin;
+      var isErr = !!nd.isErrorLine && !isPin; // error line but not pin
       var lbl = (nd.name || nd.type).substring(0,18);
       var sub = nd.type + (nd.loc?' L'+nd.loc.start.line:'');
+      if(isPin) sub += ' \\u{1F3AF}';
+      else if(isErr) sub += ' \\u26A0';
       var rx=n.x-NODE_W/2, ry=n.y;
+      var fill = isPin ? 'rgba(248,81,73,0.15)' : (isErr ? 'rgba(210,153,34,0.12)' : c+'22');
+      var stroke = isPin ? '#f85149' : (isErr ? '#d29922' : c);
+      var sw = isPin ? '2.5' : (isErr ? '2' : '1.5');
+      var filt = isPin ? ' filter="url(#pin-glow)"' : '';
       svg+='<g class="ast-viz-node" data-id="'+n.id+'" transform="translate('+rx+','+ry+')">';
-      svg+='<rect width="'+NODE_W+'" height="'+NODE_H+'" rx="6" fill="'+c+'22" stroke="'+c+'" stroke-width="1.5"/>';
-      svg+='<text class="ast-viz-label" x="8" y="16" fill="#e6edf3" font-size="12" font-weight="600">'+esc(lbl)+'</text>';
+      svg+='<rect width="'+NODE_W+'" height="'+NODE_H+'" rx="6" fill="'+fill+'" stroke="'+stroke+'" stroke-width="'+sw+'"'+filt+'/>';
+      svg+='<text class="ast-viz-label" x="8" y="16" fill="'+(isPin?'#f85149':(isErr?'#d29922':'#e6edf3'))+'" font-size="12" font-weight="'+(isPin||isErr?'700':'600')+'">'+esc(lbl)+'</text>';
       svg+='<text class="ast-viz-label" x="8" y="30" fill="#8b949e" font-size="10">'+esc(sub)+'</text>';
       if(hasKids){
         svg+='<text x="'+(NODE_W-16)+'" y="26" fill="#8b949e" font-size="14" text-anchor="middle">'+(isExp?'\\u25BC':'\\u25B6')+'</text>';
@@ -234,15 +255,45 @@ _INTERACTIVE_TREE_JS = """
     var container = wrap.querySelector('.ast-viz-container');
     container.innerHTML = svg;
 
-    // Attach click handlers
-    var gs = container.querySelectorAll('.ast-viz-node');
-    for(var j=0;j<gs.length;j++){
-      gs[j].addEventListener('click', function(){
-        var id = this.getAttribute('data-id');
-        if(expanded[id]) delete expanded[id]; else expanded[id]=true;
-        render();
-      });
+    // Tooltip for pin nodes
+    var pinGs = container.querySelectorAll('.ast-viz-node');
+    for(var j=0;j<pinGs.length;j++){
+      var g = pinGs[j];
+      var nid = g.getAttribute('data-id');
+      (function(nid2, gEl){
+        gEl.addEventListener('click', function(){
+          if(expanded[nid2]) delete expanded[nid2]; else expanded[nid2]=true;
+          render();
+        });
+        // Hover tooltip for pin nodes
+        var nd2 = findNode(data,nid2.replace(/^(root-?)/,'').split('-'));
+        if(nd2 && nd2.isErrorPin){
+          var tip = document.createElement('div');
+          tip.className='ast-viz-tooltip';
+          tip.style.cssText='display:none;position:absolute;background:#1c1e21;color:#f85149;padding:6px 10px;border-radius:4px;font-size:12px;max-width:300px;z-index:10;pointer-events:none;border:1px solid #f85149;';
+          var reason = window[DATA_ID+'_PIN_REASON']||'';
+          tip.textContent = reason||'AI-pinpointed root cause';
+          gEl.parentNode.appendChild(tip);
+          gEl.addEventListener('mouseenter',function(e){
+            var r=gEl.getBoundingClientRect();
+            var cr=container.getBoundingClientRect();
+            tip.style.left=(r.left-cr.left+container.scrollLeft+r.width/2-80)+'px';
+            tip.style.top=(r.top-cr.top+container.scrollTop+r.height+4)+'px';
+            tip.style.display='block';
+          });
+          gEl.addEventListener('mouseleave',function(){tip.style.display='none';});
+        }
+      })(nid, g);
     }
+  }
+
+  function findNode(d,path){
+    if(!d) return null;
+    if(!path||!path.length||path[0]==='') return d;
+    var idx=parseInt(path.shift());
+    if(isNaN(idx)) return d;
+    if(d.children&&d.children[idx]) return findNode(d.children[idx],path);
+    return null;
   }
 
   function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
@@ -254,9 +305,19 @@ _INTERACTIVE_TREE_JS = """
   };
   wrap.querySelector('.ast-viz-btn-collapse').onclick=function(){expanded={'root':true};render();};
 
-  // Initial expand first two levels
+  // Initial expand first two levels + error/pin paths
   expanded['root']=true;
   if(data.children) for(var i=0;i<data.children.length;i++) expanded['root-'+i]=true;
+  // Auto-expand path to pinned or error-line node
+  (function expandToTarget(n,id){
+    if(!n||!n.children) return false;
+    for(var i=0;i<n.children.length;i++){
+      var cid=id+'-'+i;
+      if(n.children[i].isErrorPin||n.children[i].isErrorLine){expanded[cid]=true;expanded[id]=true;return true;}
+      if(expandToTarget(n.children[i],cid)){expanded[id]=true;return true;}
+    }
+    return false;
+  })(data,'root');
   render();
 })();
 """
@@ -271,19 +332,90 @@ def _build_interactive_ast_section(ast_trace, section_id: str = "ast_interactive
     if not ast_trace or not ast_trace.main_ast:
         return ""
 
+    has_pin = bool(ast_trace.pin_file and ast_trace.pin_line)
+    pin_line = ast_trace.pin_line if has_pin else 0
+    pin_in_same_file = has_pin and ast_trace.pin_file == ast_trace.error_file
+
     data_var = f"__ast_{section_id}__"
+    effective_pin = pin_line if pin_in_same_file else 0
+    error_line = ast_trace.error_line if ast_trace.error_line else 0
     ast_json = json_mod.dumps(
-        _ast_node_to_dict(ast_trace.main_ast, max_depth=12),
+        _ast_node_to_dict(ast_trace.main_ast, max_depth=12, pin_line=effective_pin, error_line=error_line),
         separators=(',', ':'),
     )
 
     js = _INTERACTIVE_TREE_JS.replace('__AST_DATA_ID__', data_var)
+
+    # Build pin banner if AI pinpointed a different location
+    pin_banner = ""
+    if has_pin:
+        pin_reason = _esc(ast_trace.pin_reason or "AI identified this as the root cause")
+        pin_loc = f"L{ast_trace.pin_line}"
+        if not pin_in_same_file:
+            pin_banner = (
+                '<div style="background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);'
+                'border-radius:6px;padding:10px 14px;margin-bottom:10px;">'
+                '<span style="color:#f85149;font-weight:700;">&#127919; AI-Pinpointed Root Cause</span> '
+                f'in <code style="color:#58a6ff;">{_esc(ast_trace.pin_file)}</code> at '
+                f'<code style="color:#f85149;">{pin_loc}</code>'
+                f' &mdash; differs from reported error at L{ast_trace.error_line}'
+                f'<br><small style="color:#8b949e;">{pin_reason}</small></div>'
+            )
+        else:
+            pin_banner = (
+                '<div style="background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);'
+                'border-radius:6px;padding:10px 14px;margin-bottom:10px;">'
+                '<span style="color:#f85149;font-weight:700;">&#127919; AI-Pinpointed Root Cause</span> at '
+                f'<code style="color:#f85149;">{pin_loc}</code>'
+                f' &mdash; differs from reported error at L{ast_trace.error_line}'
+                f'<br><small style="color:#8b949e;">{pin_reason}</small></div>'
+            )
+
+    # Pin reason for JS tooltip
+    pin_reason_js = ""
+    if has_pin:
+        reason = (ast_trace.pin_reason or "AI-pinpointed root cause").replace("'", "\\'")
+        pin_reason_js = f"<script>window['{data_var}_PIN_REASON']=\"{reason}\";</script>"
+
+    # Build second tree for pin file if it's in a different file
+    pin_file_section = ""
+    if has_pin and not pin_in_same_file and ast_trace.pin_file_ast and ast_trace.pin_file_ast.main_ast:
+        pin_sec_id = f"{section_id}_pin"
+        pin_data_var = f"__ast_{pin_sec_id}__"
+        pin_ast_json = json_mod.dumps(
+            _ast_node_to_dict(ast_trace.pin_file_ast.main_ast, max_depth=12,
+                              pin_line=ast_trace.pin_line),
+            separators=(',', ':'),
+        )
+        pin_js = _INTERACTIVE_TREE_JS.replace('__AST_DATA_ID__', pin_data_var)
+        pin_reason_for_js = (ast_trace.pin_reason or "AI-pinpointed root cause").replace("'", "\\'")
+        pin_file_section = f"""
+  <div class="card">
+    <h2><i class="ph ph-crosshair" style="color:#f85149;"></i> AI-Pinpointed Root Cause File</h2>
+    <p style="color:var(--fg2);font-size:13px;margin-bottom:8px;">
+      The AI identified <code style="color:#f85149;">{_esc(ast_trace.pin_file)}</code> as the true origin of the error.
+    </p>
+    <div class="ast-viz-wrap" id="{pin_data_var}_wrap">
+      <div class="ast-viz-toolbar">
+        <button class="ast-viz-btn-expand">Expand All</button>
+        <button class="ast-viz-btn-collapse">Collapse All</button>
+        <span style="color:#f85149;font-size:11px;margin-left:auto;">
+          <i class="ph ph-crosshair" style="font-size:11px;"></i> {_esc(ast_trace.pin_file)} &bull; Root cause at L{ast_trace.pin_line}</span>
+      </div>
+      <div class="ast-viz-container"></div>
+    </div>
+  </div>
+  <script>window['{pin_data_var}']={pin_ast_json};</script>
+  <script>window['{pin_data_var}_PIN_REASON']="{pin_reason_for_js}";</script>
+  <script>{pin_js}</script>
+"""
 
     return f"""
   <div class="card">
     <h2><i class="ph ph-tree-structure"></i> Interactive AST Visualization</h2>
     <p style="color:var(--fg2);font-size:13px;margin-bottom:8px;">
       Click nodes to expand/collapse. Drag to pan.</p>
+    {pin_banner}
     <div class="ast-viz-wrap" id="{data_var}_wrap">
       <div class="ast-viz-toolbar">
         <button class="ast-viz-btn-expand">Expand All</button>
@@ -295,7 +427,9 @@ def _build_interactive_ast_section(ast_trace, section_id: str = "ast_interactive
     </div>
   </div>
   <script>window['{data_var}']={ast_json};</script>
+  {pin_reason_js}
   <script>{js}</script>
+{pin_file_section}
 """
 
 

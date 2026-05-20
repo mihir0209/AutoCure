@@ -27,62 +27,28 @@
 <div class="card mb-6">
   <div class="card-header">
     <h2><i class="ph ph-tree-structure"></i> Repository AST Visualization</h2>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <select id="repoSelect" class="input" style="min-width:200px;" onchange="loadRepoFiles()">
-        <option value="">Select a repository...</option>
-      </select>
-      <a href="/visualizer" class="btn btn-sm btn-primary" target="_blank"><i class="ph ph-arrow-square-out"></i> Full Visualizer</a>
-    </div>
   </div>
-  <div class="card-body">
-    <div id="repoAstContainer" style="display:none;">
-      <div style="display:flex;gap:0;height:600px;">
-        <!-- File tree panel -->
-        <div style="width:240px;border-right:1px solid var(--border);overflow-y:auto;padding:8px 12px 8px 8px;flex-shrink:0;">
-          <div style="margin-bottom:8px;">
-            <input type="text" id="fileFilter" class="input" placeholder="Filter files..." onkeyup="filterFiles()" style="width:100%;font-size:12px;padding:4px 8px;">
-          </div>
-          <div id="fileList" style="font-size:13px;"></div>
-        </div>
-        <!-- SVG AST tree canvas -->
-        <div style="flex:1;display:flex;flex-direction:column;position:relative;">
-          <div id="astFileInfo" style="padding:6px 12px;font-size:13px;color:var(--text-muted);display:none;border-bottom:1px solid var(--border);">
-            <span id="astFileName"></span> &bull; <span id="astLang"></span>
-          </div>
-          <!-- Toolbar -->
-          <div id="astToolbar" style="display:none;padding:4px 8px;background:var(--bg-secondary);border-bottom:1px solid var(--border);gap:6px;align-items:center;font-size:12px;">
-            <button class="btn btn-sm btn-ghost" onclick="astExpandAll()">Expand All</button>
-            <button class="btn btn-sm btn-ghost" onclick="astCollapseAll()">Collapse All</button>
-            <span style="color:var(--text-muted);margin:0 4px;">|</span>
-            <button class="btn btn-sm btn-ghost" onclick="astZoom(1.2)">+</button>
-            <button class="btn btn-sm btn-ghost" onclick="astZoom(0.8)">−</button>
-            <button class="btn btn-sm btn-ghost" onclick="astResetView()">Reset</button>
-            <span id="astZoomLevel" style="color:var(--text-muted);margin-left:4px;">100%</span>
-            <button class="btn btn-sm btn-ghost" id="astMinimapToggle" onclick="astToggleMinimap()" style="margin-left:auto;">🗺️ Minimap</button>
-            <span style="color:var(--text-muted);margin-left:8px;">Drag to pan · Scroll to zoom</span>
-          </div>
-          <!-- SVG Canvas -->
-          <div id="astSvgContainer" style="flex:1;overflow:hidden;background:#0f172a;border-radius:0 0 6px 0;position:relative;cursor:grab;touch-action:none;">
-            <svg id="astSvg" width="100%" height="100%" style="display:block;">
-              <g id="astSvgGroup"></g>
-            </svg>
-            <!-- Minimap -->
-            <div id="astMinimap" style="position:absolute;bottom:12px;right:12px;width:180px;height:120px;background:rgba(30,41,59,.9);border:1px solid #475569;border-radius:8px;cursor:pointer;display:none;box-shadow:0 4px 12px rgba(0,0,0,.3);">
-              <div style="position:absolute;top:2px;left:6px;font-size:10px;color:#94a3b8;pointer-events:none;">🗺️</div>
-              <svg id="astMinimapSvg" width="180" height="120"></svg>
-            </div>
-            <div class="empty-state" id="astSvgEmpty">
-              <i class="ph ph-tree-structure"></i>
-              <p>Select a file to visualize its AST</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div id="repoAstEmpty">
+  <div class="card-body" style="padding:0;">
+    <div id="repoListEmpty">
       <div class="empty-state">
         <i class="ph ph-tree-structure"></i>
-        <p>No repositories registered yet. Register a service with a repo_url to see AST visualization.</p>
+        <p>No repositories registered yet. Register a service with a repo_url to enable AST visualization.</p>
+      </div>
+    </div>
+    <div id="repoListContainer" style="display:none;">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Repository</th>
+              <th>User</th>
+              <th>Status</th>
+              <th>Branch</th>
+              <th style="text-align:right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="repoTableBody"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -108,70 +74,12 @@
           </tr>
         </thead>
         <tbody id="reviewTableBody">
-          <tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet. Push a commit to trigger automatic review.</p></div></td></tr>
+          <tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet.</p></div></td></tr>
         </tbody>
       </table>
     </div>
   </div>
 </div>
-
-<!-- Server Logs (last entries from app.log) -->
-<div class="card mb-6">
-  <div class="card-header">
-    <h2><i class="ph ph-terminal-window"></i> Server Logs</h2>
-    <div style="display:flex;gap:8px;">
-      <button class="btn btn-sm btn-ghost" onclick="loadServerLogs()"><i class="ph ph-arrows-clockwise"></i> Refresh</button>
-      <a href="/logs" class="btn btn-sm btn-ghost"><i class="ph ph-arrow-square-out"></i> Full Logs</a>
-    </div>
-  </div>
-  <div class="card-body" style="padding:0;">
-    <div class="log-stream" id="serverLogStream" style="max-height:300px;overflow-y:auto;">
-      <div class="empty-state" id="serverLogEmpty">
-        <i class="ph ph-terminal-window"></i>
-        <p>Loading server logs...</p>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="grid-2">
-  <!-- Activity Feed -->
-  <div class="card">
-    <div class="card-header">
-      <h2><i class="ph ph-activity"></i> Live Activity</h2>
-      <button class="btn btn-sm btn-ghost" onclick="clearActivity()"><i class="ph ph-trash"></i> Clear</button>
-    </div>
-    <div class="card-body">
-      <div class="activity-feed" id="activityFeed">
-        <div class="empty-state" id="activityEmpty">
-          <i class="ph ph-activity"></i>
-          <p>No activity yet. Events will appear here in real-time once services connect.</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- System Info -->
-  <div class="card">
-    <div class="card-header">
-      <h2><i class="ph ph-gear-six"></i> System Info</h2>
-      <button class="btn btn-sm btn-ghost" onclick="loadDashboard()"><i class="ph ph-arrows-clockwise"></i></button>
-    </div>
-    <div class="card-body">
-      <table>
-        <tbody>
-          <tr><td class="text-muted">AI Provider</td><td id="sysProvider">--</td></tr>
-          <tr><td class="text-muted">Server Version</td><td>v2.0.0</td></tr>
-          <tr><td class="text-muted">Repos Synced</td><td id="sysRepos">--</td></tr>
-          <tr><td class="text-muted">WebSocket URL</td><td class="mono text-sm">ws://{{ request.url.netloc }}/ws/logs/&lt;user_id&gt;</td></tr>
-          <tr><td class="text-muted">API Base</td><td class="mono text-sm">{{ request.url.scheme }}://{{ request.url.netloc }}/api/v1</td></tr>
-          <tr><td class="text-muted">Log Cache</td><td>Auto-flush every 10 min (errors retained)</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
 
 {% endblock %}
 
@@ -183,429 +91,55 @@ var USER_NAME = '{{ user.username }}';
 async function loadDashboard() {
   try {
     var data = await api('/api/v1/dashboard/summary');
-    document.getElementById('statConnections').textContent = data.registered_services;
-    document.getElementById('statUsers').textContent = data.registered_users;
-    document.getElementById('statErrors').textContent = data.total_errors;
+    document.getElementById('statConnections').textContent = data.registered_services || 0;
+    document.getElementById('statUsers').textContent = data.registered_users || 0;
+    document.getElementById('statErrors').textContent = data.total_errors || 0;
     document.getElementById('statReports').textContent = data.total_reports || 0;
-    document.getElementById('sysProvider').textContent = data.ai_provider;
-    document.getElementById('sysRepos').textContent = data.repositories_synced;
   } catch(e) {
+    console.error('Dashboard load failed:', e);
     showToast('Failed to load dashboard data', 'error');
   }
 }
 
-var ACTIVITY_ICONS = {
-  error:          { cls: 'error',      icon: 'ph-warning-circle' },
-  analysis:       { cls: 'analysis',   icon: 'ph-magnifying-glass' },
-  fix:            { cls: 'fix',        icon: 'ph-wrench' },
-  connection:     { cls: 'connection', icon: 'ph-plugs-connected' },
-  disconnection:  { cls: 'connection', icon: 'ph-plug' },
-  log:            { cls: 'log',        icon: 'ph-terminal-window' },
-  review_complete:{ cls: 'fix',        icon: 'ph-code' },
-};
-
-function addActivity(data) {
-  var feed = document.getElementById('activityFeed');
-  var empty = document.getElementById('activityEmpty');
-  if (empty) empty.remove();
-  var info = ACTIVITY_ICONS[data.type] || ACTIVITY_ICONS.log;
-  var item = document.createElement('div');
-  item.className = 'activity-item';
-  item.innerHTML =
-    '<div class="activity-icon ' + info.cls + '"><i class="ph ' + info.icon + '"></i></div>' +
-    '<div class="activity-content">' +
-      '<div class="activity-message">' + escapeHtml(data.message || data.type) + '</div>' +
-      '<div class="activity-time">' + (data.user_id ? escapeHtml(data.user_id) + ' &middot; ' : '') + 'just now</div>' +
-    '</div>';
-  feed.prepend(item);
-  while (feed.children.length > 50) feed.lastChild.remove();
-}
-
-function clearActivity() {
-  document.getElementById('activityFeed').innerHTML =
-    '<div class="empty-state" id="activityEmpty"><i class="ph ph-activity"></i><p>Cleared.</p></div>';
-}
-
 dashboardWS.onMessage(function(data) {
-  addActivity(data);
-  if (data.type === 'connection') {
-    showToast('Service connected: ' + (data.user_id || ''), 'success');
-  }
-  if (data.type === 'disconnection') {
-    showToast('Service disconnected: ' + (data.user_id || ''), 'warning');
-  }
   if (data.type === 'error') {
     var el = document.getElementById('statErrors');
     el.textContent = parseInt(el.textContent || '0') + 1;
     showToast(data.message || 'Error detected', 'error');
+  }
+  if (data.type === 'review_complete') {
+    loadReviews();
   }
 });
 
 loadDashboard();
 setInterval(loadDashboard, 30000);
 
-// ── Repository AST Visualization ──────────────────────────────
-var _repoFiles = [];
-var _selectedRepoUser = '';
-
+// ── Repository List ──────────────────────────────
 async function loadRepos() {
   try {
     var data = await api('/api/v1/repos/registered');
-    var sel = document.getElementById('repoSelect');
-    sel.innerHTML = '<option value="">Select a repository...</option>';
-    (data.repos || []).forEach(function(r) {
-      if (r.status === 'ready') {
-        var opt = document.createElement('option');
-        opt.value = r.user_id;
-        opt.textContent = r.repo_url.replace('https://github.com/', '') + ' (' + r.user_id + ')';
-        sel.appendChild(opt);
-      }
-    });
-    if (data.repos && data.repos.length > 0) {
-      document.getElementById('repoAstEmpty').style.display = 'none';
-      document.getElementById('repoAstContainer').style.display = 'block';
-    }
+    var repos = data.repos || [];
+    if (repos.length === 0) return;
+    document.getElementById('repoListEmpty').style.display = 'none';
+    document.getElementById('repoListContainer').style.display = 'block';
+    var tbody = document.getElementById('repoTableBody');
+    tbody.innerHTML = repos.map(function(r) {
+      var statusBadge = r.status === 'ready'
+        ? '<span class="badge badge-success">Ready</span>'
+        : '<span class="badge badge-warning">Not Cloned</span>';
+      var vizBtn = r.status === 'ready'
+        ? '<a href="/visualizer?repo=' + encodeURIComponent(r.user_id) + '" class="btn btn-sm btn-primary" target="_blank"><i class="ph ph-eye"></i> Visualize</a>'
+        : '';
+      return '<tr>' +
+        '<td class="text-sm"><i class="ph ph-github-logo" style="color:var(--text-muted);margin-right:6px;"></i>' + escapeHtml(r.repo_url.replace('https://github.com/', '')) + '</td>' +
+        '<td class="text-sm text-muted">' + escapeHtml(r.user_id) + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td class="text-sm text-muted">' + escapeHtml(r.current_branch || '--') + '</td>' +
+        '<td style="text-align:right">' + vizBtn + '</td>' +
+      '</tr>';
+    }).join('');
   } catch(e) { console.error('Failed to load repos:', e); }
-}
-
-async function loadRepoFiles() {
-  var userId = document.getElementById('repoSelect').value;
-  if (!userId) return;
-  _selectedRepoUser = userId;
-  try {
-    var data = await api('/api/v1/repo/' + userId + '/files');
-    _repoFiles = data.files || [];
-    renderFileList(_repoFiles);
-  } catch(e) { showToast('Failed to load repo files', 'error'); }
-}
-
-function filterFiles() {
-  var q = document.getElementById('fileFilter').value.toLowerCase();
-  var filtered = _repoFiles.filter(function(f) { return f.path.toLowerCase().includes(q); });
-  renderFileList(filtered);
-}
-
-function renderFileList(files) {
-  var el = document.getElementById('fileList');
-  var langIcons = {
-    python:'ph-file-py', javascript:'ph-file-js', typescript:'ph-file-ts',
-    java:'ph-file-code', go:'ph-file-code', rust:'ph-file-rs',
-    c:'ph-file-c', cpp:'ph-file-cpp', ruby:'ph-file-code', php:'ph-file-code'
-  };
-  el.innerHTML = files.map(function(f) {
-    var iconClass = langIcons[f.language] || 'ph-file';
-    return '<div class="file-item" onclick="loadFileAst(\'' + escapeHtml(f.path) + '\')" ' +
-           'style="padding:4px 6px;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px;" ' +
-           'onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">' +
-           '<i class="ph ' + iconClass + '" style="font-size:14px;color:var(--accent);"></i>' +
-           '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(f.path) + '</span>' +
-           '<span style="color:var(--text-muted);font-size:10px;">' + escapeHtml(f.language) + '</span></div>';
-  }).join('');
-}
-
-// ── SVG AST Tree Engine ──────────────────────────────
-var _astTree = null;
-var _astExpanded = {};
-var _astTransform = { x: 50, y: 20, scale: 1 };
-var _astDragging = false;
-var _astLastPos = { x: 0, y: 0 };
-var _astShowMinimap = true;
-var _astNodes = [];
-var _astEdges = [];
-var _astTreeW = 0;
-var _astTreeH = 0;
-
-var AST_NODE_W = 180;
-var AST_NODE_H = 50;
-var AST_H_GAP = 30;
-var AST_V_GAP = 80;
-
-var AST_COLORS = {
-  module:'#9C27B0',program:'#9C27B0',class:'#2196F3',class_definition:'#2196F3',
-  'function':'#4CAF50',function_definition:'#4CAF50',method_definition:'#4CAF50',method:'#8BC34A',
-  import:'#FF9800',import_statement:'#FF9800',import_from_statement:'#FF9800',
-  call:'#E91E63',call_expression:'#E91E63','if':'#673AB7',if_statement:'#673AB7',
-  'for':'#3F51B5',for_statement:'#3F51B5','try':'#FFC107',try_statement:'#FFC107',
-  'return':'#CDDC39',return_statement:'#CDDC39',expression_statement:'#78909C',
-  assignment:'#26A69A',variable_declaration:'#26A69A',block:'#546E7A'
-};
-function astColor(t) { return AST_COLORS[(t||'').toLowerCase()] || '#64748b'; }
-
-function astCalcWidth(node, nodeId) {
-  if (!node) return 0;
-  if (!_astExpanded[nodeId] || !node.children || !node.children.length) return AST_NODE_W;
-  var total = 0;
-  for (var i = 0; i < node.children.length; i++) {
-    total += astCalcWidth(node.children[i], nodeId + '-' + i);
-    if (i < node.children.length - 1) total += AST_H_GAP;
-  }
-  return Math.max(AST_NODE_W, total);
-}
-
-function astLayout(tree) {
-  _astNodes = [];
-  _astEdges = [];
-  if (!tree) return;
-
-  function position(node, nodeId, x, y, px, py) {
-    if (!node) return;
-    var w = astCalcWidth(node, nodeId);
-    var nx = x + w / 2;
-    var type = node.type || node.node_type || '?';
-    var name = node.name || '';
-    var line = node.loc ? 'L' + node.loc.start.line : (node.start_line ? 'L' + node.start_line : '');
-    var hasKids = node.children && node.children.length > 0;
-    _astNodes.push({ id: nodeId, x: nx, y: y, type: type, name: name, line: line, hasKids: hasKids, data: node });
-    if (px !== null) _astEdges.push({ x1: px, y1: py + AST_NODE_H, x2: nx, y2: y });
-    if (_astExpanded[nodeId] && node.children && node.children.length) {
-      var cx = x;
-      for (var i = 0; i < node.children.length; i++) {
-        var cid = nodeId + '-' + i;
-        var cw = astCalcWidth(node.children[i], cid);
-        position(node.children[i], cid, cx, y + AST_NODE_H + AST_V_GAP, nx, y);
-        cx += cw + AST_H_GAP;
-      }
-    }
-  }
-
-  position(tree, 'root', 0, 0, null, null);
-
-  var maxX = 0, maxY = 0;
-  for (var i = 0; i < _astNodes.length; i++) {
-    maxX = Math.max(maxX, _astNodes[i].x + AST_NODE_W);
-    maxY = Math.max(maxY, _astNodes[i].y + AST_NODE_H);
-  }
-  _astTreeW = maxX + 100;
-  _astTreeH = maxY + 100;
-}
-
-function astRender() {
-  var g = document.getElementById('astSvgGroup');
-  if (!g) return;
-  g.setAttribute('transform', 'translate(' + _astTransform.x + ',' + _astTransform.y + ') scale(' + _astTransform.scale + ')');
-
-  var html = '';
-
-  // Edges (Bézier curves)
-  for (var i = 0; i < _astEdges.length; i++) {
-    var e = _astEdges[i];
-    var my = (e.y1 + e.y2) / 2;
-    html += '<path d="M ' + e.x1 + ' ' + e.y1 + ' C ' + e.x1 + ' ' + my + ', ' + e.x2 + ' ' + my + ', ' + e.x2 + ' ' + e.y2 + '" fill="none" stroke="#475569" stroke-width="2"/>';
-  }
-
-  // Nodes
-  for (var i = 0; i < _astNodes.length; i++) {
-    var n = _astNodes[i];
-    var col = astColor(n.type);
-    var nx = n.x - AST_NODE_W / 2;
-    var label = n.name ? n.type + ': ' + n.name : n.type;
-    if (label.length > 25) label = label.substring(0, 22) + '...';
-
-    html += '<g transform="translate(' + nx + ',' + n.y + ')" data-nid="' + n.id + '">';
-    html += '<rect width="' + AST_NODE_W + '" height="' + AST_NODE_H + '" rx="6" fill="#334155" stroke="' + col + '" stroke-width="2" style="cursor:pointer;" onclick="astNodeClick(\'' + n.id + '\')"/>';
-    html += '<text x="' + (AST_NODE_W/2) + '" y="18" text-anchor="middle" fill="#f1f5f9" font-size="11" font-weight="600" style="pointer-events:none;">' + escapeHtml(label) + '</text>';
-    if (n.line) {
-      html += '<text x="' + (AST_NODE_W/2) + '" y="34" text-anchor="middle" fill="#94a3b8" font-size="10" style="pointer-events:none;">' + n.line + '</text>';
-    }
-    // Expand/collapse toggle
-    if (n.hasKids) {
-      var isExp = !!_astExpanded[n.id];
-      html += '<g transform="translate(' + (AST_NODE_W/2 - 10) + ',' + (AST_NODE_H - 5) + ')" onclick="event.stopPropagation();astToggle(\'' + n.id + '\')" style="cursor:pointer;">';
-      html += '<circle r="10" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>';
-      html += '<text y="4" text-anchor="middle" fill="white" font-size="14" font-weight="bold">' + (isExp ? '−' : '+') + '</text>';
-      html += '</g>';
-    }
-    html += '</g>';
-  }
-
-  g.innerHTML = html;
-
-  // Update zoom display
-  var zl = document.getElementById('astZoomLevel');
-  if (zl) zl.textContent = Math.round(_astTransform.scale * 100) + '%';
-
-  // Render minimap
-  astRenderMinimap();
-}
-
-function astToggle(nodeId) {
-  if (_astExpanded[nodeId]) {
-    // Collapse node and all children
-    var keys = Object.keys(_astExpanded);
-    for (var i = 0; i < keys.length; i++) {
-      if (keys[i] === nodeId || keys[i].indexOf(nodeId + '-') === 0) delete _astExpanded[keys[i]];
-    }
-  } else {
-    _astExpanded[nodeId] = true;
-  }
-  astLayout(_astTree);
-  astRender();
-}
-
-function astNodeClick(nodeId) {
-  astToggle(nodeId);
-}
-
-function astExpandAll() {
-  if (!_astTree) return;
-  _astExpanded = { root: true };
-  function collect(node, prefix) {
-    if (node && node.children) {
-      for (var i = 0; i < node.children.length; i++) {
-        var id = prefix + '-' + i;
-        _astExpanded[id] = true;
-        collect(node.children[i], id);
-      }
-    }
-  }
-  collect(_astTree, 'root');
-  astLayout(_astTree);
-  astRender();
-}
-
-function astCollapseAll() {
-  _astExpanded = { root: true };
-  astLayout(_astTree);
-  astRender();
-}
-
-function astZoom(factor) {
-  _astTransform.scale = Math.max(0.2, Math.min(3, _astTransform.scale * factor));
-  astRender();
-}
-
-function astResetView() {
-  _astTransform = { x: 50, y: 20, scale: 1 };
-  astRender();
-}
-
-function astToggleMinimap() {
-  _astShowMinimap = !_astShowMinimap;
-  var mm = document.getElementById('astMinimap');
-  if (mm) mm.style.display = _astShowMinimap ? 'block' : 'none';
-  var btn = document.getElementById('astMinimapToggle');
-  if (btn) btn.style.background = _astShowMinimap ? 'var(--accent)' : '';
-}
-
-function astRenderMinimap() {
-  var mm = document.getElementById('astMinimapSvg');
-  if (!mm || !_astShowMinimap) return;
-  var mw = 180, mh = 120, pad = 10;
-  var sx = (mw - 2 * pad) / Math.max(_astTreeW, 1);
-  var sy = (mh - 2 * pad) / Math.max(_astTreeH, 1);
-  var ms = Math.min(sx, sy);
-
-  var html = '<g transform="translate(' + pad + ',' + pad + ') scale(' + ms + ')">';
-  for (var i = 0; i < _astEdges.length; i++) {
-    var e = _astEdges[i];
-    html += '<line x1="' + e.x1 + '" y1="' + (e.y1 + 25) + '" x2="' + e.x2 + '" y2="' + e.y2 + '" stroke="#475569" stroke-width="' + (1/ms) + '"/>';
-  }
-  for (var i = 0; i < _astNodes.length; i++) {
-    var n = _astNodes[i];
-    html += '<rect x="' + (n.x - 5) + '" y="' + n.y + '" width="10" height="5" rx="2" fill="' + astColor(n.type) + '"/>';
-  }
-  html += '</g>';
-
-  // Viewport rectangle
-  var container = document.getElementById('astSvgContainer');
-  if (container) {
-    var cr = container.getBoundingClientRect();
-    var vx = (-_astTransform.x / _astTransform.scale);
-    var vy = (-_astTransform.y / _astTransform.scale);
-    var vw = cr.width / _astTransform.scale;
-    var vh = cr.height / _astTransform.scale;
-    var rx = pad + vx * ms;
-    var ry = pad + vy * ms;
-    var rw = vw * ms;
-    var rh = vh * ms;
-    html += '<rect x="' + Math.max(0, rx) + '" y="' + Math.max(0, ry) + '" width="' + Math.min(rw, mw - Math.max(0, rx)) + '" height="' + Math.min(rh, mh - Math.max(0, ry)) + '" fill="rgba(96,165,250,0.2)" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="4,2"/>';
-  }
-  mm.innerHTML = html;
-}
-
-// Mouse/wheel handlers for pan/zoom on the SVG canvas
-(function() {
-  var container = document.getElementById('astSvgContainer');
-  if (!container) return;
-
-  container.addEventListener('mousedown', function(e) {
-    if (e.target.closest('#astMinimap')) return;
-    _astDragging = true;
-    _astLastPos = { x: e.clientX, y: e.clientY };
-    container.style.cursor = 'grabbing';
-    e.preventDefault();
-  });
-  document.addEventListener('mousemove', function(e) {
-    if (!_astDragging) return;
-    var dx = e.clientX - _astLastPos.x;
-    var dy = e.clientY - _astLastPos.y;
-    _astTransform.x += dx;
-    _astTransform.y += dy;
-    _astLastPos = { x: e.clientX, y: e.clientY };
-    astRender();
-  });
-  document.addEventListener('mouseup', function() {
-    _astDragging = false;
-    var c = document.getElementById('astSvgContainer');
-    if (c) c.style.cursor = 'grab';
-  });
-  container.addEventListener('wheel', function(e) {
-    e.preventDefault();
-    var factor = e.deltaY > 0 ? 0.9 : 1.1;
-    _astTransform.scale = Math.max(0.2, Math.min(3, _astTransform.scale * factor));
-    astRender();
-  }, { passive: false });
-
-  // Minimap click-to-navigate
-  var minimap = document.getElementById('astMinimap');
-  if (minimap) {
-    minimap.addEventListener('click', function(e) {
-      var rect = minimap.getBoundingClientRect();
-      var pad = 10;
-      var sx = (180 - 2 * pad) / Math.max(_astTreeW, 1);
-      var sy = (120 - 2 * pad) / Math.max(_astTreeH, 1);
-      var ms = Math.min(sx, sy);
-      var clickX = (e.clientX - rect.left - pad) / ms;
-      var clickY = (e.clientY - rect.top - pad) / ms;
-      var cr = container.getBoundingClientRect();
-      _astTransform.x = cr.width / 2 - clickX * _astTransform.scale;
-      _astTransform.y = cr.height / 2 - clickY * _astTransform.scale;
-      astRender();
-    });
-  }
-})();
-
-async function loadFileAst(filePath) {
-  if (!_selectedRepoUser) return;
-  var svgEmpty = document.getElementById('astSvgEmpty');
-  if (svgEmpty) svgEmpty.style.display = 'none';
-  document.getElementById('astFileInfo').style.display = 'block';
-  document.getElementById('astFileName').textContent = filePath;
-  document.getElementById('astToolbar').style.display = 'flex';
-  document.getElementById('astMinimap').style.display = _astShowMinimap ? 'block' : 'none';
-  // Show loading
-  document.getElementById('astSvgGroup').innerHTML = '<text x="50" y="50" fill="#94a3b8" font-size="14">Parsing AST...</text>';
-  try {
-    var data = await api('/api/v1/repo/' + _selectedRepoUser + '/ast', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({file_path: filePath})
-    });
-    document.getElementById('astLang').textContent = data.language || '';
-    _astTree = data.tree || data;
-    _astExpanded = { root: true };
-    // Auto-expand first level
-    if (_astTree && _astTree.children) {
-      for (var i = 0; i < _astTree.children.length; i++) {
-        _astExpanded['root-' + i] = true;
-      }
-    }
-    _astTransform = { x: 50, y: 20, scale: 1 };
-    astLayout(_astTree);
-    astRender();
-  } catch(e) {
-    document.getElementById('astSvgGroup').innerHTML = '<text x="50" y="50" fill="#ef4444" font-size="14">Failed to parse: ' + escapeHtml(e.message || String(e)) + '</text>';
-  }
-}
 }
 
 // ── Recent Code Reviews ──
@@ -621,7 +155,7 @@ async function loadReviews() {
     var reviews = data.reports || [];
     var tbody = document.getElementById('reviewTableBody');
     if (reviews.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet. Push a commit to trigger automatic review.</p></div></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><i class="ph ph-code"></i><p>No code reviews yet.</p></div></td></tr>';
       return;
     }
     tbody.innerHTML = reviews.map(function(r) {
@@ -638,65 +172,7 @@ async function loadReviews() {
   } catch(e) { console.error('Failed to load reviews:', e); }
 }
 
-// ── Server Logs ──
-async function loadServerLogs() {
-  try {
-    var data = await api('/api/v1/logs/server?limit=50');
-    var stream = document.getElementById('serverLogStream');
-    var logs = data.logs || [];
-    if (logs.length === 0) {
-      stream.innerHTML = '<div class="empty-state"><i class="ph ph-terminal-window"></i><p>No server logs.</p></div>';
-      return;
-    }
-    stream.innerHTML = logs.map(function(l) {
-      var level = (l.level || 'INFO').toUpperCase();
-      var levelCls = level.indexOf('ERR') >= 0 || level === 'CRITICAL' ? 'error'
-        : level.indexOf('WARN') >= 0 ? 'warning'
-        : level === 'DEBUG' ? 'debug' : 'info';
-      return '<div class="log-entry ' + levelCls + '" style="padding:4px 12px;font-size:12px;">' +
-        '<span class="log-time">' + escapeHtml(l.timestamp || '') + '</span>' +
-        '<span class="log-level ' + levelCls + '">' + level + '</span>' +
-        '<span class="log-user">[' + escapeHtml(l.logger || 'server') + ']</span>' +
-        '<span class="log-message">' + escapeHtml(l.message || '') + '</span>' +
-      '</div>';
-    }).join('');
-    stream.scrollTop = stream.scrollHeight;
-  } catch(e) { console.error('Failed to load server logs:', e); }
-}
-
-// Also refresh reviews on WebSocket review_complete event
-dashboardWS.onMessage(function(data) {
-  if (data.type === 'review_complete') {
-    loadReviews();
-  }
-  // Real-time server log streaming
-  if (data.type === 'server_log') {
-    var stream = document.getElementById('serverLogStream');
-    var empty = document.getElementById('serverLogEmpty');
-    if (empty) empty.remove();
-    var level = (data.level || 'INFO').toUpperCase();
-    var levelCls = level.indexOf('ERR') >= 0 || level === 'CRITICAL' ? 'error'
-      : level.indexOf('WARN') >= 0 ? 'warning'
-      : level === 'DEBUG' ? 'debug' : 'info';
-    var el = document.createElement('div');
-    el.className = 'log-entry ' + levelCls;
-    el.style.cssText = 'padding:4px 12px;font-size:12px;';
-    el.innerHTML =
-      '<span class="log-time">' + escapeHtml(data.timestamp || '') + '</span>' +
-      '<span class="log-level ' + levelCls + '">' + level + '</span>' +
-      '<span class="log-user">[' + escapeHtml(data.logger || 'server') + ']</span>' +
-      '<span class="log-message">' + escapeHtml(data.message || '') + '</span>';
-    stream.appendChild(el);
-    // Keep max 200 entries
-    while (stream.children.length > 200) stream.firstChild.remove();
-    stream.scrollTop = stream.scrollHeight;
-  }
-});
-
 loadRepos();
 loadReviews();
-loadServerLogs();
-// Auto-refresh server logs every 30 seconds (live WS fills gaps)
-setInterval(loadServerLogs, 30000);
 </script>
 {% endblock %}

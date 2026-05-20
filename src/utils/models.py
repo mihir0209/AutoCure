@@ -248,6 +248,11 @@ class RootCauseAnalysis(BaseModel):
     confidence_score: float = 0.0
     references: List[str] = Field(default_factory=list)
 
+    # AI-pinpointed root cause location (set when stack trace doesn't point to user code)
+    error_pin_file: Optional[str] = None
+    error_pin_line: Optional[int] = None
+    error_pin_reason: Optional[str] = None
+
 
 class EdgeTestCase(BaseModel):
     """An edge test case that demonstrates the original bug."""

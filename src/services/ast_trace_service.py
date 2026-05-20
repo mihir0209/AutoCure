@@ -66,6 +66,11 @@ class ASTTraceContext:
     call_chain: List[Tuple[str, int, str]] = field(default_factory=list)
     # Full function bodies collected for AI
     traced_functions: Dict[str, str] = field(default_factory=dict)  # "file:func" -> body
+    # AI-pinpointed root cause (when error line differs from actual cause)
+    pin_file: Optional[str] = None
+    pin_line: Optional[int] = None
+    pin_reason: Optional[str] = None
+    pin_file_ast: Optional['ASTTraceContext'] = None  # AST trace for the pin file
 
 
 class ASTTraceService:
