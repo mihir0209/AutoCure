@@ -148,10 +148,26 @@ class ConnectionManager:
         # Track error presence (prevents auto-flush)
         if log_entry.level.upper() in ("ERROR", "FATAL", "CRITICAL"):
             self._has_errors[user_id] = True
-        
+
         # Keep only last 2000 logs
         if len(self.log_buffers[user_id]) > 2000:
             self.log_buffers[user_id] = self.log_buffers[user_id][-2000:]
+
+        # Persist to Redis (fire-and-forget)
+        try:
+            entry_dict = {
+                "level": log_entry.level,
+                "message": log_entry.message[:500],
+                "timestamp": log_entry.timestamp.isoformat() if log_entry.timestamp else "",
+                "source_file": log_entry.source_file or "",
+            }
+            asyncio.create_task(self._redis_buffer(user_id, entry_dict))
+        except Exception:
+            pass
+
+    async def _redis_buffer(self, user_id: str, entry: dict):
+        from utils.cache import buffer_log
+        await buffer_log(user_id, entry)
 
     def flush_logs(self, user_id: str, force: bool = False):
         """Flush (discard) cached logs for a user.
@@ -165,11 +181,20 @@ class ConnectionManager:
         if force:
             self.log_buffers[user_id] = []
             self._has_errors[user_id] = False
+            # Clear Redis buffer too
+            try:
+                asyncio.create_task(self._redis_clear(user_id))
+            except Exception:
+                pass
             return
         # Auto-flush: skip if the buffer contains errors
         if self._has_errors.get(user_id, False):
             return
         self.log_buffers[user_id] = []
+
+    async def _redis_clear(self, user_id: str):
+        from utils.cache import clear_log_buffer
+        await clear_log_buffer(user_id)
 
     def periodic_flush_all(self):
         """Auto-flush every user buffer that has NO errors."""
@@ -933,6 +958,14 @@ async def lifespan(app: FastAPI):
     _store = get_report_store()
     logger.info(f"  Report store: {config.database.type} ({_store.count()} reports)")
 
+    # Initialize Redis cache (graceful — app works without it)
+    try:
+        from database.redis_service import redis_service
+        await redis_service.initialize()
+        logger.info("  Redis cache: connected")
+    except Exception as e:
+        logger.warning(f"  Redis cache: unavailable ({e}) — running without cache")
+
     # Load persisted registrations and re-attach repos
     _load_registrations()
     if user_registrations:
@@ -968,6 +1001,10 @@ async def lifespan(app: FastAPI):
                     try:
                         success = await github_service.pull_repository(uid)
                         if success:
+                            # Invalidate visualization cache for this repo
+                            commit = repo_info.latest_commit or "head"
+                            from utils.cache import delete_cached
+                            await delete_cached(f"ast:repo:{uid}:{commit}")
                             logger.info(f"Cron pull: {uid} updated")
                         else:
                             logger.warning(f"Cron pull: {uid} failed")
@@ -1004,7 +1041,14 @@ async def lifespan(app: FastAPI):
     flush_task.cancel()
     pull_task.cancel()
     log_broadcast_task.cancel()
-    
+
+    # Close Redis
+    try:
+        from database.redis_service import redis_service
+        await redis_service.close()
+    except Exception:
+        pass
+
     # Cleanup
     logger.info("═" * 60)
     logger.info("   SELF-HEALING SYSTEM SHUTDOWN COMPLETE")
@@ -1572,7 +1616,7 @@ async def list_repo_files(user_id: str, ext: Optional[str] = Query(None)):
 
 @app.get("/api/v1/repo/{user_id}/visualize")
 async def visualize_repo(user_id: str):
-    """Process a user's repo and return full AST visualization data."""
+    """Process a user's repo and return full AST visualization data (cached)."""
     if user_id not in user_registrations:
         raise HTTPException(status_code=404, detail="User not found")
     repo_info = user_repos.get(user_id)
@@ -1585,10 +1629,17 @@ async def visualize_repo(user_id: str):
     children = [p for p in local.iterdir() if p.is_dir() and not p.name.startswith('.')]
     if len(children) == 1 and any(children[0].iterdir()):
         sub = children[0]
+    # Check Redis cache
+    cache_key = f"ast:repo:{user_id}:{repo_info.latest_commit or 'head'}"
+    from utils.cache import get_cached, set_cached
+    cached = await get_cached(cache_key)
+    if cached is not None:
+        return cached
     from services.ast_visualizer import get_ast_visualizer
     result = get_ast_visualizer().parse_repo_directory(str(sub), sub.name)
     if "error" in result and result["error"]:
         raise HTTPException(status_code=400, detail=result["error"])
+    await set_cached(cache_key, result, ttl=3600)
     return result
 
 
@@ -1748,6 +1799,11 @@ async def clear_user_logs(user_id: str):
 @app.post("/api/v1/analyze/{user_id}")
 async def trigger_analysis(user_id: str, background_tasks: BackgroundTasks):
     """Manually trigger error analysis for a user."""
+    # Rate limit: 10 analysis requests per minute per user
+    from utils.cache import check_rate
+    allowed, count = await check_rate(user_id, "analysis", max_req=10, window=60)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({count}/10 per min)")
     if user_id not in user_registrations:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -2531,8 +2587,14 @@ async def system_status():
 # ============================================================================
 
 @app.post("/upload/zip")
-async def upload_zip_project(file: UploadFile = File(...)):
+async def upload_zip_project(request: Request, file: UploadFile = File(...)):
     """Upload a ZIP file and get complete project visualization with cross-file references."""
+    # Rate limit: 20 uploads per minute per IP
+    from utils.cache import check_rate
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, count = await check_rate(client_ip, "upload", max_req=20, window=60)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({count}/20 per min)")
     from services.ast_visualizer import get_ast_visualizer
     
     if not file.filename:
@@ -2648,27 +2710,33 @@ async def get_languages_visualizer():
 
 # Upload a repo directory for visualization (bonus - for registered repos)
 @app.post("/api/v1/visualize/repo")
-async def visualize_repo(body: dict):
-    """Parse all files in a user's registered repo for project visualization."""
-    from services.ast_visualizer import get_ast_visualizer
-    
+async def visualize_repo_post(body: dict):
+    """Parse all files in a user's registered repo for project visualization (cached)."""
     user_id = body.get("user_id", "")
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
-    
+
     repo_info = user_repos.get(user_id)
     if not repo_info or not repo_info.local_path:
         raise HTTPException(status_code=404, detail="Repository not found for user")
-    
-    visualizer = get_ast_visualizer()
-    result = visualizer.parse_repo_directory(
+
+    # Check Redis cache
+    cache_key = f"ast:repo:{user_id}:{repo_info.latest_commit or 'head'}"
+    from utils.cache import get_cached, set_cached
+    cached = await get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    from services.ast_visualizer import get_ast_visualizer
+    result = get_ast_visualizer().parse_repo_directory(
         str(repo_info.local_path),
         project_name=user_id,
     )
-    
+
     if "error" in result and result["error"]:
         raise HTTPException(status_code=400, detail=result["error"])
-    
+
+    await set_cached(cache_key, result, ttl=3600)
     return result
 
 
