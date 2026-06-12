@@ -11,8 +11,8 @@
 > - 🌳 **Visualizes ASTs** in a browser-based React UI with drag/zoom, code-to-tree navigation, and cross-file reference resolution
 
 > **What AutoCure Does NOT Do**
-> - Does NOT automatically commit or push fixes to the production branch (human review required)
-> - Does NOT modify your codebase directly (a new branch is created for the fix)
+> - Does NOT automatically merge fixes to the production branch (human review required)
+> - Does NOT modify your default branch directly — fixes are pushed to a new `autocure/fix-*` branch
 > - Does NOT replace developer judgment — it provides recommendations
 
 ---
@@ -34,11 +34,13 @@
 - [API Reference](#api-reference)
 - [GitHub Webhook Integration](#github-webhook-integration)
 - [End-to-End Testing](#end-to-end-testing)
-- [Demo Service](#demo-service)
+- [Demo Services](#demo-services)
 - [Project Structure](#project-structure)
 - [Supported Languages](#supported-languages)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
+- [Docker Deployment](#docker-deployment)
+- [Testing](#testing)
 - [License](#license)
 
 ---
@@ -73,11 +75,13 @@ That's it! Your AutoCure server is now running. See [Complete Usage Guide](#comp
 ## Features
 
 - **Real-time Error Detection** — WebSocket-based log streaming from production with live dashboard feed
-- **Multi-Agent AI Analysis** — Microsoft AutoGen with `llama-3.3-70b` (Groq/Cerebras) for intelligent classification and RCA
-- **AST-Based Code Understanding** — tree-sitter parsing (26+ languages) with cross-file reference resolution
+- **Multi-Agent AI Analysis** — Microsoft AutoGen with `llama-3.3-70b` (Groq/Cerebras/Azure) for intelligent classification and RCA
+- **AST-Based Code Understanding** — tree-sitter parsing (26+ languages) with cross-file reference resolution and call chain tracing
 - **Interactive AST Visualization** — Browser React UI with drag, zoom, expand/collapse, code-to-tree linking
-- **Iterative Confidence Scoring** — Multiple analysis passes to validate and score fix confidence
-- **Intelligent Fix Proposals** — AI-generated patches with risk level, side effects, test cases
+- **Iterative Confidence Scoring** — Multiple analysis passes with confidence validation to validate and score fix confidence
+- **Error Replication** — Automatically reproduces errors with payload variations to confirm reproducibility
+- **Intelligent Fix Proposals** — AI-generated patches with risk level, side effects, and edge test cases
+- **Auto-Apply & Branch Push** — High-confidence fixes (≥75%) are automatically applied and pushed to a new GitHub branch
 - **AI Code Review for PRs** — Automated review with per-file comments and overall assessment
 - **Rich HTML Reports** — Dark-themed standalone reports with interactive AST trees, charts, collapsible sections
 - **Email Notifications** — Detailed HTML emails with findings, proposals, and direct report links
@@ -129,10 +133,10 @@ That's it! Your AutoCure server is now running. See [Complete Usage Guide](#comp
 | Layer | Technology |
 |-------|-----------|
 | **Server** | FastAPI, Uvicorn, Jinja2 templates |
-| **AI** | Microsoft AutoGen 0.7+, llama-3.3-70b (Groq / Cerebras), other BYOK providers to be introduced. |
+| **AI** | Microsoft AutoGen 0.7+, llama-3.3-70b (Groq / Cerebras / Azure OpenAI) |
 | **AST Parsing** | tree-sitter 0.21+, tree-sitter-languages (26 languages) |
 | **Frontend** | React 19, Vite 7, Tailwind CSS, Phosphor Icons |
-| **Database** | PostgreSQL 14+ (reports, users), Redis 7+ (sessions, cache) |
+| **Database** | PostgreSQL 14+ or SQLite (reports, users), Redis 7+ (sessions, cache) |
 | **Auth** | JWT (python-jose), bcrypt password hashing |
 | **Email** | SMTP (Gmail App Passwords), HTML report templates |
 | **VCS** | Git CLI integration, GitHub webhook receiver |
@@ -142,11 +146,10 @@ That's it! Your AutoCure server is now running. See [Complete Usage Guide](#comp
 ## Prerequisites
 
 - Python 3.10+
-- PostgreSQL 14+
-- Redis 7+
-- Node.js 18+ (for the demo service)
+- PostgreSQL 14+ (or SQLite for local development)
+- Redis 7+ (optional but recommended for caching)
 - Git
-- An API key for **Groq** or **Cerebras** (both offer free tiers)
+- An API key for **Groq**, **Cerebras**, or **Azure OpenAI**
 
 ---
 
@@ -195,11 +198,15 @@ Create a `.env` file in the project root:
 
 ```env
 # ── AI Provider ──────────────────────────────────────────────
-AI_PROVIDER=cerebras              # "groq" or "cerebras"
+AI_PROVIDER=groq                  # "groq", "cerebras", or "azure"
 GROQ_API_KEY=gsk_...              # https://console.groq.com/keys
 CEREBRAS_API_KEY=csk-...          # https://cloud.cerebras.ai/
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_KEY=your-azure-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
 
 # ── Database ─────────────────────────────────────────────────
+DB_TYPE=postgres                  # "postgres" or "sqlite"
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=selfhealer
@@ -214,14 +221,16 @@ REDIS_PORT=6379
 SENDER_EMAIL=you@gmail.com
 SENDER_PASSWORD=xxxx-xxxx-xxxx    # Gmail App Password
 ADMIN_EMAIL=admin@example.com
+ENABLE_EMAIL_NOTIFICATIONS=true
 
 # ── Server ───────────────────────────────────────────────────
 SERVER_HOST=0.0.0.0
-SERVER_PORT=8000
+SERVER_PORT=9292
 JWT_SECRET=change-this-in-production
 
 # ── GitHub (optional) ────────────────────────────────────────
-GITHUB_TOKEN=ghp_...              # For private repos
+# Personal Access Token with 'repo' scope (read + write for branch push)
+GITHUB_TOKEN=ghp_...
 GITHUB_WEBHOOK_SECRET=your-secret
 ```
 
@@ -231,6 +240,9 @@ GITHUB_WEBHOOK_SECRET=your-secret
 |----------|-----------|-------|---------|
 | **Groq** | 6,000 req/day | `llama-3.3-70b-versatile` | [console.groq.com/keys](https://console.groq.com/keys) |
 | **Cerebras** | 10,000 req/day | `llama-3.3-70b` | [cloud.cerebras.ai](https://cloud.cerebras.ai/) |
+| **Azure OpenAI** | Pay-as-you-go | `gpt-4.1-mini` | [Azure Portal](https://portal.azure.com/) |
+
+> **Note on GitHub Token:** AutoCure clones repos and pushes fix branches automatically. Your GitHub Personal Access Token needs the **`repo`** scope (read + write). A read-only token (`repo:read`) is insufficient for the auto-apply feature.
 
 ---
 
@@ -238,7 +250,7 @@ GITHUB_WEBHOOK_SECRET=your-secret
 
 ```bash
 # Start the FastAPI server
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.main:app --host 0.0.0.0 --port 9292 --reload
 ```
 
 Or via the shortcut:
@@ -317,7 +329,7 @@ async def stream_logs(server_url, user_id):
 // ~50 lines — see src/websocket_client/js_client.js
 const WebSocket = require('ws');
 
-const ws = new WebSocket('ws://localhost:8000/ws/logs/my-service');
+const ws = new WebSocket('ws://localhost:9292/ws/logs/my-service');
 
 // Express error middleware
 app.use((err, req, res, next) => {
@@ -761,14 +773,14 @@ app.use((err, req, res, next) => {
 });
 ```
 
-#### Option B: Demo Service (Testing)
+#### Option B: Demo Services (Testing)
 
 ```bash
-cd demo_service
-npm install
-node server.js
-# Server on http://localhost:4000
-# POST http://localhost:4000/api/calculate with {"a": 5, "b": 0}
+cd demo_services
+pip install -r requirements.txt
+python start_all.py
+# 4 services on ports 8001-8004
+# POST http://localhost:8002/payment/process with {"amount": 100, "divisor": 0}
 # This triggers a division-by-zero error
 ```
 
@@ -886,23 +898,24 @@ All standalone reports (viewed in browser) use **Phosphor Icons** and a dark the
 
 ---
 
-## Demo Service
+## Demo Services
 
-The `demo_service/` directory contains a Node.js Express server with intentional bugs for testing:
+The `demo_services/` directory contains **4 Python FastAPI services** with intentional bugs for testing. Each service auto-connects to AutoCure via WebSocket and streams errors in real-time.
 
-| Endpoint | Bug |
-|----------|-----|
-| `POST /api/user` | Undefined property access |
-| `POST /api/items` | Array index out of bounds |
-| `POST /api/calculate` | Division by zero |
-| `POST /api/profile` | Null property access |
-| `POST /api/config` | JSON parse error |
+| Service | Endpoint | Bug |
+|---------|----------|-----|
+| **Inventory** | `GET /inventory/low-stock` | IndexError — list index out of range |
+| **Payment** | `POST /payment/process` | ZeroDivisionError — division by zero |
+| **Notification** | `POST /notify` | KeyError — missing dict key |
+| **Analytics** | `GET /analytics/summary` | TypeError — unsupported operand |
 
 ```bash
-cd demo_service
-npm install
-node server.js    # Starts on port 4000, auto-connects to AutoCure
+cd demo_services
+pip install -r requirements.txt
+python start_all.py    # Starts all 4 services on ports 8001-8004
 ```
+
+Each service includes an `autocure_client.py` showing production-grade WebSocket integration.
 
 ---
 
@@ -938,12 +951,18 @@ SelfHealer/
 │       │   ├── App.jsx            # Main app (file browser, AST viewer, code panel)
 │       │   └── components/        # TreeVisualization, CodePanel, AstTree
 │       └── package.json
-├── demo_service/                  # Node.js demo with intentional bugs
-│   ├── server.js
-│   └── tests/
+├── demo_services/                 # Python FastAPI demos with intentional bugs
+│   ├── start_all.py
+│   ├── inventory_service.py
+│   ├── payment_service.py
+│   ├── notification_service.py
+│   ├── analytics_service.py
+│   ├── autocure_client.py
+│   └── requirements.txt
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── WORKFLOW.md
+│   ├── WORKFLOW.md
+│   └── HANDLER_INTEGRATION.md
 ├── requirements.txt               # Python dependencies
 ├── package.json                   # Root package scripts
 └── README.md
@@ -993,7 +1012,6 @@ A complete E2E test validates the entire AutoCure workflow from error detection 
 ### Prerequisites
 
 - Python 3.10+ with virtual environment activated
-- Node.js 18+ installed
 - `.env` configured with AI provider credentials
 
 ### Test Scenario
@@ -1021,13 +1039,13 @@ python src/main.py
 # Server running on http://localhost:9292
 ```
 
-### Running the Test (Terminal 2: Demo Service)
+### Running the Test (Terminal 2: Demo Services)
 
 ```bash
-cd demo_service
-npm install
-node server.js
-# Demo service on http://localhost:4000
+cd demo_services
+pip install -r requirements.txt
+python start_all.py
+# 4 services start on ports 8001-8004
 ```
 
 ### Running the Test (Terminal 3: Client / Automation)
@@ -1046,9 +1064,9 @@ node server.js
 3. **Trigger Error**:
    ```bash
    # Terminal 3: Trigger division-by-zero error
-   curl -X POST http://localhost:4000/api/calculate \
+   curl -X POST http://localhost:8002/payment/process \
      -H "Content-Type: application/json" \
-     -d '{"a": 10, "b": 0}'
+     -d '{"amount": 100, "divisor": 0}'
    ```
 
 4. **Monitor Dashboard**:
@@ -1081,7 +1099,7 @@ node server.js
 | Issue | Check |
 |-------|-------|
 | Server won't start | Port 9292 already in use? Check `netstat` or restart computer |
-| Demo service error | Node.js 18+ installed? Run `node --version` |
+| Demo services won't start | Python 3.10+ installed? Run `python --version` |
 | Analysis times out | AI provider rate limit? Check Groq/Cerebras console, try reducing requests |
 | WebSocket connection fails | Firewall blocking localhost:9292? Check Windows Defender |
 | Email not sent | SMTP credentials correct? Check `.env` has `SMTP_PASSWORD` (not Gmail password) |
@@ -1098,6 +1116,55 @@ node server.js
 - **Tenant Isolation** — Separate file system workspaces and Redis namespaces per user.
 - **Rate Limiting** — Per-user limits on log ingestion, PR reviews, and analysis triggers.
 - **Input Validation** — Pydantic models for all API inputs; file size limits on uploads.
+
+---
+
+## Docker Deployment
+
+AutoCure includes a `docker-compose.yml` for containerized deployment with PostgreSQL and Redis.
+
+```bash
+# Build and start all services
+docker-compose up --build
+
+# Or run in background
+docker-compose up -d
+```
+
+Services included:
+- **AutoCure server** — Port 9292
+- **PostgreSQL** — Port 5432 (persistent volume)
+- **Redis** — Port 6379
+
+Environment variables are loaded from `.env`. Ensure `DB_HOST=postgres` and `REDIS_HOST=redis` when using Docker.
+
+---
+
+## Testing
+
+AutoCure includes automated test suites for regression and stress testing.
+
+### Regression Tests
+
+Validate core functionality (auth, repo sync, AST parsing, analysis pipeline):
+
+```bash
+pytest tests/test_regression.py -v
+```
+
+### Stress / Load Tests
+
+Simulate concurrent error ingestion and measure throughput:
+
+```bash
+pytest tests/test_stress_load.py -v
+```
+
+### Test Reports
+
+JUnit XML reports are generated for CI integration:
+- `regression-test-report.xml`
+- `stress-test-report.xml`
 
 ---
 
