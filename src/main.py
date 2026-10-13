@@ -948,6 +948,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"  tree-sitter: {ts_ver}")
     logger.info(f"  tree-sitter-languages: {tsl_ver}")
     
+    # Validate production configuration (security checks)
+    from utils.validators import validate_production_config
+    config_warnings = validate_production_config(config)
+    if config_warnings:
+        logger.warning("═" * 60)
+        logger.warning("  CONFIGURATION WARNINGS:")
+        for warning in config_warnings:
+            logger.warning(f"  {warning}")
+        logger.warning("═" * 60)
+    
     # Ensure directories exist
     config.logs_path.mkdir(parents=True, exist_ok=True)
     config.temp_path.mkdir(parents=True, exist_ok=True)

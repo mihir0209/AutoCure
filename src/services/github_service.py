@@ -18,6 +18,7 @@ import aiohttp
 
 from utils.models import RepositoryInfo, PRInfo, UserRegistration
 from utils.logger import setup_colored_logger
+from utils.validators import validate_code_syntax
 
 
 logger = setup_colored_logger("github_service")
@@ -73,6 +74,26 @@ class GitHubService:
                 self._safe_directories_configured.add(path)
         except Exception as e:
             logger.warning(f"Failed to configure safe.directory for {cwd}: {e}")
+    
+    def _detect_language(self, file_path: str) -> Optional[str]:
+        """Detect programming language from file extension."""
+        ext_map = {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".java": "java",
+            ".c": "c",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".cxx": "cpp",
+            ".go": "go",
+            ".rs": "rust",
+            ".cs": "csharp",
+        }
+        ext = Path(file_path).suffix.lower()
+        return ext_map.get(ext)
         
     def _get_repo_path(self, user_id: str, repo_name: str) -> Path:
         """Get the local path for a user's repository."""
@@ -584,6 +605,15 @@ class GitHubService:
         except ValueError:
             logger.error(f"Path traversal attempt blocked: {file_path}")
             return False
+
+        # Validate syntax before applying fix
+        language = self._detect_language(file_path)
+        if language:
+            is_valid, error_msg = validate_code_syntax(suggested_code, language)
+            if not is_valid:
+                logger.error(f"Syntax validation failed for {file_path}: {error_msg}")
+                logger.warning(f"Skipping invalid fix: {suggested_code[:100]}...")
+                return False
 
         try:
             content = full_path.read_text(encoding="utf-8")

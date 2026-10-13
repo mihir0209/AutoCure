@@ -21,9 +21,11 @@ from config import get_config
 from services.ast_review_service import get_ast_review_service
 from utils.models import (
     DetectedError, ASTContext, RootCauseAnalysis, FixProposal,
-    PRInfo, CodeReviewComment, CodeReviewResult, ErrorReplicationSummary
+    PRInfo, CodeReviewComment, CodeReviewResult, ErrorReplicationSummary,
+    AIAnalysisResponse, AIFixResponse, AICodeReviewResponse,
 )
 from utils.logger import setup_colored_logger
+from pydantic import ValidationError
 
 
 logger = setup_colored_logger("ai_analyzer")
@@ -35,8 +37,8 @@ logger = setup_colored_logger("ai_analyzer")
 
 def _extract_json(text: str) -> dict:
     """
-    Robustly extract the first JSON object from an AI response.
-    Handles markdown fences, preamble text, trailing commas, etc.
+    Extract JSON from AI response, handling markdown fences and preamble.
+    Returns empty dict on failure (fallback for legacy code).
     """
     if not text:
         return {}
@@ -74,6 +76,35 @@ def _extract_json(text: str) -> dict:
                     pass  # keep looking
 
     return {}
+
+
+def _parse_with_pydantic(text: str, model_class):
+    """
+    Parse AI response using Pydantic model for robust validation.
+    Falls back to JSON extraction if Pydantic parsing fails.
+    
+    Returns: (parsed_model_or_dict, success: bool)
+    """
+    if not text:
+        return {}, False
+    
+    # Extract JSON first
+    data = _extract_json(text)
+    if not data:
+        logger.warning(f"Could not extract JSON from AI response (len={len(text)})")
+        return {}, False
+    
+    # Try Pydantic validation
+    try:
+        validated = model_class(**data)
+        return validated, True
+    except ValidationError as e:
+        logger.warning(f"Pydantic validation failed for {model_class.__name__}: {e}")
+        # Return raw dict as fallback
+        return data, False
+    except Exception as e:
+        logger.error(f"Unexpected error in Pydantic parsing: {e}")
+        return data, False
 
 
 class AIAnalyzer:
@@ -548,26 +579,68 @@ class AIAnalyzer:
     # ══════════════════════════════════════════════════════════
 
     def _parse_analysis_response(self, response: str, error: DetectedError) -> RootCauseAnalysis:
-        data = _extract_json(response)
-
-        pin = data.get("error_pin") or {}
-
+        """Parse AI analysis response into RootCauseAnalysis object with Pydantic validation."""
+        # Try Pydantic validation first
+        parsed_data, validation_success = _parse_with_pydantic(response, AIAnalysisResponse)
+        
+        if validation_success and isinstance(parsed_data, AIAnalysisResponse):
+            # Use validated Pydantic model
+            return RootCauseAnalysis(
+                error=error,
+                root_cause=parsed_data.root_cause,
+                error_category=parsed_data.error_category,
+                severity_justification=parsed_data.severity_justification or "",
+                confidence=parsed_data.confidence,
+                reasoning=parsed_data.reasoning or "",
+                suggested_investigation_steps=parsed_data.suggested_investigation_steps or [],
+                related_components=parsed_data.related_components or [],
+                error_pin_file=parsed_data.error_pin.file_path if parsed_data.error_pin else "",
+                error_pin_line=parsed_data.error_pin.line_number if parsed_data.error_pin else 0,
+                error_pin_reason=parsed_data.error_pin.reason if parsed_data.error_pin else "",
+            )
+        
+        # Fallback to manual dict parsing
+        data = parsed_data if isinstance(parsed_data, dict) else {}
+        logger.warning(f"Using fallback parsing for analysis response (validation failed)")
+        
         return RootCauseAnalysis(
             error=error,
             root_cause=data.get("root_cause", "Unable to determine root cause"),
             error_category=data.get("error_category", "unknown"),
-            severity=data.get("severity", "medium"),
-            affected_components=data.get("affected_components", []),
+            severity_justification=data.get("severity_justification", ""),
             confidence=float(data.get("confidence", 0.5)),
-            additional_context=data.get("additional_context", ""),
-            analyzed_at=datetime.utcnow(),
-            error_pin_file=pin.get("file"),
-            error_pin_line=pin.get("line"),
-            error_pin_reason=pin.get("reason"),
+            reasoning=data.get("reasoning", ""),
+            suggested_investigation_steps=data.get("suggested_investigation_steps", []),
+            related_components=data.get("related_components", []),
+            error_pin_file=data.get("error_pin_file", ""),
+            error_pin_line=int(data.get("error_pin_line", 0)) if data.get("error_pin_line") else 0,
+            error_pin_reason=data.get("error_pin_reason", ""),
         )
 
     def _parse_fix_response(self, response: str, error: DetectedError) -> List[FixProposal]:
-        data = _extract_json(response)
+        """Parse AI fix response into FixProposal objects with Pydantic validation."""
+        # Try Pydantic validation first
+        parsed_data, validation_success = _parse_with_pydantic(response, AIFixResponse)
+        
+        if validation_success and isinstance(parsed_data, AIFixResponse):
+            # Use validated Pydantic model
+            proposals = []
+            for p in parsed_data.proposals:
+                proposals.append(FixProposal(
+                    target_file=p.target_file,
+                    line_number=p.line_number,
+                    original_code=p.original_code,
+                    suggested_code=p.suggested_code,
+                    explanation=p.explanation,
+                    risk_level=p.risk_level,
+                    confidence=p.confidence,
+                    side_effects=p.side_effects or [],
+                ))
+            return proposals
+        
+        # Fallback to manual dict parsing
+        data = parsed_data if isinstance(parsed_data, dict) else {}
+        logger.warning(f"Using fallback parsing for fix response (validation failed)")
         raw_proposals = data.get("proposals", [])
 
         proposals = []
@@ -604,7 +677,41 @@ class AIAnalyzer:
         pr_info: PRInfo,
         ast_review: Optional[Dict[str, Any]] = None,
     ) -> CodeReviewResult:
-        data = _extract_json(response)
+        """Parse AI code review response into CodeReviewResult with Pydantic validation."""
+        # Try Pydantic validation first
+        parsed_data, validation_success = _parse_with_pydantic(response, AICodeReviewResponse)
+        
+        if validation_success and isinstance(parsed_data, AICodeReviewResponse):
+            # Use validated Pydantic model
+            comments = []
+            for c in parsed_data.comments:
+                comments.append(CodeReviewComment(
+                    file_path=c.file_path,
+                    line_number=c.line_number,
+                    severity=c.severity,
+                    comment_type=c.comment_type,
+                    message=c.message,
+                    suggested_fix=c.suggested_fix,
+                ))
+            
+            return CodeReviewResult(
+                pr_info=pr_info,
+                overall_score=parsed_data.overall_score,
+                overall_assessment=parsed_data.overall_assessment,
+                summary=parsed_data.summary,
+                comments=comments,
+                highlights=parsed_data.highlights or [],
+                approved=parsed_data.overall_assessment == "approve",
+                ast_insights=parsed_data.ast_insights or (ast_review or {}).get("summary", ""),
+                ast_diffs=(ast_review or {}).get("ast_diffs", []),
+                reference_traces=(ast_review or {}).get("reference_traces", []),
+                manual_flags=(ast_review or {}).get("manual_flags", []),
+                reviewed_at=datetime.utcnow(),
+            )
+        
+        # Fallback to manual dict parsing
+        data = parsed_data if isinstance(parsed_data, dict) else {}
+        logger.warning(f"Using fallback parsing for review response (validation failed)")
 
         comments = []
         for c in data.get("comments", []):

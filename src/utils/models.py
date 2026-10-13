@@ -376,5 +376,64 @@ class WebSocketConnection(BaseModel):
     errors_detected: int = 0
 
 
+# ==========================================
+# AI Response Models (for robust parsing)
+# ==========================================
+
+class ErrorPinPoint(BaseModel):
+    """AI-pinpointed error location when stack trace doesn't show user code"""
+    file: str
+    line: int
+    reason: str
+
+
+class AIAnalysisResponse(BaseModel):
+    """Validated AI analysis response"""
+    root_cause: str
+    error_category: str = "unknown"
+    severity: str = "medium"
+    affected_components: List[str] = Field(default_factory=list)
+    confidence: float = 0.5
+    additional_context: str = ""
+    error_pin: Optional[ErrorPinPoint] = None
+
+
+class AIFixProposalResponse(BaseModel):
+    """Single fix proposal from AI"""
+    target_file: str
+    line_number: int
+    original_code: str
+    suggested_code: str
+    explanation: str
+    risk_level: str = "medium"
+    confidence: float = 0.5
+    side_effects: List[str] = Field(default_factory=list)
+
+
+class AIFixResponse(BaseModel):
+    """Validated AI fix response"""
+    proposals: List[AIFixProposalResponse] = Field(default_factory=list)
+
+
+class AIReviewCommentResponse(BaseModel):
+    """Single review comment from AI"""
+    file_path: str = ""
+    line_number: int = 0
+    severity: str = "info"
+    comment_type: str = "suggestion"
+    message: str = ""
+    suggested_fix: Optional[str] = None
+
+
+class AICodeReviewResponse(BaseModel):
+    """Validated AI code review response"""
+    overall_assessment: str = "comment"
+    overall_score: float = 0.0
+    summary: str = ""
+    comments: List[AIReviewCommentResponse] = Field(default_factory=list)
+    highlights: List[str] = Field(default_factory=list)
+    ast_insights: str = ""
+
+
 # Allow self-referencing for ASTNode
 ASTNode.model_rebuild()
