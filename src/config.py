@@ -34,6 +34,8 @@ class AIConfig(BaseModel):
     @property
     def active_api_key(self) -> str:
         """Get the API key for the active provider"""
+        if self.provider == "mock":
+            return "mock-api-key"
         if self.provider == "azure":
             return self.azure_openai_api_key or ""
         if self.provider == "groq":
@@ -43,6 +45,8 @@ class AIConfig(BaseModel):
     @property
     def active_base_url(self) -> str:
         """Get the base URL for the active provider"""
+        if self.provider == "mock":
+            return "http://localhost:9292/mock-ai"
         if self.provider == "azure":
             ep = (self.azure_openai_endpoint or "").rstrip("/")
             return f"{ep}/openai/deployments/{self.azure_openai_deployment}"
@@ -53,6 +57,8 @@ class AIConfig(BaseModel):
     @property
     def active_model(self) -> str:
         """Get the model for the active provider"""
+        if self.provider == "mock":
+            return "mock-llama-3.3"
         if self.provider == "azure":
             return self.azure_openai_deployment
         if self.provider == "groq":

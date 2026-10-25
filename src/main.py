@@ -103,7 +103,11 @@ class ConnectionManager:
     async def send_message(self, user_id: str, message: WebSocketMessage):
         """Send a message to a specific user's service."""
         if user_id in self.websockets:
-            await self.websockets[user_id].send_json(message.model_dump(mode='json'))
+            try:
+                await self.websockets[user_id].send_json(message.model_dump(mode='json'))
+            except Exception as e:
+                logger.debug(f"Could not send WebSocket message to user {user_id}: {e}")
+                self.disconnect(user_id)
             
     async def broadcast(self, message: WebSocketMessage):
         """Broadcast a message to all connected services."""
@@ -1839,6 +1843,7 @@ async def trigger_analysis(user_id: str, background_tasks: BackgroundTasks):
 # ============================================================================
 
 @app.post("/api/v1/repo/{user_id}/apply-fix")
+@app.post("/api/v1/fix/apply/{user_id}")
 async def apply_fix_proposal(user_id: str, request: Request, background_tasks: BackgroundTasks):
     """
     Apply a fix proposal to the user's repository:
@@ -3093,7 +3098,8 @@ def main():
         "main:app",
         host=config.server.host,
         port=config.server.port,
-        reload=True,
+        reload=os.getenv("UVICORN_RELOAD", "false").lower() in ("1", "true"),
+        reload_dirs=[str(Path(__file__).parent)],
         log_level="info",
         access_log=True,
         use_colors=True,

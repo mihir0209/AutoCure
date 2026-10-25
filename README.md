@@ -1142,29 +1142,98 @@ Environment variables are loaded from `.env`. Ensure `DB_HOST=postgres` and `RED
 
 ## Testing
 
-AutoCure includes automated test suites for regression and stress testing.
+AutoCure includes automated test suites covering AST parsing, error tracing, dashboard APIs, end-to-end regression, and stress testing.
 
-### Regression Tests
+### Environment Setup
 
-Validate core functionality (auth, repo sync, AST parsing, analysis pipeline):
+AutoCure requires Python 3.11 (due to `tree-sitter-languages` binary wheel compatibility). You can bootstrap it using `uv`:
 
 ```bash
+uv python install 3.11
+uv venv -p 3.11 venv
+uv pip install -r requirements.txt --python venv/bin/python
+```
+
+Configure your environment in `.env` (using SQLite and Mock AI mode for standalone local testing):
+
+```env
+AI_PROVIDER=mock
+DB_TYPE=sqlite
+```
+
+### Running Test Suites
+
+#### 1. AST Parsing & Error Tracing Pipeline Unit Tests (Isolated)
+Validates multi-language Tree-sitter AST parsing (Python, JavaScript, TypeScript), stack trace node resolution, cross-file references, and offline mock fix generation without requiring a live server:
+
+```bash
+pytest tests/test_ast_pipeline.py -v
+```
+
+#### 2. Dashboard & Web UI API Integration Tests
+Tests report metadata endpoints (`GET /api/v1/reports/{id}`), proposal endpoints, interactive AST visualizer HTML generation, visualizer authentication, and manual fix application (`POST /api/v1/fix/apply/{user_id}`) via FastAPI `TestClient`:
+
+```bash
+pytest tests/test_dashboard_api.py -v
+```
+
+#### 3. End-to-End Regression Tests (Live Server)
+Validates live WebSocket streaming, error detection, automated AST root cause analysis against registered repositories, dashboard summaries, and system health against the running server on port 9292:
+
+```bash
+# Terminal 1: Start AutoCure server
+export PYTHONPATH=src
+export DB_TYPE=sqlite
+export AI_PROVIDER=mock
+./venv/bin/python src/main.py
+
+# Terminal 2: Run regression suite
 pytest tests/test_regression.py -v
 ```
 
-### Stress / Load Tests
-
-Simulate concurrent error ingestion and measure throughput:
+#### 4. Stress and Load Tests
+Simulates high-volume log ingestion and concurrent user connections:
 
 ```bash
 pytest tests/test_stress_load.py -v
 ```
 
-### Test Reports
+#### 5. Run the Entire Test Suite
+Run all 31 tests across all test modules:
 
-JUnit XML reports are generated for CI integration:
-- `regression-test-report.xml`
-- `stress-test-report.xml`
+```bash
+pytest tests/ -v
+```
+
+---
+
+## AST Error Analysis & Self-Healing Pipeline
+
+AutoCure automates diagnosis and remediation of software runtime failures:
+
+```
+[WebSocket Log Stream]
+          │
+          ▼
+[1. LogAnalyzer] ───────── Extracts error type, message, stack trace & source location
+          │
+          ▼
+[2. ASTTraceService] ───── Parses source code with Tree-sitter grammar;
+          │                 walks node hierarchy to exact statement;
+          │                 resolves cross-file imports & manifest dependencies
+          ▼
+[3. AIAnalyzer] ────────── Performs root cause diagnosis using AST context & source code
+          │                 (supports Groq, Cerebras, Azure OpenAI, or offline mock mode)
+          ▼
+[4. Fix Proposals] ─────── Synthesizes exact copy-paste code replacement diffs
+          │
+          ▼
+[5. GitHubService] ─────── Checks out fix branch (autocure/fix-*), applies patch,
+          │                 commits changes, and generates compare URLs
+          ▼
+[6. Reports & UI] ──────── Renders interactive SVG/HTML AST visualizer with zoom/pan controls,
+                            indexes report in SQLite (data/reports.db), and alerts via WebSocket
+```
 
 ---
 

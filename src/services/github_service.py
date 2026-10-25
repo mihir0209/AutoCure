@@ -142,6 +142,12 @@ class GitHubService:
         host, owner, repo_name = self._parse_repo_url(user.repo_url)
         local_path = self._get_repo_path(user.user_id, f"{owner}_{repo_name}")
         
+        # Check direct path if specific subfolder doesn't exist
+        if not local_path.exists():
+            direct_path = self.repos_base_path / user.user_id
+            if direct_path.exists() and (direct_path / ".git").exists():
+                local_path = direct_path
+
         # Check if already cloned
         if local_path.exists() and not force:
             logger.info(f"Repository already exists: {local_path}")
@@ -565,11 +571,17 @@ class GitHubService:
             # Fetch latest from remote
             _sp.run(["git", "fetch", "origin"], cwd=cwd, capture_output=True, text=True, timeout=60)
 
-            # Create new branch from origin/base_branch
+            # Create new branch from origin/base_branch (or local base_branch if no remote)
             proc = _sp.run(
                 ["git", "checkout", "-b", branch_name, f"origin/{base_branch}"],
                 cwd=cwd, capture_output=True, text=True, timeout=30,
             )
+            if proc.returncode != 0:
+                # Fallback to local base_branch
+                proc = _sp.run(
+                    ["git", "checkout", "-b", branch_name, base_branch],
+                    cwd=cwd, capture_output=True, text=True, timeout=30,
+                )
             if proc.returncode != 0:
                 # Branch may already exist, try switching to it
                 proc = _sp.run(
@@ -727,12 +739,17 @@ class GitHubService:
             sha_proc = _sp.run(["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, timeout=15)
             commit_sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else "unknown"
 
+            # Check if origin remote exists
+            remote_proc = _sp.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=cwd, capture_output=True, text=True, timeout=15,
+            )
+            if remote_proc.returncode != 0:
+                logger.info(f"Local commit succeeded ({commit_sha[:8]}); no remote origin to push to")
+                return commit_sha
+
             # Set remote URL with token for push auth
             if token:
-                remote_proc = _sp.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=cwd, capture_output=True, text=True, timeout=15,
-                )
                 remote_url = remote_proc.stdout.strip()
                 auth_url = self._inject_token_in_url(remote_url, token)
                 _sp.run(

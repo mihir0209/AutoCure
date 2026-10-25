@@ -58,7 +58,7 @@ class LogAnalyzer:
     # Stack trace patterns
     STACK_PATTERNS = {
         "javascript": r"at\s+(?:(\w+)\s+)?\(?([^:]+):(\d+):(\d+)\)?",
-        "python": r'File\s+"([^"]+)",\s+line\s+(\d+)',
+        "python": r'File\s+["\']([^"\']+)["\'],\s+line\s+(\d+)',
         "java": r"at\s+([\w.$]+)\(([\w.]+):(\d+)\)",
     }
     
@@ -115,8 +115,8 @@ class LogAnalyzer:
             error_category=error_category,
             message=log.message,
             stack_trace=log.stack_trace,
-            source_file=source_file,
-            line_number=line_number,
+            source_file=source_file or log.source_file,
+            line_number=line_number or log.line_number,
             function_name=function_name,
             api_endpoint=api_endpoint,
             http_method=http_method,

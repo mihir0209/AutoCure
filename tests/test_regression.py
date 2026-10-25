@@ -213,16 +213,36 @@ async def test_tc03_ai_analysis(client):
         f"Unexpected analysis status: {result['status']}"
     )
 
-    if result["status"] == "queued":
-        assert result["error_count"] > 0, "Analysis queued but error_count is 0"
+    # Allow background task to complete AST analysis and report generation
+    await asyncio.sleep(1.0)
 
     # Verify reports API
-    reports_resp = await client.get("/api/v1/reports", params={"limit": 5})
+    reports_resp = await client.get("/api/v1/reports", params={"limit": 10})
     assert reports_resp.status_code == 200
+    reports_data = reports_resp.json()
+    assert "reports" in reports_data
+
+    reports = reports_data.get("reports", [])
+    assert len(reports) > 0, "Expected at least one report generated"
+    latest_report = next((r for r in reports if r.get("user_id") == user_id), None)
+    assert latest_report is not None, f"Expected report for {user_id}"
+    assert latest_report["user_id"] == user_id
+    assert latest_report["proposals_count"] > 0, "Expected fix proposals to be generated"
+
+    # Verify proposals API
+    report_id = latest_report.get("report_id") or latest_report.get("id")
+    prop_resp = await client.get(f"/api/v1/reports/{report_id}/proposals")
+    assert prop_resp.status_code == 200
+    prop_data = prop_resp.json()
+    assert len(prop_data.get("proposals", [])) > 0
+    first_prop = prop_data["proposals"][0]
+    assert first_prop["target_file"] == "processor.py"
+    assert first_prop["line_number"] == 25
+    assert "items[index]" in first_prop["original_code"]
 
     await client.delete(f"/api/v1/logs/{user_id}")
 
-    print(f"\n  TC03: AI analysis status={result['status']}")
+    print(f"\n  TC03: AI analysis & AST fix proposals verified for {user_id} (report={report_id})")
 
 
 # ═══════════════════════════════════════════════════════════════════
