@@ -15,6 +15,9 @@ from .cascading_patcher import (
 from .verifier import RegressionVerifier, VerificationResult
 
 __all__ = [
+    "NullSafetyFinding",
+    "NullSafetySynthesizer",
+    "synthesize_null_safety",
     "ASTPatcher",
     "ASTPatch",
     "DefectPattern",
@@ -25,3 +28,4 @@ __all__ = [
     "RegressionVerifier",
     "VerificationResult",
 ]
+from .null_safety_synthesizer import NullSafetyFinding, NullSafetySynthesizer, synthesize_null_safety
