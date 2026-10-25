@@ -2,7 +2,8 @@
 AutoCure Healing Module
 =======================
 Minimal-Diff AST Patch Generator, Cascading Multi-File Patcher,
-Regression Verifier, Transactional Auto-Rollback Engine & Fault Boundary Synthesizer.
+Regression Verifier, Transactional Auto-Rollback Engine, Fault Boundary Synthesizer,
+and Async/Await Deadlock Sanitizer.
 """
 
 from .ast_patcher import ASTPatcher, ASTPatch, DefectPattern
@@ -20,8 +21,16 @@ from .exception_boundary_synthesizer import (
     ExceptionBoundarySynthesizer,
     synthesize_exception_boundaries,
 )
+from .async_deadlock_sanitizer import (
+    AsyncDeadlockFinding,
+    AsyncDeadlockSanitizer,
+    sanitize_async_deadlocks,
+)
 
 __all__ = [
+    "AsyncDeadlockFinding",
+    "AsyncDeadlockSanitizer",
+    "sanitize_async_deadlocks",
     "ExceptionBoundaryFinding",
     "ExceptionBoundarySynthesizer",
     "synthesize_exception_boundaries",
