@@ -3,7 +3,8 @@ AutoCure Healing Module
 =======================
 Minimal-Diff AST Patch Generator, Cascading Multi-File Patcher,
 Regression Verifier, Transactional Auto-Rollback Engine, Fault Boundary Synthesizer,
-and Async/Await Deadlock Sanitizer.
+Async/Await Deadlock Sanitizer, SQL Injection Parameterizer, Import Cycle Breaker,
+and Session/Executor Sanitizer.
 """
 
 from .ast_patcher import ASTPatcher, ASTPatch, DefectPattern
@@ -26,8 +27,37 @@ from .async_deadlock_sanitizer import (
     AsyncDeadlockSanitizer,
     sanitize_async_deadlocks,
 )
+from .invariant_guard_synthesizer import (
+    InvariantViolationFinding,
+    InvariantGuardSynthesizer,
+    synthesize_invariant_guards,
+)
+from .sql_injection_synthesizer import (
+    SQLInjectionFinding,
+    SQLInjectionSynthesizer,
+    synthesize_parameterized_queries,
+)
+from .import_cycle_synthesizer import (
+    ImportCycleFinding,
+    ImportCycleSynthesizer,
+    synthesize_import_cycle_break,
+)
+from .executor_session_sanitizer import (
+    ExecutorSessionFinding,
+    ExecutorSessionSanitizer,
+    sanitize_executor_sessions,
+)
 
 __all__ = [
+    "SQLInjectionFinding",
+    "SQLInjectionSynthesizer",
+    "synthesize_parameterized_queries",
+    "ImportCycleFinding",
+    "ImportCycleSynthesizer",
+    "synthesize_import_cycle_break",
+    "ExecutorSessionFinding",
+    "ExecutorSessionSanitizer",
+    "sanitize_executor_sessions",
     "InvariantViolationFinding",
     "InvariantGuardSynthesizer",
     "synthesize_invariant_guards",
@@ -53,9 +83,3 @@ __all__ = [
     "RegressionVerifier",
     "VerificationResult",
 ]
-
-from .invariant_guard_synthesizer import (
-    InvariantViolationFinding,
-    InvariantGuardSynthesizer,
-    synthesize_invariant_guards,
-)
