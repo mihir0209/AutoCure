@@ -28,6 +28,9 @@ from .async_deadlock_sanitizer import (
 )
 
 __all__ = [
+    "InvariantViolationFinding",
+    "InvariantGuardSynthesizer",
+    "synthesize_invariant_guards",
     "AsyncDeadlockFinding",
     "AsyncDeadlockSanitizer",
     "sanitize_async_deadlocks",
@@ -50,3 +53,9 @@ __all__ = [
     "RegressionVerifier",
     "VerificationResult",
 ]
+
+from .invariant_guard_synthesizer import (
+    InvariantViolationFinding,
+    InvariantGuardSynthesizer,
+    synthesize_invariant_guards,
+)
