@@ -166,6 +166,21 @@ def handle_heal(args: argparse.Namespace) -> int:
 
         if exit_code == 0:
             print(f"[AutoCure] ✓ All tests passed in {duration:.2f}s. Repository is healthy.")
+            if args.output:
+                try:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "success": True,
+                            "tests_passed": True,
+                            "regression_detected": False,
+                            "rolled_back": False,
+                            "exit_code": 0,
+                            "warning": None,
+                            "duration_seconds": round(duration, 2),
+                            "patch": None,
+                        }, f, indent=2)
+                except Exception:
+                    pass
             return 0
 
         print(f"[AutoCure] Baseline tests failed (exit code {exit_code}). Extracting traceback...")
@@ -176,6 +191,20 @@ def handle_heal(args: argparse.Namespace) -> int:
             "[AutoCure] ❌ Could not generate AST patch. No recognized defect pattern located.",
             file=sys.stderr,
         )
+        if args.output:
+            try:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "success": False,
+                        "tests_passed": False,
+                        "regression_detected": False,
+                        "rolled_back": False,
+                        "exit_code": 1,
+                        "warning": "Could not generate AST patch.",
+                        "patch": None,
+                    }, f, indent=2)
+            except Exception:
+                pass
         return 1
 
     print("\n[AutoCure] ==================== Generated AST Patch ====================")

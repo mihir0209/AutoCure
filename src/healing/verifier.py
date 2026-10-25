@@ -147,22 +147,26 @@ class RegressionVerifier:
                 f"✓ Regression check PASSED: patch at {patch.file_path}:{patch.line_number} "
                 f"verified in {duration:.2f}s"
             )
-            # Remove backup file on verified success
-            full_path = self.patcher._resolve_file_path(patch.file_path, root_path)
-            if full_path:
-                bak_path = f"{full_path}.autocure_bak"
-                if os.path.isfile(bak_path):
-                    try:
-                        os.remove(bak_path)
-                    except Exception:
-                        pass
+            rolled_back = False
+            if auto_rollback:
+                rolled_back = self.patcher.rollback_patch(patch, repo_path=root_path)
+            else:
+                # Remove backup file on verified success
+                full_path = self.patcher._resolve_file_path(patch.file_path, root_path)
+                if full_path:
+                    bak_path = f"{full_path}.autocure_bak"
+                    if os.path.isfile(bak_path):
+                        try:
+                            os.remove(bak_path)
+                        except Exception:
+                            pass
 
             return VerificationResult(
                 success=True,
                 patch=patch,
                 tests_passed=True,
                 regression_detected=False,
-                rolled_back=False,
+                rolled_back=rolled_back,
                 exit_code=exit_code,
                 test_output=test_output,
                 duration_seconds=duration,
