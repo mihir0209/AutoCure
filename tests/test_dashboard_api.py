@@ -200,3 +200,62 @@ def test_post_apply_fix_missing_fixes(client):
     resp = client.post("/api/v1/fix/apply/test-service", json={"fixes": []})
     assert resp.status_code == 400
     assert "no fixes provided" in resp.json()["detail"].lower()
+
+
+# ============================================================================
+# 5. OpenAPI Specification Export & Schema Validation (/api/v1/openapi.json)
+# ============================================================================
+
+def test_get_openapi_specification_and_schema_validation(client):
+    """
+    Verify GET /api/v1/openapi.json exports valid OpenAPI 3.x specification
+    and satisfies JSON schema validation rules.
+    """
+    import jsonschema
+
+    resp = client.get("/api/v1/openapi.json")
+    assert resp.status_code == 200
+    assert "application/json" in resp.headers.get("content-type", "")
+
+    spec = resp.json()
+    assert "openapi" in spec
+    assert spec["openapi"].startswith("3.")
+    assert "info" in spec
+    assert spec["info"]["title"] == "Self-Healing Software System"
+    assert spec["info"]["version"] == "2.0.0"
+    assert "paths" in spec
+
+    # Verify key routes are mapped in OpenAPI paths
+    paths = spec["paths"]
+    assert "/health" in paths
+    assert "/api/v1/status" in paths
+    assert "/api/v1/openapi.json" in paths
+    assert "/api/v1/reports" in paths
+    assert "/api/v1/reports/{report_id}" in paths
+    assert "/api/v1/fix/apply/{user_id}" in paths
+
+    # Structural JSON schema validation for OpenAPI 3.x document
+    openapi_meta_schema = {
+        "type": "object",
+        "required": ["openapi", "info", "paths"],
+        "properties": {
+            "openapi": {"type": "string", "pattern": r"^3\.\d+\.\d+"},
+            "info": {
+                "type": "object",
+                "required": ["title", "version"],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "version": {"type": "string", "minLength": 1},
+                    "description": {"type": "string"},
+                },
+            },
+            "paths": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": {"type": "object"},
+            },
+            "components": {"type": "object"},
+        },
+    }
+
+    jsonschema.validate(instance=spec, schema=openapi_meta_schema)

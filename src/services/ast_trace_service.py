@@ -106,6 +106,7 @@ class ASTTraceService:
         error_line: int,
         repo_path: str,
         source_code: Optional[str] = None,
+        max_hops: int = 2,
     ) -> ASTTraceContext:
         """
         Build complete AST trace for an error.
@@ -115,6 +116,7 @@ class ASTTraceService:
             error_line: Line number of the error
             repo_path: Root path of the repository
             source_code: Optional source code (if file content is provided)
+            max_hops: Maximum module depth for cross-file reference resolution
             
         Returns:
             ASTTraceContext with full trace information
@@ -170,12 +172,35 @@ class ASTTraceService:
             )
         
         if context.source_code:
-            # Parse referenced files (limited depth)
-            for ref in context.references[:5]:  # Limit to 5 references
+            # Multi-hop reference resolution (parses ASTs across module boundaries)
+            resolved_queue: List[Tuple[str, int]] = []
+            for ref in context.references[:10]:
                 if ref.resolved_path and ref.resolved_path not in context.referenced_files:
                     referenced_ast = self.ast_service.parse_file(ref.resolved_path)
                     if referenced_ast:
                         context.referenced_files[ref.resolved_path] = referenced_ast
+                        resolved_queue.append((ref.resolved_path, 1))
+
+            while resolved_queue:
+                curr_path, curr_hop = resolved_queue.pop(0)
+                if curr_hop >= max_hops:
+                    continue
+                try:
+                    with open(curr_path, "r", encoding="utf-8") as fh:
+                        hop_code = fh.read()
+                    hop_rel = os.path.relpath(curr_path, repo_path) if repo_path else curr_path
+                    hop_refs = self._extract_references(hop_code, hop_rel)
+                    hop_refs = self._resolve_references(hop_refs, repo_path)
+                    for href in hop_refs[:10]:
+                        if href.resolved_path and href.resolved_path not in context.referenced_files:
+                            h_ast = self.ast_service.parse_file(href.resolved_path)
+                            if h_ast:
+                                context.referenced_files[href.resolved_path] = h_ast
+                                resolved_queue.append((href.resolved_path, curr_hop + 1))
+                                if href not in context.references:
+                                    context.references.append(href)
+                except Exception as ex:
+                    logger.debug(f"Failed to resolve multi-hop references in {curr_path}: {ex}")
         
         # Detect project requirements
         if repo_path:
@@ -382,18 +407,20 @@ class ASTTraceService:
         
         resolved = []
         for ref in references:
-            possible_paths = self._get_possible_paths(ref.to_file, repo_path)
+            possible_paths = self._get_possible_paths(ref.to_file, repo_path, from_file=ref.from_file)
             
             for path in possible_paths:
                 if os.path.exists(path):
-                    ref.resolved_path = path
+                    ref.resolved_path = os.path.normpath(path)
                     break
             
             resolved.append(ref)
         
         return resolved
     
-    def _get_possible_paths(self, import_path: str, repo_path: str) -> List[str]:
+    def _get_possible_paths(
+        self, import_path: str, repo_path: str, from_file: Optional[str] = None
+    ) -> List[str]:
         """Generate possible file paths for an import."""
         # Clean the import path
         clean_path = import_path.lstrip('./')
@@ -402,15 +429,18 @@ class ASTTraceService:
         extensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go']
         
         paths = []
+        bases = [os.path.join(repo_path, clean_path)]
+        if from_file:
+            from_dir = os.path.dirname(from_file)
+            if from_dir and from_dir != ".":
+                bases.append(os.path.join(repo_path, from_dir, clean_path))
         
-        # Direct file
-        base = os.path.join(repo_path, clean_path)
-        paths.append(base)
-        
-        # With extensions
-        for ext in extensions:
-            paths.append(base + ext)
-            paths.append(os.path.join(base, f"index{ext}"))
+        for base in bases:
+            paths.append(base)
+            for ext in extensions:
+                paths.append(base + ext)
+                paths.append(os.path.join(base, f"index{ext}"))
+                paths.append(os.path.join(base, f"__init__{ext}"))
         
         return paths
     
@@ -623,7 +653,7 @@ class ASTTraceService:
 
         import_sections: list[str] = []
         for ifile in sorted(involved_files):
-            imports = self._extract_import_lines(ifile, trace)
+            imports = self._extract_import_lines(ifile, trace, repo_path=repo_path)
             if imports:
                 import_sections.append(f"`{ifile}` imports:\n```\n{imports}\n```\n")
         if import_sections:
@@ -802,7 +832,7 @@ class ASTTraceService:
         return "\n".join(result) if result else None
 
     def _extract_import_lines(
-        self, rel_file: str, trace: ASTTraceContext
+        self, rel_file: str, trace: ASTTraceContext, repo_path: str = ""
     ) -> str:
         """Return only the import / from-import lines of a file."""
         source = None
@@ -817,6 +847,15 @@ class ASTTraceService:
                     except Exception:
                         pass
                     break
+
+        if source is None and repo_path:
+            disk_path = os.path.join(repo_path, rel_file)
+            if os.path.isfile(disk_path):
+                try:
+                    with open(disk_path, "r", encoding="utf-8") as fh:
+                        source = fh.read()
+                except Exception:
+                    pass
 
         if not source:
             return ""

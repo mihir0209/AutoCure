@@ -208,10 +208,12 @@ class AIAnalyzer:
         msg = error.message or ""
 
         if "ZeroDivision" in err_type or "division by zero" in msg:
+            div_match = re.search(r'/\s*([a-zA-Z_]\w*)', original_code)
+            div_var = div_match.group(1) if div_match else "count"
             suggested_code = (
-                "return total / count if count != 0 else 0"
+                f"return total / {div_var} if {div_var} != 0 else 0"
                 if "return" in original_code else
-                "if count != 0:\n    " + original_code
+                f"if {div_var} != 0:\n    {original_code}"
             )
             explanation = "Guard against ZeroDivisionError by checking that divisor is non-zero."
         elif "IndexError" in err_type or "out of range" in msg:

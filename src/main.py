@@ -374,7 +374,7 @@ def _normalize_line_number(
     code_lines_from_tb: list[str] = []
     tb_lines = stack_trace.splitlines()
     for i, tl in enumerate(tb_lines):
-        if _re.search(rf'File\s+"[^"]*{_re.escape(basename)}"\s*,\s*line\s+{reported_line}', tl):
+        if _re.search(rf'File\s+["\'][^"\']*{_re.escape(basename)}["\']\s*,\s*line\s+{reported_line}', tl):
             # The next line(s) in the traceback are the actual source code
             for j in range(i + 1, min(i + 3, len(tb_lines))):
                 candidate = tb_lines[j].strip()
@@ -420,7 +420,7 @@ def _build_call_chain(
         return frames
 
     for m in _re.finditer(
-        r'File\s+"([^"]+)"\s*,\s*line\s+(\d+)(?:\s*,\s*in\s+(\S+))?',
+        r'File\s+["\']([^"\']+)["\']\s*,\s*line\s+(\d+)(?:\s*,\s*in\s+(\S+))?',
         stack_trace,
     ):
         abs_file, line_str, func_name = m.group(1), m.group(2), m.group(3) or ""
@@ -2594,6 +2594,12 @@ async def system_status():
         "repositories_synced": len(user_repos),
         "ai_provider": config.ai.provider,
     }
+
+
+@app.get("/api/v1/openapi.json", tags=["System"])
+async def get_openapi_specification():
+    """Export the OpenAPI 3.0/3.1 specification for the AutoCure API."""
+    return app.openapi()
 
 
 # ============================================================================
