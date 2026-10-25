@@ -15,6 +15,9 @@ from .cascading_patcher import (
 from .verifier import RegressionVerifier, VerificationResult
 
 __all__ = [
+    "ResourceLeakFinding",
+    "ResourceLeakSynthesizer",
+    "synthesize_resource_management",
     "NullSafetyFinding",
     "NullSafetySynthesizer",
     "synthesize_null_safety",
@@ -29,3 +32,4 @@ __all__ = [
     "VerificationResult",
 ]
 from .null_safety_synthesizer import NullSafetyFinding, NullSafetySynthesizer, synthesize_null_safety
+from .resource_leak_synthesizer import ResourceLeakFinding, ResourceLeakSynthesizer, synthesize_resource_management
