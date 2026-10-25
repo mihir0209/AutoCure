@@ -17,9 +17,25 @@ from fastapi.testclient import TestClient
 # Ensure src is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from main import app
+from main import app, user_registrations, user_repos
 from database.report_store import get_report_store
 from database.token_store import get_token_store
+from utils.models import UserRegistration, RepositoryInfo
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_test_service():
+    """Ensure test-service registration and repo info exist for fix proposal tests."""
+    user_registrations["test-service"] = UserRegistration(
+        user_id="test-service",
+        repo_url="https://github.com/test/repo",
+        access_token="ghp_mock_token_for_dashboard_tests_1234567890",
+    )
+    user_repos["test-service"] = RepositoryInfo(
+        user_id="test-service",
+        repo_url="https://github.com/test/repo",
+        local_path="/tmp",
+    )
 
 
 @pytest.fixture(scope="module")
