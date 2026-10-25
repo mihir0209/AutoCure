@@ -4,7 +4,8 @@ AutoCure Healing Module
 Minimal-Diff AST Patch Generator, Cascading Multi-File Patcher,
 Regression Verifier, Transactional Auto-Rollback Engine, Fault Boundary Synthesizer,
 Async/Await Deadlock Sanitizer, SQL Injection Parameterizer, Import Cycle Breaker,
-and Session/Executor Sanitizer.
+Session/Executor Sanitizer, ReDoS Safe Regex Synthesizer, Path Traversal Sanitizer,
+and Stream Memory Exhaustion Sanitizer.
 """
 
 from .ast_patcher import ASTPatcher, ASTPatch, DefectPattern
@@ -47,6 +48,21 @@ from .executor_session_sanitizer import (
     ExecutorSessionSanitizer,
     sanitize_executor_sessions,
 )
+from .redos_synthesizer import (
+    ReDoSFinding,
+    ReDoSSynthesizer,
+    synthesize_redos_guards,
+)
+from .path_traversal_sanitizer import (
+    PathTraversalFinding,
+    PathTraversalSanitizer,
+    sanitize_path_traversal,
+)
+from .stream_memory_sanitizer import (
+    StreamMemoryFinding,
+    StreamMemorySanitizer,
+    sanitize_stream_memory,
+)
 
 __all__ = [
     "SQLInjectionFinding",
@@ -58,6 +74,15 @@ __all__ = [
     "ExecutorSessionFinding",
     "ExecutorSessionSanitizer",
     "sanitize_executor_sessions",
+    "ReDoSFinding",
+    "ReDoSSynthesizer",
+    "synthesize_redos_guards",
+    "PathTraversalFinding",
+    "PathTraversalSanitizer",
+    "sanitize_path_traversal",
+    "StreamMemoryFinding",
+    "StreamMemorySanitizer",
+    "sanitize_stream_memory",
     "InvariantViolationFinding",
     "InvariantGuardSynthesizer",
     "synthesize_invariant_guards",
