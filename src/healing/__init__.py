@@ -63,6 +63,21 @@ from .stream_memory_sanitizer import (
     StreamMemorySanitizer,
     sanitize_stream_memory,
 )
+from .ssrf_sanitizer import (
+    SSRFFinding,
+    SSRFSanitizer,
+    sanitize_ssrf,
+)
+from .deserialization_sanitizer import (
+    DeserializationFinding,
+    DeserializationSanitizer,
+    sanitize_deserialization,
+)
+from .crypto_sanitizer import (
+    CryptoFinding,
+    CryptoSanitizer,
+    sanitize_crypto,
+)
 
 __all__ = [
     "SQLInjectionFinding",
@@ -83,6 +98,15 @@ __all__ = [
     "StreamMemoryFinding",
     "StreamMemorySanitizer",
     "sanitize_stream_memory",
+    "SSRFFinding",
+    "SSRFSanitizer",
+    "sanitize_ssrf",
+    "DeserializationFinding",
+    "DeserializationSanitizer",
+    "sanitize_deserialization",
+    "CryptoFinding",
+    "CryptoSanitizer",
+    "sanitize_crypto",
     "InvariantViolationFinding",
     "InvariantGuardSynthesizer",
     "synthesize_invariant_guards",
