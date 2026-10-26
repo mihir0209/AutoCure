@@ -5,7 +5,8 @@ Minimal-Diff AST Patch Generator, Cascading Multi-File Patcher,
 Regression Verifier, Transactional Auto-Rollback Engine, Fault Boundary Synthesizer,
 Async/Await Deadlock Sanitizer, SQL Injection Parameterizer, Import Cycle Breaker,
 Session/Executor Sanitizer, ReDoS Safe Regex Synthesizer, Path Traversal Sanitizer,
-and Stream Memory Exhaustion Sanitizer.
+Stream Memory Exhaustion Sanitizer, SSRF Sanitizer, Deserialization Sanitizer,
+Crypto Sanitizer, Command Injection Sanitizer, XXE Sanitizer, and Secrets Extractor.
 """
 
 from .ast_patcher import ASTPatcher, ASTPatch, DefectPattern
@@ -78,8 +79,32 @@ from .crypto_sanitizer import (
     CryptoSanitizer,
     sanitize_crypto,
 )
+from .command_injection_sanitizer import (
+    CommandInjectionFinding,
+    CommandInjectionSanitizer,
+    sanitize_command_injection,
+)
+from .xxe_sanitizer import (
+    XXEFinding,
+    XXESanitizer,
+    sanitize_xxe,
+)
+from .secrets_sanitizer import (
+    SecretFinding,
+    SecretsSanitizer,
+    sanitize_secrets,
+)
 
 __all__ = [
+    "CommandInjectionFinding",
+    "CommandInjectionSanitizer",
+    "sanitize_command_injection",
+    "XXEFinding",
+    "XXESanitizer",
+    "sanitize_xxe",
+    "SecretFinding",
+    "SecretsSanitizer",
+    "sanitize_secrets",
     "SQLInjectionFinding",
     "SQLInjectionSynthesizer",
     "synthesize_parameterized_queries",
