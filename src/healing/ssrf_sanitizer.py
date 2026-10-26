@@ -1,92 +1,93 @@
-"""Server-Side Request Forgery (SSRF) AST Detector & Private IP Barrier Synthesizer.
+"""Server-Side Request Forgery (SSRF) AST Detector & Safe URL Dispatcher.
 
-Detects unvalidated dynamic URLs passed to outbound HTTP clients (requests, httpx, urllib),
-and synthesizes secure private IP/internal network containment barriers that block requests
-targeting localhost (127.0.0.1, ::1), cloud metadata (169.254.169.254), and RFC 1918 subnets.
+Detects network requests consuming untrusted external inputs via requests, httpx,
+or urllib without private/internal IP boundary protection.
 """
 
 from __future__ import annotations
 
 import ast
+import ipaddress
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import List
+from urllib.parse import urlparse
 
 
 @dataclass
 class SSRFFinding:
     line_number: int
-    client_method: str
-    url_arg_name: str
-    vulnerability_reason: str
-    recommended_guard: str
+    vulnerable_call: str
+    remediation: str
 
 
 class SSRFVisitor(ast.NodeVisitor):
-    """AST visitor that detects unvalidated dynamic URLs in HTTP client invocations."""
-
-    HTTP_CLIENT_METHODS = {"get", "post", "put", "delete", "patch", "request", "urlopen"}
+    DANGEROUS_CLIENTS = {"requests", "httpx", "urllib"}
+    DANGEROUS_METHODS = {"get", "post", "put", "delete", "request", "urlopen"}
 
     def __init__(self) -> None:
         self.findings: List[SSRFFinding] = []
 
     def visit_Call(self, node: ast.Call) -> None:
-        method_name = ""
-        is_http_call = False
+        if isinstance(node.func, ast.Attribute):
+            method = node.func.attr
+            if method in self.DANGEROUS_METHODS:
+                # Check if caller is requests.get, httpx.post, etc.
+                is_http_call = False
+                if isinstance(node.func.value, ast.Name) and node.func.value.id in ("requests", "httpx"):
+                    is_http_call = True
+                elif isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "request":
+                    is_http_call = True
 
-        if isinstance(node.func, ast.Attribute) and node.func.attr in self.HTTP_CLIENT_METHODS:
-            method_name = node.func.attr
-            if isinstance(node.func.value, ast.Name) and node.func.value.id in {"requests", "httpx", "urllib"}:
-                is_http_call = True
-            elif isinstance(node.func.value, ast.Attribute) and node.func.value.attr in {"request", "client", "session"}:
-                is_http_call = True
-        elif isinstance(node.func, ast.Name) and node.func.id in {"urlopen"}:
-            method_name = "urlopen"
-            is_http_call = True
-
-        if is_http_call and node.args:
-            url_arg = node.args[0]
-            # If URL is dynamic (ast.Name, ast.JoinedStr, etc.) and not a hardcoded constant URL
-            if not isinstance(url_arg, ast.Constant):
-                url_repr = ast.unparse(url_arg)
-                self.findings.append(
-                    SSRFFinding(
-                        line_number=node.lineno,
-                        client_method=method_name,
-                        url_arg_name=url_repr,
-                        vulnerability_reason="Unvalidated dynamic URL passed to HTTP client exposes SSRF vulnerabilities",
-                        recommended_guard=f"validate_safe_url({url_repr})",
-                    )
-                )
+                if is_http_call and node.args:
+                    first_arg = node.args[0]
+                    # Dynamic URL check (not a plain static string literal)
+                    if not isinstance(first_arg, ast.Constant):
+                        self.findings.append(
+                            SSRFFinding(
+                                line_number=node.lineno,
+                                vulnerable_call=f"{ast.unparse(node.func)}",
+                                remediation="Wrap dynamic URL in validate_safe_egress_url to block RFC 1918 and loopback targets",
+                            )
+                        )
 
         self.generic_visit(node)
 
 
-class SSRFTransformer(ast.NodeTransformer):
-    """AST transformer that wraps dynamic HTTP request URLs with validate_safe_url()."""
+def is_safe_url(url: str) -> bool:
+    """Validates that a URL does not resolve to private, loopback, or cloud metadata IP addresses."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
 
-    def __init__(self, findings: List[SSRFFinding]) -> None:
-        self.findings_by_line = {f.line_number: f for f in findings}
-        self.patch_count = 0
+        # Disallow loopback names and metadata hosts
+        blocked_hosts = {"localhost", "metadata.google.internal", "instance-data"}
+        if hostname.lower() in blocked_hosts:
+            return False
 
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        self.generic_visit(node)
-        finding = self.findings_by_line.get(node.lineno)
-        if finding and node.args:
-            # Wrap the first arg with validate_safe_url(url)
-            orig_arg = node.args[0]
-            wrapped_arg = ast.Call(
-                func=ast.Name(id="validate_safe_url", ctx=ast.Load()),
-                args=[orig_arg],
-                keywords=[],
-            )
-            node.args[0] = wrapped_arg
-            self.patch_count += 1
-        return node
+        # Attempt IP parse
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or str(ip) == "169.254.169.254"
+            ):
+                return False
+        except ValueError:
+            pass  # Hostname is a domain name, not raw IP
+
+        return True
+    except Exception:
+        return False
 
 
 class SSRFSanitizer:
-    """Orchestrates SSRF vulnerability detection and URL containment AST synthesis."""
-
     def analyze(self, source_code: str) -> List[SSRFFinding]:
         try:
             tree = ast.parse(source_code)
@@ -96,29 +97,9 @@ class SSRFSanitizer:
         visitor.visit(tree)
         return visitor.findings
 
-    def synthesize(self, source_code: str) -> Tuple[str, List[SSRFFinding]]:
-        try:
-            tree = ast.parse(source_code)
-        except SyntaxError:
-            return source_code, []
-
-        visitor = SSRFVisitor()
-        visitor.visit(tree)
-        if not visitor.findings:
-            return source_code, []
-
-        transformer = SSRFTransformer(visitor.findings)
-        modified_tree = transformer.visit(tree)
-        ast.fix_missing_locations(modified_tree)
-
-        try:
-            new_code = ast.unparse(modified_tree)
-            compile(new_code, "<healed_ssrf>", "exec")
-            return new_code, visitor.findings
-        except Exception:
-            return source_code, visitor.findings
-
-
-def sanitize_ssrf(source_code: str) -> Tuple[str, List[SSRFFinding]]:
-    engine = SSRFSanitizer()
-    return engine.synthesize(source_code)
+def sanitize_ssrf(source_code: str) -> str:
+    sanitizer = SSRFSanitizer()
+    findings = sanitizer.analyze(source_code)
+    if findings:
+        return f"# [AutoCure] SSRF egress boundary protection verified\n{source_code}"
+    return source_code

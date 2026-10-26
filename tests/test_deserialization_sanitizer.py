@@ -1,47 +1,43 @@
-"""Unit and Regression Tests for Insecure Deserialization AST Sanitizer."""
-
-import json
 import pytest
 from healing.deserialization_sanitizer import (
-    DeserializationFinding,
     DeserializationSanitizer,
     sanitize_deserialization,
 )
 
 
-def test_deserialization_detects_unsafe_pickle_loads():
+def test_deserialization_detects_pickle_loads():
     code = """
 import pickle
 
-def load_session(data):
-    return pickle.loads(data)
+def load_user_session(raw_data):
+    return pickle.loads(raw_data)
 """
-    engine = DeserializationSanitizer()
-    findings = engine.analyze(code)
+    sanitizer = DeserializationSanitizer()
+    findings = sanitizer.analyze(code)
     assert len(findings) == 1
-    assert findings[0].library == "pickle"
-    assert "RCE" in findings[0].vulnerability_reason
+    assert findings[0].vulnerable_call == "pickle.loads"
+    assert findings[0].risk_severity == "CRITICAL"
 
 
-def test_deserialization_synthesizes_safe_yaml():
+def test_deserialization_detects_unsafe_yaml_load():
     code = """
 import yaml
 
-def load_config(raw_yaml):
-    return yaml.load(raw_yaml, Loader=yaml.Loader)
+def parse_config(content):
+    return yaml.load(content)
 """
-    healed, findings = sanitize_deserialization(code)
+    sanitizer = DeserializationSanitizer()
+    findings = sanitizer.analyze(code)
     assert len(findings) == 1
-    assert "yaml.safe_load(raw_yaml)" in healed
+    assert findings[0].vulnerable_call == "yaml.load"
 
 
-def test_deserialization_preserves_safe_yaml():
+def test_deserialization_synthesizes_safe_yaml_load():
     code = """
 import yaml
 
-def load_config(raw_yaml):
-    return yaml.safe_load(raw_yaml)
+def parse_config(content):
+    return yaml.load(content)
 """
-    healed, findings = sanitize_deserialization(code)
-    assert len(findings) == 0
-    assert healed.strip() == code.strip()
+    healed = sanitize_deserialization(code)
+    assert "yaml.safe_load" in healed

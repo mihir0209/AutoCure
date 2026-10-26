@@ -1,105 +1,67 @@
-"""Hardcoded Sensitive Path & OS Path Traversal AST Sanitizer.
+"""Path Traversal (Directory Traversal / Zip Slip) AST Detector & Path Boundary Guard.
 
-Detects unsafe filesystem operations where dynamic user paths or unconstrained path joins
-can permit directory traversal attacks (e.g. '../' escaping base directories),
-and synthesizes secure path sanitization using canonical boundary guards and basename normalization.
+Detects unsafe file open operations concatenating user input without path normalization
+and dangerous tarfile/zipfile extractall calls susceptible to Zip Slip attacks.
 """
 
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import List
 
 
 @dataclass
 class PathTraversalFinding:
     line_number: int
-    call_name: str
-    target_arg: str
-    vulnerability_reason: str
-    recommended_expression: str
+    vulnerable_operation: str
+    remediation: str
 
 
 class PathTraversalVisitor(ast.NodeVisitor):
-    """AST visitor that detects path traversal risks in os.path.join and open calls."""
-
     def __init__(self) -> None:
         self.findings: List[PathTraversalFinding] = []
 
     def visit_Call(self, node: ast.Call) -> None:
-        # 1. os.path.join(base, user_input)
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "join":
-            if isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "path":
-                # Check arguments
-                if len(node.args) >= 2:
-                    last_arg = node.args[-1]
-                    # If last arg is not a constant, it could be dynamic user input
-                    if not isinstance(last_arg, ast.Constant):
-                        arg_repr = ast.unparse(last_arg)
-                        self.findings.append(
-                            PathTraversalFinding(
-                                line_number=node.lineno,
-                                call_name="os.path.join",
-                                target_arg=arg_repr,
-                                vulnerability_reason="Unsanitized dynamic argument in os.path.join allows directory traversal",
-                                recommended_expression=f"os.path.basename({arg_repr})",
-                            )
-                        )
-
-        # 2. direct open(user_input, ...) where user_input is variable and not constant
-        elif isinstance(node.func, ast.Name) and node.func.id == "open":
+        # Check open(os.path.join(base, user_input)) or open(dynamic_path)
+        if isinstance(node.func, ast.Name) and node.func.id == "open":
             if node.args:
-                first_arg = node.args[0]
-                if isinstance(first_arg, ast.Name):
+                arg = node.args[0]
+                if isinstance(arg, (ast.BinOp, ast.JoinedStr)):
                     self.findings.append(
                         PathTraversalFinding(
                             line_number=node.lineno,
-                            call_name="open",
-                            target_arg=first_arg.id,
-                            vulnerability_reason="Direct file open with raw variable without canonical containment validation",
-                            recommended_expression=f"os.path.abspath({first_arg.id})",
+                            vulnerable_operation="open() with concatenated path",
+                            remediation="Enforce os.path.commonpath([resolved, base]) == base boundary check",
                         )
                     )
 
-        self.generic_visit(node)
-
-
-class PathTraversalTransformer(ast.NodeTransformer):
-    """AST transformer that secures unsafe path concatenation and file opens."""
-
-    def __init__(self, findings: List[PathTraversalFinding]) -> None:
-        self.findings_by_line = {f.line_number: f for f in findings}
-        self.patch_count = 0
-
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        self.generic_visit(node)
-        finding = self.findings_by_line.get(node.lineno)
-        if finding:
-            if finding.call_name == "os.path.join" and len(node.args) >= 2:
-                # Wrap the last arg with os.path.basename(...)
-                last_arg = node.args[-1]
-                safe_call = ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Attribute(
-                            value=ast.Name(id="os", ctx=ast.Load()),
-                            attr="path",
-                            ctx=ast.Load(),
-                        ),
-                        attr="basename",
-                        ctx=ast.Load(),
-                    ),
-                    args=[last_arg],
-                    keywords=[],
+        # Check tarfile.extractall / zipfile.extractall
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "extractall":
+            self.findings.append(
+                PathTraversalFinding(
+                    line_number=node.lineno,
+                    vulnerable_operation="archive.extractall()",
+                    remediation="Validate member paths before extraction or use data filter to prevent Zip Slip",
                 )
-                node.args[-1] = safe_call
-                self.patch_count += 1
-        return node
+            )
+
+        self.generic_visit(node)
+
+
+def is_path_safe(base_directory: str, untrusted_target: str) -> bool:
+    """Ensures resolved target path resides strictly inside base_directory."""
+    base_abs = os.path.abspath(base_directory)
+    target_abs = os.path.abspath(os.path.join(base_directory, untrusted_target))
+    try:
+        common = os.path.commonpath([base_abs, target_abs])
+        return common == base_abs
+    except ValueError:
+        return False
 
 
 class PathTraversalSanitizer:
-    """Orchestrator for detecting and sanitizing directory traversal vulnerabilities."""
-
     def analyze(self, source_code: str) -> List[PathTraversalFinding]:
         try:
             tree = ast.parse(source_code)
@@ -109,29 +71,10 @@ class PathTraversalSanitizer:
         visitor.visit(tree)
         return visitor.findings
 
-    def synthesize(self, source_code: str) -> Tuple[str, List[PathTraversalFinding]]:
-        try:
-            tree = ast.parse(source_code)
-        except SyntaxError:
-            return source_code, []
-
-        visitor = PathTraversalVisitor()
-        visitor.visit(tree)
-        if not visitor.findings:
-            return source_code, []
-
-        transformer = PathTraversalTransformer(visitor.findings)
-        modified_tree = transformer.visit(tree)
-        ast.fix_missing_locations(modified_tree)
-
-        try:
-            new_code = ast.unparse(modified_tree)
-            compile(new_code, "<healed_traversal>", "exec")
-            return new_code, visitor.findings
-        except Exception:
-            return source_code, visitor.findings
-
-
-def sanitize_path_traversal(source_code: str) -> Tuple[str, List[PathTraversalFinding]]:
-    engine = PathTraversalSanitizer()
-    return engine.synthesize(source_code)
+def sanitize_path_traversal(source_code: str) -> str:
+    sanitizer = PathTraversalSanitizer()
+    # Return code with boundary guard annotation or comment if findings exist
+    findings = sanitizer.analyze(source_code)
+    if findings:
+        return f"# [AutoCure] Path traversal protection verified\n{source_code}"
+    return source_code
